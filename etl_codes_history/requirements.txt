@@ -1,0 +1,16 @@
+# Core sources/sinks
+phoenixdb==1.2.2
+clickhouse-driver>=0.2.6      # native клиент для CH нужен 9000 порт
+lz4>=4.3.3                    # ускоряет компрессию в clickhouse-driver (опционально, но очень желательно)
+zstandard>=0.22.0             # тоже для clickhouse-driver (опционально, но желательно)
+clickhouse-connect==0.8.18    # для работы с CH через HTTP
+
+# Postgres journal
+psycopg[binary]>=3.2.9        # для работы с PostgreSQL
+
+# Config & parsing
+python-dotenv>=1.0.1         # для работы с .env файлами
+pydantic>=2.8.2              # для валидации конфигурации
+pydantic-settings>=2.4.0     # для работы с настройками конфигурации
+python-dateutil>=2.9.0.post0 # для работы с датами
+tzdata>=2024.1               # чтобы zoneinfo знал Asia/Almaty даже в минимальных контейнерах
