@@ -120,17 +120,15 @@ DROP TABLE IF EXISTS stg.daily_codes_history ON CLUSTER shardless SYNC;
 CREATE TABLE stg.daily_codes_history ON CLUSTER shardless
 (
     -- Обязательные поля (NOT NULL)
-    c   String,           -- cis_id
-    t   UInt8,            -- тип операции (0,1,2,...)
-    opd DateTime,         -- дата/время операции (как в источнике)
+    c   String,                 -- cis_id (уникальный код)
+    t   UInt8,                  -- тип операции
+    opd DateTime64(3),          -- дата/время операции (как в источнике, с миллисекундами)
 
-    -- Остальные поля допускают NULL (по спецификации многие могут быть пустыми)
-    id   Nullable(String),    -- md5(did) (перезаписывается в ETL); если did пустой -> NULL
+    -- Остальные поля допускают NULL
+    id   Nullable(String),      -- системный surrogate: md5(did), если есть did (см. ETL), иначе NULL
     did  Nullable(String),
-
-    rid  Nullable(String),  rinn Nullable(String),  rn  Nullable(String),
-    sid  Nullable(String),  sinn Nullable(String),  sn  Nullable(String),
-
+    rid  Nullable(String),  rinn Nullable(String), rn  Nullable(String),
+    sid  Nullable(String),  sinn Nullable(String), sn  Nullable(String),
     gt   Nullable(String),
     prid Nullable(String),
 
@@ -138,9 +136,9 @@ CREATE TABLE stg.daily_codes_history ON CLUSTER shardless
     ste  Nullable(UInt8),
     elr  Nullable(UInt8),
 
-    emd  Nullable(DateTime),
-    apd  Nullable(DateTime),
-    exd  Nullable(DateTime),
+    emd  Nullable(DateTime64(3)),
+    apd  Nullable(DateTime64(3)),
+    exd  Nullable(DateTime64(3)),
 
     p    Nullable(String),
     pt   Nullable(UInt8),
@@ -149,9 +147,9 @@ CREATE TABLE stg.daily_codes_history ON CLUSTER shardless
     b    Nullable(String),
 
     tt   Nullable(Int64),
-    tm   Nullable(DateTime),
+    tm   Nullable(DateTime64(3)),
 
-    -- ВАЖНО: в Phoenix это VARCHAR ARRAY → в CH храним как массив строк
+    -- ВАЖНО: дочерние коды как массив, а не строка
     ch   Array(String) DEFAULT [] CODEC(ZSTD(6)),
     j    Nullable(String),
 
@@ -161,25 +159,26 @@ CREATE TABLE stg.daily_codes_history ON CLUSTER shardless
     pvad Nullable(String),
     ag   Nullable(String),
 
-    -- системные/служебные поля от ETL
-    ts DateTime,                  -- верх бизнес-окна (UTC), задаётся ETL
-    q  UInt8 DEFAULT 0,           -- флаг дублей/служебный
+    -- Системные/служебные поля (для аудита и партиционирования)
+    ts DateTime64(3),                               -- верх бизнес-окна (как пришло, без конвертации)
+    q  UInt8 DEFAULT 0,                             -- флаг «дубль/качество» (зарезервировано; можно использовать при пост-очистке)
 
-    -- Денормы по ts для партиций/аналитики (Asia/Almaty)
-    ts_biz DateTime MATERIALIZED toTimeZone(ts, 'Asia/Almaty'),
-    d_biz  Date     MATERIALIZED toDate(ts_biz),
-    h_biz  UInt8    MATERIALIZED toHour(ts_biz),
+    -- Денормы по ts для удобства аналитики (бизнес-время Asia/Almaty)
+    ts_biz DateTime64(3) MATERIALIZED toTimeZone(ts, 'Asia/Almaty'),
+    d_biz  Date         MATERIALIZED toDate(ts_biz),
+    h_biz  UInt8        MATERIALIZED toHour(ts_biz),
 
     -- Метаданные загрузки
-    ts_ingested DateTime DEFAULT now(),
+    ts_ingested DateTime64(3) DEFAULT now64(3),     -- когда запись попала в CH
     etl_job LowCardinality(String) DEFAULT 'codes_history_etl',
     load_id UUID DEFAULT generateUUIDv4()
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/stg.daily_codes_history', '{shardless_repl}')
 PARTITION BY toYYYYMMDD(d_biz)
--- Ключ сортировки должен быть non-nullable: заворачиваем Nullable поля в ifNull()
+-- Ключ сортировки только NOT NULL поля или через ifNull
 ORDER BY (c, opd, ifNull(et, toUInt8(0)), ifNull(st, toUInt8(0)), ifNull(ste, toUInt8(0)))
-SETTINGS index_granularity = 8192;
+SETTINGS
+    index_granularity = 8192;
 
 -- =========================
 -- Распределённая таблица

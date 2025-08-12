@@ -2,17 +2,21 @@
 """
 Incremental ETL: Phoenix(HBase) → ClickHouse (+ PG-журнал, CSV опционально).
 
-Основные изменения против предыдущей версии:
-- Системные поля ВКЛЮЧЕНЫ по умолчанию (ETL_ADD_SYS_FIELDS=1):
-  * ts — верхняя граница бизнес-окна (UTC) как DateTime для CH;
-  * id — md5(did), при пустом/отсутствующем did → NULL. Исходный id перезаписывается.
-- По умолчанию sink=clickhouse (в .env SINK=clickhouse). CSV остаётся как опция (--sink csv|both).
-- ClickHouse клиент с фэйловером по списку хостов (CH_HOSTS=host1,host2,...).
-- Типовые приведения к DDL stg.daily_codes_history (DateTime/UInt/String).
+Что важно именно в этой версии:
+- DateTime из источника храним «как есть» в ClickHouse (DateTime64(3)), без перевода TZ.
+  * Для строк -> передаём строку "YYYY-MM-DD HH:MM:SS.mmm".
+  * Для datetime -> форматируем в строку с миллисекундами (отрезаем до .mmm).
+- Окно запроса в Phoenix сдвигаем на -5 часов по умолчанию (PHX_QUERY_SHIFT_MINUTES=-300).
+- Поле ch храним как Array(String) (оригинальный порядок); для ключа уникальности канонизируем (distinct+sort).
+- Жёсткая дедупликация на уровне ETL за весь запуск процесса (--since..--until..):
+  дубликаты по бизнес-ключу (без служебки) не вставляются.
+- Служебка ts/q/ts_ingested/etl_job/load_id оставлена: полезна для анализа, аудита, SLA.
 """
 
 import os
+import re
 import csv
+import json
 import argparse
 import logging
 import time
@@ -31,6 +35,7 @@ from .journal import ProcessJournal
 
 log = logging.getLogger("codes_history_etl")
 
+# Если .env не задали список колонок — используем этот базовый
 ALL_COLUMNS: List[str] = [
     "c", "t", "opd", "tm",
     "id", "did",
@@ -45,7 +50,10 @@ ALL_COLUMNS: List[str] = [
 
 HEARTBEAT_EVERY_SEC = 10
 
-# ---------- Работа со схемой Phoenix ----------
+# Поля, которые НЕ участвуют в ключе уникальности (служебка/искусственные)
+NON_BUSINESS_FIELDS = {"ts", "q", "ts_ingested", "etl_job", "load_id", "id"}  # 'id' искусственный
+
+# ----------------- Работа со схемой Phoenix -----------------
 def _discover_columns_via_limit0(pqs_url: str, table: str) -> List[str]:
     try:
         import phoenixdb
@@ -84,7 +92,7 @@ def _columns_from_settings_or_fallback(cfg: Settings) -> List[str]:
         cols = ALL_COLUMNS
     return cols
 
-# ---------- Утилиты ----------
+# ----------------- Утилиты конфигурации -----------------
 def _cfg_value(cfg: Settings, name: str, default=None):
     v = getattr(cfg, name, default)
     if isinstance(v, str):
@@ -106,7 +114,7 @@ def _cfg_int(cfg: Settings, name: str, default: int = 0) -> int:
     except Exception:
         return default
 
-# ---------- CSV writer ----------
+# ----------------- CSV writer -----------------
 def write_csv(export_dir: str, export_prefix: str, start: datetime, end: datetime,
               rows: List[dict], columns: List[str]) -> int:
     os.makedirs(export_dir, exist_ok=True)
@@ -120,9 +128,9 @@ def write_csv(export_dir: str, export_prefix: str, start: datetime, end: datetim
             w.writerow({c: r.get(c) for c in columns})
     return len(rows)
 
-# ---------- Приведение типов к CH ----------
+# ----------------- Приведение типов к CH -----------------
+# ВАЖНО: порядок должен совпадать с DDL stg.daily_codes_history (кроме MATERIALIZED/DEFAULT)
 CH_COLUMNS = [
-    # порядок должен совпадать с DDL stg.daily_codes_history
     "c","t","opd","id","did",
     "rid","rinn","rn","sid","sinn","sn",
     "gt","prid","st","ste","elr",
@@ -131,22 +139,27 @@ CH_COLUMNS = [
     "pg","et","pvad","ag",
     "ts","q"
 ]
-DT_FIELDS = {"opd","emd","apd","exd","tm","ts"}
-INT8_FIELDS = {"t","st","ste","elr","pt","et","q"}
-INT16_FIELDS = {"pg"}
-INT64_FIELDS = {"tt"}  # если есть ещё большие ints — добавляй сюда
 
-def _as_dt_utc_naive(v: Any) -> Any:
+DT_FIELDS = {"opd","emd","apd","exd","tm","ts"}
+INT8_FIELDS  = {"t","st","ste","elr","pt","et","q"}
+INT16_FIELDS = {"pg"}
+INT64_FIELDS = {"tt"}  # добавляй сюда при необходимости
+
+def _as_dt_str_keep(v: Any) -> Any:
+    """
+    Возвращаем строку DateTime64(3) «как есть», чтобы CH записал точность до миллисекунд.
+    - None / "" -> None
+    - datetime -> "YYYY-MM-DD HH:MM:SS.mmm"
+    - иначе -> str(v) (если источник уже отдаёт строку в нужном формате)
+    """
     if v is None or v == "":
         return None
     if isinstance(v, datetime):
-        return v.astimezone(timezone.utc).replace(tzinfo=None)
-    # строка iso/формат БД
-    try:
-        dt = parse_iso_utc(str(v))
-        return dt.replace(tzinfo=None)
-    except Exception:
-        return None
+        # форматируем до миллисекунд
+        return v.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    s = str(v).strip()
+    # если пришла строка без мс — оставим как есть; CH сам примет её
+    return s if s else None
 
 def _as_int(v: Any) -> Any:
     if v is None or v == "":
@@ -156,39 +169,98 @@ def _as_int(v: Any) -> Any:
     except Exception:
         return None
 
+def _parse_ch_array_storage(v: Any) -> List[str]:
+    """
+    Преобразуем значение поля ch к Array(String) для ХРАНЕНИЯ (оригинальный порядок).
+    - list/tuple → приводим элементы к str, фильтруем пустые
+    - str(JSON) → если это JSON list → как list; иначе пытаемся распарсить "A,B;C" / "{A,B}"
+    """
+    if v is None or v == "" or v == "{}":
+        return []
+    if isinstance(v, (list, tuple)):
+        return [str(x).strip() for x in v if x is not None and str(x).strip() != ""]
+    s = str(v).strip()
+    if not s:
+        return []
+    # сначала пробуем как JSON
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if x is not None and str(x).strip() != ""]
+    except Exception:
+        pass
+    # затем — просто разделители
+    raw = s.strip("[]{}()")
+    return [p.strip() for p in re.split(r"[,;|]", raw) if p.strip()]
+
+def _canon_ch_for_key(v: Any) -> tuple:
+    """
+    Канонизация ch для КЛЮЧА: distinct + sort (порядок не влияет на уникальность).
+    """
+    return tuple(sorted(set(_parse_ch_array_storage(v))))
+
+def _norm_for_key(col: str, val: Any) -> Any:
+    """
+    Нормализуем значение для ключа уникальности:
+    - DT → строка ISO с миллисекундами (UTC или «как есть», но стабильный формат)
+    - ch → канонизированный tuple
+    - list/dict → каноничный JSON
+    - остальное → str().strip()
+    """
+    if val is None or val == "":
+        return None
+    if col in DT_FIELDS:
+        # пробуем аккуратно распарсить; если не получилось — оставим str
+        try:
+            dt = parse_iso_utc(str(val))
+            return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        except Exception:
+            if isinstance(val, datetime):
+                return val.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            return str(val).strip()
+    if col == "ch":
+        return _canon_ch_for_key(val)
+    if isinstance(val, (list, dict)):
+        return json.dumps(val, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return str(val).strip()
+
 def _row_to_ch_tuple(r: Dict[str, Any]) -> tuple:
+    """
+    Готовим к вставке в ClickHouse: порядок и типы соответствуют CH_COLUMNS.
+    - DT → строка (с мс) через _as_dt_str_keep
+    - ch → Array(String) через _parse_ch_array_storage
+    """
     out = []
     for col in CH_COLUMNS:
         val = r.get(col)
         if col in DT_FIELDS:
-            out.append(_as_dt_utc_naive(val))
+            out.append(_as_dt_str_keep(val))
         elif col in INT8_FIELDS or col in INT16_FIELDS or col in INT64_FIELDS:
             out.append(_as_int(val))
+        elif col == "ch":
+            out.append(_parse_ch_array_storage(val))
         else:
+            # пустую строку превращаем в NULL
             out.append(val if val not in ("",) else None)
     return tuple(out)
 
 # ----------------------------------- main -----------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Codes History Incremental (HBase→CH/CSV + PG)")
-    parser.add_argument("--since", required=False, help="ISO (можно с TZ, напр. 2025-08-06T00:00:00+05:00)")
-    parser.add_argument("--until", required=True, help="ISO (можно с TZ)")
-    parser.add_argument("--step-min", type=int, default=None, help="Размер слайса в минутах (дефолт из env)")
+    parser.add_argument("--since", required=False, help="ISO без TZ ОК. Пример: 2025-01-15T00:00:00")
+    parser.add_argument("--until", required=True, help="ISO. Пример: 2025-01-16T00:00:00")
+    parser.add_argument("--step-min", type=int, default=None, help="Размер слайса (мин). По умолчанию из env.")
 
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--migrate-only", action="store_true", help="Только применить миграции и выйти")
+    parser.add_argument("--migrate-only", action="store_true", help="Только применить миграции PG и выйти")
     parser.add_argument("--query-shift-min", type=int, default=None,
-                        help="Сдвиг окна запроса к Phoenix в минутах (например, -300). "
-                             "По умолчанию PHX_QUERY_SHIFT_MINUTES или 0.")
+                        help="Сдвиг окна к Phoenix в минутах (например, -300). "
+                             "По умолчанию PHX_QUERY_SHIFT_MINUTES или -300.")
 
-    parser.add_argument("--list-columns", action="store_true",
-                        help="Показать фактические колонки Phoenix и выйти.")
-    parser.add_argument("--columns-strict", action="store_true",
-                        help="Строгий режим: если колонки из .env отсутствуют — аварийно завершить.")
-    parser.add_argument("--sys-fields", action="store_true",
-                        help="Явно включить системные поля (перекроет .env).")
-    parser.add_argument("--no-sys-fields", action="store_true",
-                        help="Явно выключить системные поля (перекроет .env).")
+    parser.add_argument("--list-columns", action="store_true", help="Показать фактические колонки Phoenix и выйти.")
+    parser.add_argument("--columns-strict", action="store_true", help="Если колонок из .env нет — аварийно завершить.")
+    parser.add_argument("--sys-fields", action="store_true", help="Явно включить системные поля (перекроет .env).")
+    parser.add_argument("--no-sys-fields", action="store_true", help="Явно выключить системные поля (перекроет .env).")
 
     parser.add_argument("--sink", choices=("clickhouse","csv","both"), default=None,
                         help="Куда писать данные (дефолт из .env SINK, по умолчанию clickhouse)")
@@ -231,7 +303,8 @@ def main():
     if args.query_shift_min is not None:
         qshift_min = args.query_shift_min
     else:
-        qshift_min = _cfg_int(cfg, "PHX_QUERY_SHIFT_MINUTES", 0)
+        # по умолчанию -5 часов, как ты просил
+        qshift_min = _cfg_int(cfg, "PHX_QUERY_SHIFT_MINUTES", -300)
     qshift = timedelta(minutes=qshift_min)
 
     # коннекты
@@ -248,6 +321,8 @@ def main():
             user=cfg.CH_USER,
             password=cfg.CH_PASSWORD,
             port=cfg.CH_PORT,
+            protocol=(_cfg_value(cfg, "CH_PROTOCOL", "auto") or "auto"),
+            compression=False,  # важно: чтобы не требовался clickhouse-cityhash
         )
         ch_table = cfg.CH_TABLE
         ch_batch = int(cfg.CH_INSERT_BATCH)
@@ -337,7 +412,7 @@ def main():
                 log.warning("SYS-FIELDS: колонка %r присутствует в источнике; "
                             "она будет перезаписана md5(did) или NULL.", used_sys_id_name)
 
-        # ensure did для md5
+        # ensure did для md5(id)
         compute_md5_id = False
         did_key = None
         if add_sys_fields:
@@ -369,15 +444,19 @@ def main():
         total_read = 0
         total_written_csv = 0
         total_written_ch = 0
+        skipped_dups_total = 0
         host = socket.gethostname()
         pid = os.getpid()
+
+        # Множество ключей, встреченных в ЭТОМ запуске (дедуп ETL)
+        seen_keys = set()
 
         # основной цикл
         for s, e in iter_slices(since_dt, until_dt, step_min):
             s_q = s + qshift
             e_q = e + qshift
 
-            log.info("Слайс (бизнес, UTC): %s → %s | запрос к Phoenix (UTC): %s → %s | shift=%+d мин",
+            log.info("Слайс (бизнес): %s → %s | запрос к Phoenix: %s → %s | shift=%+d мин",
                      s.isoformat(), e.isoformat(), s_q.isoformat(), e_q.isoformat(), qshift_min)
 
             journal.mark_planned(s, e)
@@ -393,10 +472,16 @@ def main():
                     read_count += len(batch)
 
                     # подготовка полей
-                    ts_dt = e.astimezone(timezone.utc).replace(tzinfo=None)  # CH DateTime (UTC, naive)
+                    # ts = верх окна e (формируем строку с мс)
+                    ts_str = e.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+                    # сформируем список колонок для ключа (без служебки)
+                    nonbiz = {x.lower() for x in NON_BUSINESS_FIELDS}
+                    key_cols = [c for c in effective_columns if c.lower() not in nonbiz]
+
                     for r in batch:
                         if add_sys_fields:
-                            r[used_sys_ts_name] = ts_dt
+                            r[used_sys_ts_name] = ts_str
                             # id = md5(did) | NULL
                             if compute_md5_id and did_key:
                                 did_val = r.get(did_key)
@@ -417,6 +502,14 @@ def main():
                         # флаг q (если не приходит из источника)
                         r.setdefault("q", 0)
 
+                        # ====== ДЕДУПЛИКАЦИЯ на уровне ETL (за весь запуск) ======
+                        dedup_key = tuple(_norm_for_key(col, r.get(col)) for col in key_cols)
+                        if dedup_key in seen_keys:
+                            skipped_dups_total += 1
+                            continue
+                        seen_keys.add(dedup_key)
+                        # =========================================================
+
                         # CSV-буфер
                         if sink in ("csv", "both"):
                             csv_buffer.append(r)
@@ -428,7 +521,7 @@ def main():
                     # heartbeat
                     now = time.monotonic()
                     if now - last_hb >= HEARTBEAT_EVERY_SEC:
-                        journal.heartbeat(run_id, progress={"rows_read": read_count})
+                        journal.heartbeat(run_id, progress={"rows_read": read_count, "dups_skipped": skipped_dups_total})
                         last_hb = now
 
                     # батчи в CH
@@ -450,7 +543,7 @@ def main():
                     s, e,
                     rows_read=read_count,
                     rows_written=(len(csv_buffer) if sink in ("csv","both") else total_written_ch),
-                    message=None
+                    message=f"dups_skipped={skipped_dups_total}"
                 )
                 total_read += read_count
 
@@ -463,8 +556,8 @@ def main():
         if getattr(cfg, "JOURNAL_RETENTION_DAYS", 0) and cfg.JOURNAL_RETENTION_DAYS > 0:
             journal.purge_older_than_days(cfg.JOURNAL_RETENTION_DAYS)
 
-        log.info("Готово. Всего прочитано: %d | в CH записано: %d | в CSV записано: %d",
-                 total_read, total_written_ch, total_written_csv)
+        log.info("Готово. Прочитано: %d | в CH записано: %d | в CSV записано: %d | дублей пропущено: %d",
+                 total_read, total_written_ch, total_written_csv, skipped_dups_total)
 
     phx.close()
     pg.close()

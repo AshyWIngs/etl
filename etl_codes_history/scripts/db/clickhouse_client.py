@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Универсальный клиент ClickHouse с авто-выбором протокола и failover.
-Принимает строки и как dict, и как tuple/list — сам конвертирует под драйвер.
+- Пытается HTTP (clickhouse-connect), если модуль не установлен → fallback на Native.
+- Для Native отключаю компрессию (compression=False), чтобы не требовался пакет clickhouse-cityhash.
+- insert() принимает как dict, так и tuple/list — конвертируется автоматически.
 
-Зависимости:
-  clickhouse-driver>=0.2.6
-  clickhouse-connect==0.8.18
+Зависимости, которые желательно иметь:
+  pip install clickhouse-connect clickhouse-driver lz4
 """
 
 import logging
@@ -37,7 +38,7 @@ class ClickHouseClient:
         verify: bool = True,
         connect_timeout: int = 5,
         send_receive_timeout: int = 600,
-        compression: bool = True,
+        compression: bool = False,        # ВЫКЛЮЧЕНО, чтобы не требовать clickhouse-cityhash
         extra_settings: Optional[Dict[str, Any]] = None,
     ):
         self.hosts = [h.strip() for h in (hosts or []) if h and h.strip()]
@@ -85,11 +86,19 @@ class ClickHouseClient:
             return self._do_insert(table_fqn, rows, columns)
         except Exception as e:
             log.warning(
-                "Ошибка вставки в %s через %s: %s — пытаюсь переподключиться и повторить один раз.",
+                "Ошибка вставки в %s через %s: %s — пытаюсь перепodключиться и повторить один раз.",
                 table_fqn, self._driver or "<?>", e
             )
             self._connect_auto()
             return self._do_insert(table_fqn, rows, columns)
+
+    def query_scalar(self, sql: str) -> Any:
+        if self._driver == "native":
+            res = self.client.execute(sql)
+            return res[0][0] if res else None
+        else:
+            res = self.client.query(sql)
+            return res.result_rows[0][0] if res and res.result_rows else None
 
     def close(self):
         try:
@@ -124,7 +133,7 @@ class ClickHouseClient:
                 except Exception as e:
                     last_err = e
                     log.warning(
-                        "Не удалось подключиться к ClickHouse на %s:%d (%s): %s",
+                        "Не удалось подключиться к ClickHouse на %s:%d (протокол %s): %s",
                         host, self._effective_port(proto), proto, e
                     )
                     self.client = None
@@ -141,7 +150,7 @@ class ClickHouseClient:
             return ["http", "native"]
         if self.port == 9000:
             return ["native", "http"]
-        return ["native", "http"]
+        return ["http", "native"]  # чаще 8123, пробуем сначала HTTP
 
     def _effective_port(self, proto: str) -> int:
         return self.port or (9000 if proto == "native" else 8123)
@@ -157,7 +166,7 @@ class ClickHouseClient:
             database=self.db,
             connect_timeout=self.connect_timeout,
             send_receive_timeout=self.send_receive_timeout,
-            compression=self.compression,
+            compression=self.compression,  # False → не нужен clickhouse-cityhash
             settings=self.settings,
         )
 
@@ -204,7 +213,6 @@ class ClickHouseClient:
                 try:
                     seq = list(r)  # tuple/list/генератор
                 except TypeError:
-                    # неитерируемое единичное значение; завернём как одна колонка
                     seq = [r]
                 if len(seq) < col_cnt:
                     seq += [None] * (col_cnt - len(seq))
