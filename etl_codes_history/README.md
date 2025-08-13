@@ -3,6 +3,20 @@
 Инкрементальная выгрузка историй кодов из Phoenix (HBase) в CSV с журналированием запусков и хранением `watermark` в PostgreSQL.
 
 ---
+# 1) Python 3.12 (важно для clickhouse-cityhash)
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+
+# 2) Создай таблицы в ClickHouse
+clickhouse-client -n --queries-file=ddl/stg_daily_codes_history.sql
+
+# 3) Настрой .env по .env.example
+cp .env.example .env
+
+# 4) Гони инкремент по окну (UTC)
+python -m scripts.codes_history_etl --since "2025-08-08T00:00:00" --until "2025-08-09T00:00:00"
 
 ## Коротко о ключевых фичах
 

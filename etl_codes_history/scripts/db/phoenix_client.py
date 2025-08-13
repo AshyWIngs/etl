@@ -1,70 +1,72 @@
-"""Клиент Phoenix (через PQS/Avatica). Корректно передаёт границы по TS."""
+# file: scripts/db/phoenix_client.py
+# -*- coding: utf-8 -*-
 import logging
-from datetime import datetime, timezone
-from typing import Dict, Iterator, List, Any
+from typing import Dict, Iterable, Iterator, List, Tuple
+from datetime import datetime
 import phoenixdb
-import phoenixdb.cursor
+
 log = logging.getLogger("scripts.db.phoenix_client")
+
 class PhoenixClient:
-    def __init__(self, url: str, fetchmany_size: int = 5000, ts_units: str = "seconds"):
-        self._url = url
-        self._fetchmany_size = fetchmany_size
-        self._ts_units = (ts_units or "seconds").lower().strip()
-        self._conn = phoenixdb.connect(url, autocommit=True)
-        self._cur = self._conn.cursor(cursor_factory=phoenixdb.cursor.DictCursor)
-        ps = getattr(phoenixdb, "paramstyle", None) or "qmark"
-        log.info("Phoenix PQS подключен (%s), paramstyle=%s", url, ps)
+    """
+    Подключается к Phoenix PQS и позволяет:
+    - получить список колонок (LIMIT 0),
+    - постранично читать инкремент за интервал [from; to).
+    """
+
+    def __init__(self, pqs_url: str, fetchmany_size: int = 5000, ts_units: str = "timestamp"):
+        # paramstyle от phoenixdb = qmark, autocommit=True (проще и быстрее для SELECT)
+        self.conn = phoenixdb.connect(pqs_url, autocommit=True)
+        self.cur = self.conn.cursor()
+        self.fetchmany_size = int(fetchmany_size)
+        self.ts_units = ts_units
+        log.info("Phoenix PQS подключен (%s), paramstyle=qmark", pqs_url)
+
     def close(self):
         try:
-            self._cur.close()
+            self.cur.close()
         finally:
-            self._conn.close()
-    def _to_ts_param(self, dt: datetime) -> Any:
-        """
-        seconds  → int epoch seconds
-        millis   → int epoch milliseconds
-        timestamp→ java.sql.Timestamp (через phoenixdb.TimestampFromTicks)
-        """
-        # нормализуем к UTC
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        else:
-            dt = dt.astimezone(timezone.utc)
+            self.conn.close()
 
-        if self._ts_units == "seconds":
-            return int(dt.timestamp())
-        if self._ts_units == "millis":
-            return int(dt.timestamp() * 1000)
+    def discover_columns(self, table: str) -> List[str]:
+        """
+        SELECT * LIMIT 0 → имена колонок как в описании таблицы.
+        """
+        self.cur.execute(f'SELECT * FROM "{table}" LIMIT 0')
+        return [d[0] for d in (self.cur.description or [])]
 
-        # TIMESTAMP: отдаём совместимый объект для Avatica
-        return phoenixdb.TimestampFromTicks(dt.timestamp())
-    def fetch_increment(self, table: str, ts_column: str, columns: List[str],
-                        start: datetime, end: datetime, fetchmany_size: int = None) -> Iterator[List[Dict]]:
-        fetchmany_size = fetchmany_size or self._fetchmany_size
-        cols_sql = "*" if columns == ["*"] else ", ".join(f'"{c}"' for c in columns)
-        sql = "SELECT {cols} FROM \"{table}\" WHERE \"{ts}\" >= ? AND \"{ts}\" < ? ORDER BY \"{ts}\"".format(
-            cols=cols_sql, table=table, ts=ts_column)
-        start_param = self._to_ts_param(start)
-        end_param = self._to_ts_param(end)
-        log.info("Phoenix SQL: %s | params: [%s → %s] | ts_units=%s | fetchmany=%s",
-                 sql, start, end, self._ts_units, fetchmany_size)
-        self._cur.execute(sql, (start_param, end_param))
+    def fetch_increment(
+        self,
+        table: str,
+        ts_col: str,
+        columns: List[str],
+        from_dt: datetime,
+        to_dt: datetime,
+    ) -> Iterator[List[Dict]]:
+        """
+        Читает блоками (fetchmany_size) интервал [from_dt, to_dt), упорядочено по ts_col.
+        Возвращает список словарей {col: value}.
+        from_dt/to_dt должны быть aware (UTC) — phoenixdb их корректно сериализует.
+        """
+        cols_quoted = ", ".join(f'"{c}"' for c in columns)
+        sql = (
+            f'SELECT {cols_quoted} FROM "{table}" '
+            f'WHERE "{ts_col}" >= ? AND "{ts_col}" < ? '
+            f'ORDER BY "{ts_col}"'
+        )
+        log.info(
+            "Phoenix SQL: %s | params: [%s → %s] | ts_units=%s | fetchmany=%d",
+            sql.replace("\n", " "),
+            from_dt.isoformat(), to_dt.isoformat(),
+            self.ts_units, self.fetchmany_size
+        )
+        self.cur.execute(sql, (from_dt, to_dt))
+
         while True:
-            batch = self._cur.fetchmany(fetchmany_size)
-            if not batch:
+            rows = self.cur.fetchmany(self.fetchmany_size)
+            if not rows:
                 break
-            yield batch
-    def max_ts_from_inc_processing(self, table: str = 'WORK.INC_PROCESSING', process_col: str = 'PROCESS',
-                                   ts_col: str = 'TS', process_value: str = None) -> int | None:
-        try:
-            if process_value:
-                sql = f'SELECT MAX("{ts_col}") AS mx FROM "{table}" WHERE "{process_col}" = ?'
-                self._cur.execute(sql, (process_value,))
-            else:
-                sql = f'SELECT MAX("{ts_col}") AS mx FROM "{table}"'
-                self._cur.execute(sql)
-            row = self._cur.fetchone()
-            return int(row["MX"]) if row and row.get("MX") is not None else None
-        except Exception as e:
-            log.warning("Не удалось прочитать MAX(%s) из %s: %s", ts_col, table, e)
-            return None
+            # описание курсора → имена колонок, порядок = как в SELECT
+            names = [d[0] for d in (self.cur.description or [])]
+            out = [dict(zip(names, r)) for r in rows]
+            yield out

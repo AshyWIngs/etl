@@ -1,0 +1,3 @@
+[sqlalchemy.dialects]
+phoenix = phoenixdb.sqlalchemy_phoenix:PhoenixDialect
+

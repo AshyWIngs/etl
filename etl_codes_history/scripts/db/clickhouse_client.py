@@ -1,243 +1,111 @@
+# file: scripts/db/clickhouse_client.py
 # -*- coding: utf-8 -*-
 """
-Универсальный клиент ClickHouse с авто-выбором протокола и failover.
-- Пытается HTTP (clickhouse-connect), если модуль не установлен → fallback на Native.
-- Для Native отключаю компрессию (compression=False), чтобы не требовался пакет clickhouse-cityhash.
-- insert() принимает как dict, так и tuple/list — конвертируется автоматически.
-
-Зависимости, которые желательно иметь:
-  pip install clickhouse-connect clickhouse-driver lz4
+Только Native (TCP, порт 9000), с компрессией.
+Список хостов — failover с проверкой SELECT 1.
+Вставка батчами, auto retry 1 раз при отвале коннекта.
 """
-
 import logging
 import random
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from clickhouse_driver import Client as NativeClient
+
 log = logging.getLogger("scripts.db.clickhouse_client")
 
-
 class ClickHouseClient:
-    """
-    Протоколы:
-      - "native"  → clickhouse-driver (TCP, порт 9000)
-      - "http"    → clickhouse-connect (HTTP/HTTPS, порт 8123)
-    Баланс по CH_HOSTS, пинг после коннекта, авто-ретрай вставки.
-    """
-
     def __init__(
         self,
         hosts: List[str],
-        port: int = 0,
-        database: Optional[str] = None,   # можно и db=...
-        db: Optional[str] = None,
-        user: Optional[str] = None,       # можно и username=...
-        username: Optional[str] = None,
-        password: Optional[str] = None,
-        protocol: str = "auto",           # "auto" | "native" | "http"
-        secure: bool = False,             # HTTPS (для HTTP-клиента)
-        verify: bool = True,
+        port: int = 9000,
+        database: str = "default",
+        user: str = "default",
+        password: str = "",
         connect_timeout: int = 5,
         send_receive_timeout: int = 600,
-        compression: bool = False,        # ВЫКЛЮЧЕНО, чтобы не требовать clickhouse-cityhash
-        extra_settings: Optional[Dict[str, Any]] = None,
+        compression: bool = True,       # включено: требует clickhouse-cityhash + lz4/zstd
+        settings: Optional[Dict[str, Any]] = None,
     ):
         self.hosts = [h.strip() for h in (hosts or []) if h and h.strip()]
         if not self.hosts:
             raise ValueError("CH_HOSTS пуст — укажи хотя бы один хост.")
-        self.port = int(port or 0)
-
-        self.db = (database or db or "default").strip() or "default"
-        self.user = ((user if user is not None else username) or "default").strip() or "default"
-        self.password = (password or "").strip()
-        self.protocol = (protocol or "auto").lower()
-        self.secure = bool(secure)
-        self.verify = bool(verify)
+        self.port = int(port)
+        self.db = database
+        self.user = user
+        self.password = password
         self.connect_timeout = int(connect_timeout)
         self.send_receive_timeout = int(send_receive_timeout)
         self.compression = bool(compression)
 
-        # Безопасные дефолты для кластерных вставок
         self.settings: Dict[str, Any] = {
-            "insert_distributed_sync": 1,
             "async_insert": 1,
             "wait_for_async_insert": 1,
+            "insert_distributed_sync": 1,
         }
-        if extra_settings:
-            self.settings.update(extra_settings)
+        if settings:
+            self.settings.update(settings)
 
-        self._driver: Optional[str] = None  # "native" | "http"
-        self.client = None
+        self.client: Optional[NativeClient] = None
         self.current_host: Optional[str] = None
+        self._connect_any()
 
-        self._connect_auto()
-
-    # ----------- публичный API -----------
-
-    def insert_rows(self, table: str, rows: Iterable[Any], columns: Sequence[str]) -> int:
-        """
-        Вставка батча.
-        Допустимые форматы rows:
-          - Iterable[Dict[str, Any]]
-          - Iterable[Tuple[Any, ...]] / Iterable[List[Any]]
-        При ошибке соединения — один переподключение+ретрай.
-        """
-        table_fqn = table if "." in table else f"{self.db}.{table}"
-        try:
-            return self._do_insert(table_fqn, rows, columns)
-        except Exception as e:
-            log.warning(
-                "Ошибка вставки в %s через %s: %s — пытаюсь перепodключиться и повторить один раз.",
-                table_fqn, self._driver or "<?>", e
-            )
-            self._connect_auto()
-            return self._do_insert(table_fqn, rows, columns)
-
-    def query_scalar(self, sql: str) -> Any:
-        if self._driver == "native":
-            res = self.client.execute(sql)
-            return res[0][0] if res else None
-        else:
-            res = self.client.query(sql)
-            return res.result_rows[0][0] if res and res.result_rows else None
+    def _connect_any(self) -> None:
+        last_err: Optional[Exception] = None
+        hosts = self.hosts[:]
+        random.shuffle(hosts)
+        for host in hosts:
+            try:
+                self.client = NativeClient(
+                    host=host,
+                    port=self.port,
+                    user=self.user,
+                    password=self.password,
+                    database=self.db,
+                    connect_timeout=self.connect_timeout,
+                    send_receive_timeout=self.send_receive_timeout,
+                    compression=self.compression,
+                    settings=self.settings,
+                )
+                self.client.execute("SELECT 1")
+                self.current_host = host
+                log.info("Подключен к ClickHouse (native) %s:%d, db=%s", host, self.port, self.db)
+                return
+            except Exception as e:
+                last_err = e
+                log.warning("Не удалось подключиться к ClickHouse на %s:%d: %s", host, self.port, e)
+                self.client = None
+                continue
+        raise last_err or RuntimeError("Не удалось подключиться к ClickHouse ни к одному хосту.")
 
     def close(self):
         try:
             if self.client:
-                self.client.close()
+                self.client.disconnect()
         except Exception:
             pass
 
-    # ----------- внутренняя кухня -----------
+    def query_scalar(self, sql: str) -> Any:
+        res = self.client.execute(sql)
+        return res[0][0] if res else None
 
-    def _connect_auto(self):
-        hosts = self.hosts[:]
-        random.shuffle(hosts)
-        order = self._protocol_order()
-
-        last_err: Optional[Exception] = None
-        for proto in order:
-            for host in hosts:
-                try:
-                    if proto == "native":
-                        self._connect_native(host)
-                    else:
-                        self._connect_http(host)
-                    self._driver = proto
-                    self.current_host = host
-                    log.info(
-                        "Подключен к ClickHouse (%s) %s:%d, db=%s",
-                        proto, host, self._effective_port(proto), self.db
-                    )
-                    self._ping()
-                    return
-                except Exception as e:
-                    last_err = e
-                    log.warning(
-                        "Не удалось подключиться к ClickHouse на %s:%d (протокол %s): %s",
-                        host, self._effective_port(proto), proto, e
-                    )
-                    self.client = None
-                    continue
-
-        raise last_err or RuntimeError("Не удалось подключиться ни по native, ни по http.")
-
-    def _protocol_order(self) -> List[str]:
-        if self.protocol in ("native", "tcp"):
-            return ["native"]
-        if self.protocol in ("http", "https"):
-            return ["http"]
-        if self.port == 8123:
-            return ["http", "native"]
-        if self.port == 9000:
-            return ["native", "http"]
-        return ["http", "native"]  # чаще 8123, пробуем сначала HTTP
-
-    def _effective_port(self, proto: str) -> int:
-        return self.port or (9000 if proto == "native" else 8123)
-
-    def _connect_native(self, host: str):
-        from clickhouse_driver import Client as NativeClient
-        port = self._effective_port("native")
-        self.client = NativeClient(
-            host=host,
-            port=port,
-            user=self.user,
-            password=self.password,
-            database=self.db,
-            connect_timeout=self.connect_timeout,
-            send_receive_timeout=self.send_receive_timeout,
-            compression=self.compression,  # False → не нужен clickhouse-cityhash
-            settings=self.settings,
-        )
-
-    def _connect_http(self, host: str):
-        import clickhouse_connect
-        port = self._effective_port("http")
-        self.client = clickhouse_connect.get_client(
-            host=host,
-            port=port,
-            username=self.user,
-            password=self.password,
-            database=self.db,
-            secure=self.secure,
-            verify=self.verify,
-            connect_timeout=self.connect_timeout,
-            settings=self.settings,
-        )
-
-    def _ping(self):
-        if self._driver == "native":
-            self.client.execute("SELECT 1")
-        else:
-            self.client.query("SELECT 1")
-
-    # ---- нормализация входных строк под драйвер ----
-
-    @staticmethod
-    def _normalize_rows(
-        rows: Iterable[Any],
-        columns: Sequence[str],
-        as_tuples: bool,
-    ) -> List[Any]:
+    def insert_rows(self, table: str, rows: Iterable[Any], columns: Sequence[str]) -> int:
         """
-        Преобразует rows к списку tuple/list длины == len(columns).
-        - dict → берём значения по именам колонок
-        - list/tuple → используем позиционно; подрезаем/дополняем None при несоответствии длин
+        Вставка батча (rows уже приведены к tuple/list по порядку columns).
+        На ошибках соединения пытаемся переподключиться и повторить один раз.
         """
-        col_cnt = len(columns)
-        out: List[Any] = []
-        for r in rows:
-            if isinstance(r, dict):
-                vals = [r.get(c) for c in columns]
-            else:
-                try:
-                    seq = list(r)  # tuple/list/генератор
-                except TypeError:
-                    seq = [r]
-                if len(seq) < col_cnt:
-                    seq += [None] * (col_cnt - len(seq))
-                elif len(seq) > col_cnt:
-                    seq = seq[:col_cnt]
-                vals = seq
-            out.append(tuple(vals) if as_tuples else list(vals))
-        return out
-
-    def _do_insert(self, table_fqn: str, rows: Iterable[Any], columns: Sequence[str]) -> int:
-        if self._driver == "native":
-            buf = self._normalize_rows(rows, columns, as_tuples=True)
-            if not buf:
-                return 0
-            sql = f"INSERT INTO {table_fqn} ({', '.join(columns)}) VALUES"
+        table_fqn = table if "." in table else f"{self.db}.{table}"
+        buf = list(rows)
+        if not buf:
+            return 0
+        sql = f"INSERT INTO {table_fqn} ({', '.join(columns)}) VALUES"
+        try:
+            self.client.execute(sql, buf)
+            return len(buf)
+        except Exception as e:
+            log.warning("Ошибка вставки в %s: %s — переподключаюсь и повторяю.", table_fqn, e)
+            self._connect_any()
             self.client.execute(sql, buf)
             return len(buf)
 
-        # http (clickhouse-connect)
-        buf = self._normalize_rows(rows, columns, as_tuples=False)
-        if not buf:
-            return 0
-        self.client.insert(table_fqn, buf, column_names=list(columns))
-        return len(buf)
-
-
-# Совместимость со старым импортом
+# Совместимость
 CHClient = ClickHouseClient

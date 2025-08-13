@@ -1,21 +1,27 @@
+# file: scripts/config.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from datetime import datetime, timezone
 from typing import List
+from datetime import datetime, timezone
 
 class Settings(BaseSettings):
+    """
+    Конфиг загружается из .env (см. .env.example).
+    """
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
 
     # Phoenix
     PQS_URL: str
-    PHX_TS_UNITS: str = "seconds"   # 'seconds' | 'millis' | 'timestamp'
+    PHX_TS_UNITS: str = "timestamp"   # 'seconds' | 'millis' | 'timestamp'
     PHX_FETCHMANY_SIZE: int = 5000
 
     # Источник данных
     HBASE_MAIN_TABLE: str = "TBL_JTI_TRACE_CIS_HISTORY"
     HBASE_MAIN_TS_COLUMN: str = "opd"
     HBASE_MAIN_COLUMNS: str = (
-        "c,t,opd,id,did,rid,rinn,rn,sid,sinn,sn,gt,prid,st,ste,elr,emd,apd,p,pt,o,"
-        "pn,b,tt,tm,ch,j,pg,et,exd,pvad,ag"
+        "c,t,opd,id,did,rid,rinn,rn,sid,sinn,sn,gt,prid,st,ste,elr,emd,apd,exd,"
+        "p,pt,o,pn,b,tt,tm,ch,j,pg,et,pvad,ag"
     )
 
     # PostgreSQL журнал
@@ -24,21 +30,12 @@ class Settings(BaseSettings):
     PROCESS_NAME: str = "codes_history_increment"
     JOURNAL_RETENTION_DAYS: int = 0
 
-    # ETL шаг/CSV отладка
+    # ETL шаг/поведение
     STEP_MIN: int = 60
-    EXPORT_DIR: str = "exports"
-    EXPORT_PREFIX: str = "codes_history_"
-
-    # Системные поля
-    ETL_ADD_SYS_FIELDS: int | bool = 1
-    ETL_SYS_TS_NAME: str = "ts"
-    ETL_SYS_ID_NAME: str = "id"
-
-    # Таймзона бизнеса
-    BUSINESS_TZ: str = "Asia/Almaty"
+    SINK: str = "clickhouse"  # только clickhouse
+    PHX_QUERY_SHIFT_MINUTES: int = -300
 
     # ClickHouse sink
-    SINK: str = "clickhouse"  # clickhouse | csv | both
     CH_HOSTS: str = "127.0.0.1"
     CH_PORT: int = 9000
     CH_DB: str = "stg"
@@ -55,10 +52,10 @@ class Settings(BaseSettings):
 
 def parse_iso_utc(s: str) -> datetime:
     """
-    Принимает ISO-строку с возможной TZ (в т.ч. 'Z').
-    Возвращает aware datetime в UTC.
+    ISO строка → aware UTC datetime.
+    'Z' поддерживается. Если без TZ — считаем это UTC.
     """
-    s = s.strip()
+    s = (s or "").strip()
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     dt = datetime.fromisoformat(s)
