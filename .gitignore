@@ -1,0 +1,88 @@
+# --- Python: байткод / кеш ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Виртуальные окружения (в любых подпапках) ---
+**/.venv/
+**/venv/
+**/env/
+**/ENV/
+
+# --- Сборки/пакетирование ---
+**/build/
+**/dist/
+**/.eggs/
+**/*.egg-info/
+**/*.egg
+**/wheels/
+**/pip-wheel-metadata/
+**/.pybuilder/
+**/*.manifest
+**/*.spec            # PyInstaller
+
+# --- Тесты/покрытие ---
+**/.tox/
+**/.nox/
+**/.pytest_cache/
+**/.coverage
+**/.coverage.*
+**/htmlcov/
+**/.hypothesis/
+**/.mypy_cache/
+**/.pytype/
+**/.pyre/
+
+# --- Логи (файлы и папки) ---
+**/logs/
+**/*.log
+
+# --- Локальные данные/экспорты/времянки (в проектах etl_*/ ) ---
+**/export/
+**/exports/
+**/data/
+**/tmp/
+**/temp/
+**/.tmp/
+**/*.tmp
+
+# Если всё же где-то будут дампы — игнорим их ТОЛЬКО внутри папок export/ или exports/
+**/export/**/*.csv
+**/exports/**/*.csv
+**/export/**/*.parquet
+**/exports/**/*.parquet
+
+# --- Jupyter ---
+**/.ipynb_checkpoints/
+
+# --- IDE/редакторы ---
+**/.vscode/
+**/.idea/
+**/*.code-workspace
+
+# --- Мусор ОС ---
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# --- Конфиг/секреты окружения (в любом проекте) ---
+**/.env
+**/.env.*
+!**/.env.example        # образцы конфигураций держим в гите
+**/.envrc
+**/*.env.local
+**/*.secrets
+**/*.key
+**/*.pem
+
+# --- Кэши и служебные файлы инструментов ---
+**/.ruff_cache/
+**/.cache/
+**/.poetry/
+**/pip-log.txt
+**/pip-delete-this-directory.txt
+
+# --- pyenv / direnv ---
+**/.python-version
+**/.direnv/
