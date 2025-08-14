@@ -14,9 +14,12 @@ ClickHouse с включённой компрессией.
 
 ---
 ## Требования
-- **Python 3.12** (нужен для `clickhouse-cityhash`).
+- **Python 3.12** (рекомендуется; для режима сжатия нужен wheel `clickhouse-cityhash`).
+- Зависимости для компрессии native‑клиента: `lz4`, `zstd`, `clickhouse-cityhash` (см. `requirements.txt`).
 - Доступ к Phoenix PQS и к ClickHouse (native 9000).
 - PostgreSQL для журнала.
+
+> Примечание: Python 3.13 может работать, но готовые колёса `clickhouse-cityhash` бывают недоступны; остаёмся на 3.12.
 
 ---
 ## Быстрый старт
@@ -33,45 +36,46 @@ clickhouse-client -n --queries-file=ddl/stg_daily_codes_history.sql
 # 3) Настройки окружения
 cp .env.example .env   # заполните значения
 
-# 4) (Опционально) прогнать миграции/инициализацию PG из кода
-python -m scripts.codes_history_etl --migrate-only
-
-# 5) Запуск инкремента
+# 4) Запуск инкремента
 python -m scripts.codes_history_etl \
   --since "2025-08-08T00:00:00Z" \
   --until "2025-08-09T00:00:00Z"
 ```
-**Примечание про время:** передавайте явный часовой пояс (`Z` или `+05:00`).
+PG‑таблицы журнала создаются автоматически при первом запуске (см. `journal.ensure()`).
 
 ---
 ## ENV (минимум)
 Создайте `.env` на основе `.env.example`. Ключевые переменные:
 ```ini
-# PostgreSQL (журнал и watermark)
-PG_DSN=postgresql://user:pass@host:5432/dbname
+# file: .env.example
+
+# --- PostgreSQL (журнал) ---
+PG_DSN=postgresql://etl_user:password@10.254.3.91:5432/etl_database?connect_timeout=5&keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5
 JOURNAL_TABLE=public.inc_processing
 PROCESS_NAME=codes_history_increment
+JOURNAL_RETENTION_DAYS=1         # опционально: для функции очистки журнала (ProcessJournal.prune_old)
 
-# Phoenix PQS
+# --- Phoenix ---
 PQS_URL=http://10.254.3.112:8765
 PHX_FETCHMANY_SIZE=5000
-PHX_TS_UNITS=timestamp   # timestamp | millis
-
-# Источник (Phoenix/HBase)
+PHX_TS_UNITS=timestamp             # 'seconds' | 'millis' | 'timestamp' — для phoenixdb
+PHX_QUERY_SHIFT_MINUTES=-300       # сдвиг окна запроса (минуты) относительно бизнес-интервала
 HBASE_MAIN_TABLE=TBL_JTI_TRACE_CIS_HISTORY
 HBASE_MAIN_TS_COLUMN=opd
+HBASE_MAIN_COLUMNS=c,t,opd,id,did,rid,rinn,rn,sid,sinn,sn,gt,prid,st,ste,elr,emd,apd,exd,p,pt,o,pn,b,tt,tm,ch,j,pg,et,pvad,ag
 
-# ClickHouse (native 9000 + компрессия)
-CLICKHOUSE_HOST=10.254.3.114
-CLICKHOUSE_PORT=9000
-CLICKHOUSE_DATABASE=stg
-CLICKHOUSE_USER=default
-CLICKHOUSE_PASSWORD=
-CLICKHOUSE_COMPRESSION=1  # включить сжатие в драйвере
+# --- ClickHouse (только native:9000) ---
+CH_HOSTS=10.254.3.111,10.254.3.112,10.254.3.113,10.254.3.114
+CH_PORT=9000
+CH_DB=stg
+CH_USER=default
+CH_PASSWORD=
+CH_TABLE=stg.daily_codes_history_all
+CH_INSERT_BATCH=20000
+CH_INSERT_MAX_RETRIES=1
 
-# Логика окна (по умолчанию)
-STEP_MIN=60
-BUSINESS_TZ=Asia/Almaty
+# --- Параметры ETL ---
+STEP_MIN=60        # размер слайда (минуты)
 ```
 
 ---
@@ -97,6 +101,15 @@ BUSINESS_TZ=Asia/Almaty
 - **`can't subtract offset-naive and offset-aware datetimes`** — передайте `--since/--until` с таймзоной
   (например, `...T00:00:00Z` или `...T00:00:00+05:00`).
 - **`TTL ... should have DateTime or Date, but has DateTime64`** — используйте в TTL `toDateTime(...)` или поля без суффикса `(3)` (см. актуальный DDL в `ddl/`).
+- **`No module named 'zstd'`** — установите C‑расширение Zstandard:
+  ```bash
+  pip install zstd
+  ```
+- **`Package clickhouse-cityhash is required to use compression`** — установите:
+  ```bash
+  pip install "clickhouse-cityhash==1.0.2.4"
+  ```
+  Если временно не можете поставить — запустите без сжатия, передав `compression=False` при создании `CHClient` (будет больше трафика).
 
 ---
 ## Локальный гайд по Git

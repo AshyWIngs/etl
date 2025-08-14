@@ -51,13 +51,14 @@ CREATE TABLE stg.daily_codes_history ON CLUSTER shardless
     et   Nullable(UInt8),
 
     pvad Nullable(String) CODEC(ZSTD(6)),
-    ag   Nullable(String) CODEC(ZSTD(6))
+    ag   Nullable(String) CODEC(ZSTD(6)),
+    ingested_at DateTime DEFAULT now()   -- время загрузки в CH (фиксируется при INSERT)
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/stg.daily_codes_history', '{shardless_repl}')
 PARTITION BY toYYYYMMDD(opd)             -- дневные партиции (совпадает со слайсами выгрузки)
 ORDER BY (c, opd, t)                     -- под типовые запросы (по коду и интервалу дат)
 -- TTL: например, удалять старше 180 дней по дате операции
-TTL toDateTime(opd) + INTERVAL 180 DAY DELETE   -- <-- явный cast из DateTime64(3) в DateTime
+TTL ingested_at + INTERVAL 180 DAY DELETE   -- чистим по времени загрузки, а не по бизнес-времени
 SETTINGS index_granularity = 8192;
 
 -- =========================
