@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from psycopg.types.json import Json
+from psycopg.errors import UniqueViolation
 
 log = logging.getLogger("scripts.journal")
 
@@ -57,14 +58,17 @@ class ProcessJournal:
         # простой check на статусы
         self.pg.execute(f"""
         DO $$
+        DECLARE
+          v_rel regclass := to_regclass('{self.table.replace("'", "''")}');
+          v_constraint text := 'inc_processing_status_chk';
         BEGIN
-          IF EXISTS (
-            SELECT 1 FROM pg_constraint c
-            JOIN pg_class t ON t.oid = c.conrelid
-            WHERE t.relname = '{self._tail_identifier(self.table)}'
-              AND c.conname = 'inc_processing_status_chk'
+          IF v_rel IS NOT NULL AND EXISTS (
+            SELECT 1
+              FROM pg_constraint c
+             WHERE c.conrelid = v_rel
+               AND c.conname  = v_constraint
           ) THEN
-            EXECUTE 'ALTER TABLE {self.table} DROP CONSTRAINT inc_processing_status_chk';
+            EXECUTE format('ALTER TABLE %%s DROP CONSTRAINT %%I', v_rel, v_constraint);
           END IF;
         END$$;
         """)
@@ -153,13 +157,28 @@ class ProcessJournal:
             rid = row[0]
             log.warning("Активный запуск уже существует (id=%s) — пропускаю вставку planned.", rid)
             return rid
-        self.pg.execute(
-            f"INSERT INTO {self.table} (process_name, status, details) VALUES (%s, 'planned', %s::jsonb) RETURNING id",
-            (self.process_name, Json(payload)),
-        )
-        rid = self.pg.fetchone()[0]
-        log.info("Запланирован запуск %s: id=%s [%s → %s]", self.process_name, rid, sf, st)
-        return rid
+        try:
+            self.pg.execute(
+                f"INSERT INTO {self.table} (process_name, status, details) VALUES (%s, 'planned', %s::jsonb) RETURNING id",
+                (self.process_name, Json(payload)),
+            )
+            rid = self.pg.fetchone()[0]
+            log.info("Запланирован запуск %s: id=%s [%s → %s]", self.process_name, rid, sf, st)
+            return rid
+        except UniqueViolation:
+            # Гонка: параллельно уже появился active planned/running под уникальным индексом.
+            self.pg.execute(
+                f"SELECT id FROM {self.table} "
+                "WHERE process_name=%s AND ts_end IS NULL AND status IN ('planned','running') "
+                "ORDER BY ts_start DESC LIMIT 1",
+                (self.process_name,)
+            )
+            row2 = self.pg.fetchone()
+            if not row2:
+                raise
+            rid = row2[0]
+            log.warning("Активный запуск уже создан параллельно (id=%s) — использую его.", rid)
+            return rid
 
     def mark_running(self, slice_from: datetime, slice_to: datetime, host: Optional[str] = None, pid: Optional[int] = None) -> int:
         sf = self._to_aware_utc(slice_from).isoformat()
@@ -235,6 +254,7 @@ class ProcessJournal:
         row = self.pg.fetchone()
         rid = row[0] if row else None
         log.info("Запуск %s завершён: OK", rid if rid else "-")
+        self._current_run_id = None
 
         # обновим watermark (берём правую границу)
         st_dt = self._to_aware_utc(slice_to)
@@ -259,12 +279,67 @@ class ProcessJournal:
            AND (details->>'slice_from')=%s AND (details->>'slice_to')=%s
         """, (Json({"error": str(message)}), self.process_name, sf, st))
         log.info("Запуск завершён: ERROR: %s", message)
+        self._current_run_id = None
 
     # watermark helpers
     def get_watermark(self) -> Optional[datetime]:
         self.pg.execute(f"SELECT watermark FROM {self.state_table} WHERE process_name=%s", (self.process_name,))
         row = self.pg.fetchone()
         return row[0] if row else None
+
+
+    def prune_old(self, days: Optional[int] = None, batch_size: int = 10000) -> int:
+        """
+        Мягкая ретенция: удаляет завершённые записи (ok|error|skipped) старше N дней
+        батчами по batch_size. Минимизирует длительные блокировки. Возвращает суммарное
+        число удалённых строк.
+        """
+        # Если days не передан — берём из переменной окружения JOURNAL_RETENTION_DAYS.
+        # Пустое/отсутствующее значение → используем дефолт 30.
+        if days is None:
+            import os
+            env_val = os.getenv("JOURNAL_RETENTION_DAYS", "").strip()
+            if env_val == "":
+                days = 30
+            else:
+                try:
+                    days = int(env_val)
+                except ValueError:
+                    log.warning("JOURNAL_RETENTION_DAYS некорректно (%r) — использую 30.", env_val)
+                    days = 30
+
+        # days ≤ 0 — мягкая ретенция отключена.
+        if days <= 0:
+            log.info("prune_old: отключено (days=%d).", days)
+            return 0
+
+        days = int(days)
+        batch_size = int(batch_size)
+        total = 0
+        while True:
+            self.pg.execute(f"""
+            WITH del AS (
+                SELECT id
+                  FROM {self.table}
+                 WHERE ts_end IS NOT NULL
+                   AND status IN ('ok','error','skipped')
+                   AND ts_end < now() - INTERVAL '{days} days'
+                 ORDER BY ts_end, id
+                 LIMIT {batch_size}
+            )
+            DELETE FROM {self.table} t
+              USING del
+             WHERE t.id = del.id
+            RETURNING t.id
+            """)
+            rows = self.pg.fetchall() or []
+            n = len(rows)
+            total += n
+            if n < batch_size:
+                break
+        if total:
+            log.warning("prune_old(%d, batch=%d): удалено %d завершённых записей.", days, batch_size, total)
+        return total
 
     def sanitize_stale(
         self,

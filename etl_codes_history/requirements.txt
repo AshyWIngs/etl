@@ -2,6 +2,7 @@
 clickhouse-driver==0.2.9
 lz4>=4.3.3
 zstandard>=0.22.0
+zstd>=1.5.5  # clickhouse-driver импортирует модуль 'zstd' (не 'zstandard')
 # ВАЖНО: для Py3.12 есть готовые колёса cityhash. Для Py3.13 они не выходят.
 clickhouse-cityhash==1.0.2.4
 

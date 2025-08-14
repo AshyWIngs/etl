@@ -32,10 +32,9 @@ class Settings(BaseSettings):
 
     # ETL шаг/поведение
     STEP_MIN: int = 60
-    SINK: str = "clickhouse"  # только clickhouse
     PHX_QUERY_SHIFT_MINUTES: int = -300
 
-    # ClickHouse sink
+    # ClickHouse — единственный sink; параметр SINK удалён.
     CH_HOSTS: str = "127.0.0.1"
     CH_PORT: int = 9000
     CH_DB: str = "stg"
@@ -43,6 +42,7 @@ class Settings(BaseSettings):
     CH_PASSWORD: str = ""
     CH_TABLE: str = "stg.daily_codes_history_all"
     CH_INSERT_BATCH: int = 20000
+    CH_INSERT_MAX_RETRIES: int = 1  # сколько раз повторяем insert при сбое соединения
 
     def main_columns_list(self) -> List[str]:
         return [c.strip() for c in (self.HBASE_MAIN_COLUMNS or "").split(",") if c.strip()]

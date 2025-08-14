@@ -146,7 +146,7 @@ def main():
         database=cfg.CH_DB,
         user=cfg.CH_USER,
         password=cfg.CH_PASSWORD,
-        compression=True,  # native+compression → нужен clickhouse-cityhash
+        compression=True,  # Native+compression → нужны lz4 и zstd для clickhouse-driver
     )
     ch_table = cfg.CH_TABLE
     ch_batch = int(cfg.CH_INSERT_BATCH)

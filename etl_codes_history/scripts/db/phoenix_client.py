@@ -1,7 +1,7 @@
 # file: scripts/db/phoenix_client.py
 # -*- coding: utf-8 -*-
 import logging
-from typing import Dict, Iterable, Iterator, List, Tuple
+from typing import Dict, Iterator, List
 from datetime import datetime
 import phoenixdb
 
@@ -15,12 +15,35 @@ class PhoenixClient:
     """
 
     def __init__(self, pqs_url: str, fetchmany_size: int = 5000, ts_units: str = "timestamp"):
-        # paramstyle от phoenixdb = qmark, autocommit=True (проще и быстрее для SELECT)
-        self.conn = phoenixdb.connect(pqs_url, autocommit=True)
+        # Пробуем бинарный протокол Avatica (protobuf) — обычно быстрее JSON.
+        serialization_used = "protobuf"
+        try:
+            # Новые версии phoenixdb поддерживают явный выбор protobuf
+            self.conn = phoenixdb.connect(
+                pqs_url,
+                autocommit=True,
+                serialization="protobuf",
+            )
+        except TypeError:
+            # Старые версии phoenixdb не знают параметр `serialization` — используем дефолт (JSON)
+            self.conn = phoenixdb.connect(
+                pqs_url,
+                autocommit=True,
+            )
+            serialization_used = "json"
+        except Exception as e:
+            # Любая другая ошибка при попытке protobuf — откатываемся на JSON по умолчанию
+            log.warning("Phoenix protobuf connect failed (%s) — falling back to JSON.", e)
+            self.conn = phoenixdb.connect(
+                pqs_url,
+                autocommit=True,
+            )
+            serialization_used = "json"
         self.cur = self.conn.cursor()
         self.fetchmany_size = int(fetchmany_size)
         self.ts_units = ts_units
-        log.info("Phoenix PQS подключен (%s), paramstyle=qmark", pqs_url)
+        self.cur.arraysize = self.fetchmany_size  # подсказка драйверу: размер кадра/пакета
+        log.info("Phoenix PQS подключен (%s), paramstyle=qmark, serialization=%s", pqs_url, serialization_used)
 
     def close(self):
         try:
@@ -70,3 +93,4 @@ class PhoenixClient:
             names = [d[0] for d in (self.cur.description or [])]
             out = [dict(zip(names, r)) for r in rows]
             yield out
+            
