@@ -40,7 +40,11 @@ class Settings(BaseSettings):
     CH_DB: str = "stg"
     CH_USER: str = "default"
     CH_PASSWORD: str = ""
-    CH_TABLE: str = "stg.daily_codes_history_all"
+    # Таблицы ClickHouse (stg-схема)
+    CH_RAW_TABLE: str = "stg.daily_codes_history_raw_all"
+    CH_CLEAN_TABLE: str = "stg.daily_codes_history"
+    CH_CLEAN_ALL_TABLE: str = "stg.daily_codes_history_all"
+    CH_DEDUP_BUF_TABLE: str = "stg.daily_codes_history_dedup_buf"
     CH_INSERT_BATCH: int = 20000
     CH_INSERT_MAX_RETRIES: int = 1  # сколько раз повторяем insert при сбое соединения
 

@@ -10,8 +10,16 @@ import random
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from clickhouse_driver import Client as NativeClient
+import re
+from clickhouse_driver import errors as ch_errors
 
 log = logging.getLogger("scripts.db.clickhouse_client")
+
+# Регулярка для безопасной проверки «это INSERT?» с учётом пробелов и комментариев
+_INSERT_RE = re.compile(
+    r"^\s*(?:--.*?$|\s|/\*.*?\*/)*INSERT\b",
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+)
 
 class ClickHouseClient:
     def __init__(
@@ -72,6 +80,78 @@ class ClickHouseClient:
         self.current_host: Optional[str] = None
         self._connect_any()
 
+    def _is_insert(self, sql: str) -> bool:
+        """
+        Возвращает True, если sql начинается с INSERT (игнорируя пробелы и комментарии).
+        """
+        return bool(_INSERT_RE.match(sql or ""))
+
+    def _clear_force_insert(self) -> None:
+        """
+        Страховка от бага clickhouse-driver: после INSERT соединение может
+        остаться в состоянии «force insert». Для любых не-INSERT запросов
+        обнуляем внутренние флаги соединения, если они присутствуют.
+        """
+        try:
+            conn = getattr(self.client, "connection", None)
+            if conn is not None:
+                if hasattr(conn, "force_insert_query"):
+                    conn.force_insert_query = False
+                if hasattr(conn, "force_insert"):
+                    conn.force_insert = False
+        except Exception:
+            # best-effort: не мешаем основному потоку
+            pass
+
+    def _execute_once(
+        self,
+        sql: str,
+        params: Optional[Sequence] = None,
+        settings: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Единичный вызов self.client.execute с безопасной обработкой не-INSERT запросов.
+        - для не-INSERT: сбрасываем force_insert* флаги и не передаём пустой params вовсе.
+        - для INSERT: ведём себя стандартно.
+        """
+        is_insert = self._is_insert(sql)
+        exec_settings = settings or {}
+        if not is_insert:
+            self._clear_force_insert()
+            # ВАЖНО: если params пустой — НЕ передавать его, чтобы драйвер не переключился на insert-ветку
+            if params is None or (isinstance(params, (list, tuple)) and len(params) == 0):
+                return self.client.execute(sql, settings=exec_settings)
+            else:
+                return self.client.execute(sql, params=params, settings=exec_settings)
+        else:
+            if params is None or (isinstance(params, (list, tuple)) and len(params) == 0):
+                return self.client.execute(sql, settings=exec_settings)
+            else:
+                return self.client.execute(sql, params=params, settings=exec_settings)
+
+    def _execute_with_retry(
+        self,
+        sql: str,
+        params: Optional[Sequence] = None,
+        settings: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Один автоматический повтор при UnexpectedPacketFromServerError:
+        - на повторе выполняем reconnect() и делаем второй вызов.
+        Это покрывает редкий флап после bulk INSERT/разрывов соединения,
+        когда драйвер ошибочно ждёт пакеты «как при вставке».
+        """
+        try:
+            return self._execute_once(sql, params=params, settings=settings)
+        except ch_errors.UnexpectedPacketFromServerError as e:
+            # типичный флап: сервер закрыл соединение, а клиент ждал "sample block/Data"
+            log.warning(
+                "UnexpectedPacketFromServerError на '%s': %s — reconnect() и один повтор.",
+                (sql.split()[0] if sql else "query"), e
+            )
+            self.reconnect()
+            return self._execute_once(sql, params=params, settings=settings)
+
     def _connect_any(self) -> None:
         last_err: Optional[Exception] = None
         hosts = self.hosts[:]
@@ -123,13 +203,45 @@ class ClickHouseClient:
             pass
 
     def query_scalar(self, sql: str) -> Any:
-        res = self.client.execute(sql)
+        """
+        Выполняет SELECT и возвращает первое скалярное значение.
+        Использует безопасный путь исполнения + 1 ретрай при UnexpectedPacketFromServerError.
+        """
+        res = self._execute_with_retry(sql)
         return res[0][0] if res else None
+
+    def execute(self, sql: str, params: Optional[Sequence] = None, settings: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Универсальный вызов (DDL/DML/ALTER/INSERT SELECT) с поддержкой settings.
+        Защита от «залипания» драйвера в insert-режиме и 1 авто-повтор при
+        UnexpectedPacketFromServerError.
+        """
+        self._execute_with_retry(sql, params=params, settings=settings)
+
+    def query_all(self, sql: str, params: Optional[Sequence] = None, settings: Optional[Dict[str, Any]] = None) -> List[tuple]:
+        """
+        SELECT → список строк. Использует безопасный путь исполнения
+        (сброс force_insert для не-INSERT) и 1 авто-повтор при UnexpectedPacketFromServerError.
+        """
+        return self._execute_with_retry(sql, params=params, settings=settings)  # type: ignore[return-value]
+
+    def reconnect(self) -> None:
+        """
+        Принудительное переподключение (обход глюков драйвера после bulk INSERT).
+        """
+        try:
+            if self.client:
+                self.client.disconnect()
+        except Exception:
+            pass
+        self._connect_any()
 
     def insert_rows(self, table: str, rows: Iterable[Any], columns: Sequence[str]) -> int:
         """
         Вставка порциями (чанками). На каждую порцию — до `insert_max_retries` переподключений.
         Ожидается, что `rows` выдаёт элементы, уже приведённые к tuple/list по порядку `columns`.
+        Здесь НЕ трогаем никаких внутренних "force insert" флагов — драйвер корректно
+        определяет режим по самому SQL (INSERT), а для не-INSERT это делается в _execute_*().
         """
         table_fqn = table if "." in table else f"{self.db}.{table}"
         sql = f"INSERT INTO {table_fqn} ({', '.join(columns)}) VALUES"
