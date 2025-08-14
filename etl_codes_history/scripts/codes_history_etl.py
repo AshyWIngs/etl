@@ -2,25 +2,73 @@
 # -*- coding: utf-8 -*-
 """
 Incremental ETL: Phoenix(HBase) → ClickHouse (только Native 9000, c компрессией).
-Требования:
-- переносим поля «как есть» (никаких sys-полей и вычислений id/md5),
-- дедуп в рамках запуска по (c, t, opd),
-- окно запроса к Phoenix сдвигаем относительно бизнес-интервала (PHX_QUERY_SHIFT_MINUTES),
-- DateTime64(3) передаём как python datetime (naive), обрезая до миллисекунд,
-- никаких CSV: сразу вставляем в ClickHouse.
+
+Ключевые принципы:
+- Переносим поля «как есть» (никаких sys-полей и вычислений id/md5).
+- Дедуп в рамках публикации по (c, t, opd) через argMax(..., ingested_at).
+- Окно запроса к Phoenix: бизнес-интервал + сдвиг PHX_QUERY_SHIFT_MINUTES
+  + «захлёст» назад PHX_QUERY_OVERLAP_MINUTES (обычно только на первом слайсе)
+  + «лаг» справа PHX_QUERY_LAG_MINUTES (не трогаем «кипящее»).
+- DateTime64(3) передаём как python datetime (naive), обрезая до миллисекунд.
+- Никаких CSV: сразу INSERT в ClickHouse (native 9000, compression).
+- Публикация (дедуп/REPLACE) делается **автоматически по каденсу**, без ручных флагов:
+  • PUBLISH_EVERY_MINUTES — минимальный интервал времени между публикациями,
+  • PUBLISH_EVERY_SLICES  — минимальное число успешно обработанных слайсов.
+  По достижении одного из порогов выполняется публикация «накопленных» партиций
+  и скрипт продолжает обработку дальше вплоть до правой границы --until.
+  Для надёжности можно включить ALWAYS_PUBLISH_AT_END=1 (по умолчанию) — финальная публикация в конце запуска.
 
 Чтобы избежать ошибки clickhouse-driver вида "'str' has no attribute 'tzinfo'",
 строго передаём DateTime в виде datetime, а не строк.
+
+────────────────────────────────────────────────────────────────────────────────
+КАК ЭТО РАБОТАЕТ (сквозной поток)
+1) Разбиваем заданное окно [--since, --until) на «слайды» длиной STEP_MIN (например 10–60 минут).
+   Для каждого бизнес-слайда вычисляется окно запроса в Phoenix с учётом:
+   shift (PHX_QUERY_SHIFT_MINUTES), overlap (PHX_QUERY_OVERLAP_MINUTES) и lag (PHX_QUERY_LAG_MINUTES).
+
+2) Для КАЖДОГО слайда:
+   • В журнале PG фиксируем planned → running (ProcessJournal), обновляем heartbeat.
+   • Читаем Phoenix порциями (fetchmany PHX_FETCHMANY_SIZE), упорядочено по времени.
+   • Для каждой строки:
+       - нормализуем типы под ClickHouse (TZ → naive, microseconds → milliseconds),
+       - локально дедупим ключ (c, t, opd) в рамках ТЕКУЩЕГО запуска,
+       - кладём кортеж в буфер ch_rows.
+   • Как только буфер достиг CH_INSERT_BATCH (например 20000) — выполняем INSERT VALUES в RAW.
+     Хвост < порога — отдельный INSERT в конце слайда.
+   • Запоминаем партиции (toYYYYMMDD(opd)), которых коснулся текущий слайс.
+
+3) Автопубликация (внутри основного цикла):
+   • Если прошёл порог по времени (PUBLISH_EVERY_MINUTES) и/или набралось
+     достаточно удачных слайсов (PUBLISH_EVERY_SLICES), выполняем публикацию:
+     DROP BUF → INSERT BUF (GROUP BY ... argMax) → REPLACE CLEAN → DROP BUF.
+     Операции измеряются (perf_counter) и логируются. Заводим отдельную запись в журнале
+     с именем '<PROCESS_NAME>:dedup' на каждую публикацию.
+
+4) По завершении окна (или если включён ALWAYS_PUBLISH_AT_END) — финальная публикация
+   оставшихся партиций (если есть).
+
+5) Надёжность:
+   • Один активный инстанс процесса (advisory-lock + частичный UNIQUE-индекс).
+   • Санитация planned/running, heartbeat-таймауты и жёсткий TTL до старта.
+   • CH-операции обёрнуты в мягкий retry при UnexpectedPacketFromServerError (EndOfStream):
+     reconnect() + один повтор.
+
+РЕЗЮМЕ ПО INSERT:
+• Не копим сутки в памяти. Пишем в RAW по мере накопления буфера, «хвост» на каждом слайсе.
+• Публикация (INSERT SELECT → REPLACE PARTITION) — периодическая/финальная, управляется каденсом.
 """
 from __future__ import annotations
+
 import argparse
 import logging
 import os
 import re
 import json
 import socket
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Tuple
+from psycopg.errors import UniqueViolation
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Tuple, Iterable, Optional, Set
 
 from .logging_setup import setup_logging
 from .config import Settings, parse_iso_utc
@@ -28,12 +76,8 @@ from .slicer import iter_slices
 from .db.phoenix_client import PhoenixClient
 from .db.pg_client import PGClient
 from .db.clickhouse_client import ClickHouseClient as CHClient
-
 from .journal import ProcessJournal
-
-# Ошибки драйвера ClickHouse (используем для точечного ретрая при "Unexpected packet" / "EndOfStream")
 from clickhouse_driver import errors as ch_errors
-# Высокоточный монотонный таймер — для измерения длительности этапов дедупа
 from time import perf_counter
 
 log = logging.getLogger("codes_history_etl")
@@ -51,7 +95,6 @@ CH_COLUMNS = [
     "pg","et",
     "pvad","ag"
 ]
-
 CH_COLUMNS_STR = ", ".join(CH_COLUMNS)
 
 DT_FIELDS = {"opd","emd","apd","exd","tm"}
@@ -59,11 +102,9 @@ INT8_FIELDS  = {"t","st","ste","elr","pt","et"}
 INT16_FIELDS = {"pg"}
 INT64_FIELDS = {"tt"}  # при необходимости добавляй сюда
 
+# ------------------------ УТИЛИТЫ ТИПИЗАЦИИ ------------------------
+
 def _to_dt64_obj(v: Any) -> Any:
-    """
-    Любое значение → datetime (naive) с точностью до миллисекунд, либо None.
-    Если пришёл aware — TZ выбрасываем, момент не сдвигаем.
-    """
     if v is None or v == "":
         return None
     if isinstance(v, datetime):
@@ -115,9 +156,6 @@ def _parse_ch_storage(v: Any) -> List[str]:
     return arr or []
 
 def _row_to_ch_tuple(r: Dict[str, Any]) -> tuple:
-    """
-    Приведение типов под ClickHouse DDL (см. CH_COLUMNS).
-    """
     out = []
     for col in CH_COLUMNS:
         val = r.get(col)
@@ -126,10 +164,41 @@ def _row_to_ch_tuple(r: Dict[str, Any]) -> tuple:
         elif col in INT8_FIELDS or col in INT16_FIELDS or col in INT64_FIELDS:
             out.append(_as_int(val))
         elif col == "ch":
-            out.append(_parse_ch_storage(val))  # теперь гарантированно [] либо список строк
+            out.append(_parse_ch_storage(val))
         else:
             out.append(val if val not in ("",) else None)
     return tuple(out)
+
+# ------------------------ ВСПОМОГАТЕЛЬНОЕ ------------------------
+
+def _iter_partitions_by_day(start_dt: datetime, end_dt: datetime) -> Iterable[int]:
+    """
+    Возвращает toYYYYMMDD(int) для всех дней в полуинтервале [start_dt, end_dt).
+    """
+    if start_dt >= end_dt:
+        return []
+    start_day = start_dt.date()
+    end_day_inclusive = (end_dt - timedelta(milliseconds=1)).date()
+    d = start_day
+    while d <= end_day_inclusive:
+        yield int(d.strftime("%Y%m%d"))
+        d += timedelta(days=1)
+
+def _parts_to_interval(parts: Iterable[int]) -> Tuple[datetime, datetime]:
+    """
+    По множеству партиций строим (since, until) в UTC для под-журнала публикации.
+    """
+    ps = sorted(set(parts))
+    if not ps:
+        now = datetime.now(timezone.utc)
+        return now, now
+    d0 = datetime.strptime(str(ps[0]), "%Y%m%d").date()
+    d1 = datetime.strptime(str(ps[-1]), "%Y%m%d").date()
+    start = datetime(d0.year, d0.month, d0.day, tzinfo=timezone.utc)
+    end   = datetime(d1.year, d1.month, d1.day, tzinfo=timezone.utc) + timedelta(days=1)
+    return start, end
+
+# ------------------------ ОСНОВНОЙ СЦЕНАРИЙ ------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Codes History Incremental (Phoenix→ClickHouse)")
@@ -138,12 +207,15 @@ def main():
     parser.add_argument("--step-min", type=int, default=None, help="Размер слайда (мин). По умолчанию из .env STEP_MIN")
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--manual-start", action="store_true", help="Если указан, журнал ведётся под именем 'manual_<PROCESS_NAME>' (ручной запуск).")
+    # Флаги оставлены как аварийные «оверрайды», но в обычной эксплуатации не требуются:
+    parser.add_argument("--no-publish", action="store_true", help="Принудительно отключить публикацию (override автокаденса).")
+    parser.add_argument("--force-publish", action="store_true", help="Принудительно выполнить публикацию (override автокаденса).")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
     cfg = Settings()
 
-    # Фактическое имя процесса в журнале: для ручных запусков добавляем префикс manual_
+    # Имя процесса в журнале
     process_name = ("manual_" + str(getattr(cfg, "PROCESS_NAME", ""))) if args.manual_start else cfg.PROCESS_NAME
 
     # Журнал и коннекты
@@ -158,20 +230,36 @@ def main():
         database=cfg.CH_DB,
         user=cfg.CH_USER,
         password=cfg.CH_PASSWORD,
-        compression=True,  # Native+compression → нужны lz4, zstd и clickhouse-cityhash для clickhouse-driver
+        compression=True,
     )
-    # Таблицы ClickHouse: сырой слой (RAW), чистый слой (CLEAN), их Distributed и буфер дедупликации
-    ch_table_raw_all   = cfg.CH_RAW_TABLE         # например: stg.daily_codes_history_raw_all
-    ch_table_clean     = cfg.CH_CLEAN_TABLE       # например: stg.daily_codes_history
-    ch_table_clean_all = cfg.CH_CLEAN_ALL_TABLE   # например: stg.daily_codes_history_all
-    ch_table_buf       = cfg.CH_DEDUP_BUF_TABLE   # например: stg.daily_codes_history_dedup_buf
+
+    # Таблицы ClickHouse
+    ch_table_raw_all   = cfg.CH_RAW_TABLE
+    ch_table_clean     = cfg.CH_CLEAN_TABLE
+    ch_table_clean_all = cfg.CH_CLEAN_ALL_TABLE
+    ch_table_buf       = cfg.CH_DEDUP_BUF_TABLE
     ch_batch = int(cfg.CH_INSERT_BATCH)
 
     # Времена
-    since_dt = parse_iso_utc(args.since) if args.since else None
+    since_dt = parse_iso_utc(args.since) if args.since else journal.get_watermark() or None
+    if since_dt is None:
+        raise SystemExit("Не задан --since и нет watermark в журнале")
     until_dt = parse_iso_utc(args.until)
-    step_min = args.step_min if args.step_min is not None else int(cfg.STEP_MIN)
-    qshift   = timedelta(minutes=int(cfg.PHX_QUERY_SHIFT_MINUTES))
+    step_min = args.step_min if args.step_min is not None else int(getattr(cfg, "STEP_MIN", 60))
+    qshift   = timedelta(minutes=int(getattr(cfg, "PHX_QUERY_SHIFT_MINUTES", 0)))
+
+    # Лаг и захлёст
+    phx_lag_min   = int(getattr(cfg, "PHX_QUERY_LAG_MINUTES", 0) or 0)
+    phx_overlap_min = int(getattr(cfg, "PHX_QUERY_OVERLAP_MINUTES", 0) or 0)
+    overlap_only_first_slice = bool(int(getattr(cfg, "PHX_OVERLAP_ONLY_FIRST_SLICE", 1)))
+
+    lag_delta       = timedelta(minutes=phx_lag_min) if phx_lag_min > 0 else timedelta(0)
+    overlap_delta_c = timedelta(minutes=phx_overlap_min) if phx_overlap_min > 0 else timedelta(0)
+
+    # Автокаденс публикаций
+    publish_every_min    = int(getattr(cfg, "PUBLISH_EVERY_MINUTES", 60) or 0)   # 0 → выкл
+    publish_every_slices = int(getattr(cfg, "PUBLISH_EVERY_SLICES", 0) or 0)     # 0 → выкл
+    always_publish_at_end = bool(int(getattr(cfg, "ALWAYS_PUBLISH_AT_END", 1)))
 
     # Схема Phoenix → валидация списка колонок
     try:
@@ -195,25 +283,149 @@ def main():
         raise SystemExit("После согласования колонок не осталось ни одной для SELECT — выход.")
     log.info("Итоговые колонки для SELECT (%d): %s", len(effective), ", ".join(effective))
 
-    # Watermark
-    watermark = journal.get_watermark()
-    if since_dt is None:
-        if watermark is not None:
-            since_dt = watermark
-            log.info("Старт от watermark (PG, UTC): %s", since_dt.isoformat())
-        else:
-            raise SystemExit("Не задан --since и нет watermark в журнале")
-
     total_read = 0
     total_written_ch = 0
-    # Границы всего охваченного окна загрузки (UTC, с учётом сдвига qshift) — понадобятся для определения партиций
-    overall_since = None
-    overall_until = None
+    overall_since: Optional[datetime] = None
+    overall_until: Optional[datetime] = None
+
     host = socket.gethostname()
     pid = os.getpid()
 
-    # Множество ключей, встреченных в ЭТОМ запуске (дедуп ETL по (c,t,opd))
-    seen_keys = set()
+    seen_keys = set()                # локальный дедуп на запуск
+    pending_parts: Set[int] = set()  # партиции, требующие публикации
+    slices_since_last_pub = 0
+    last_pub_dt = journal.last_ok_end(process_name + ":dedup")  # из PG (последний успешный дедуп)
+
+    # Настройки CH для дедуп-агрегации
+    ch_dedup_settings = {
+        "max_threads": 0,
+        "max_memory_usage": 8 * 1024 * 1024 * 1024,                   # 8G
+        "max_bytes_before_external_group_by": 2 * 1024 * 1024 * 1024,  # 2G
+        "distributed_aggregation_memory_efficient": 1,
+    }
+
+    def _ch_exec(sql: str, *, settings: dict | None = None, label: str = "",
+                 stage: str | None = None, part: int | None = None,
+                 journal_pub: Optional[ProcessJournal] = None) -> int:
+        t0 = perf_counter()
+        try:
+            ch.execute(sql, settings=settings)
+        except ch_errors.UnexpectedPacketFromServerError as ex:
+            log.warning("CH '%s' упал с UnexpectedPacketFromServerError: %s — reconnect() и повтор", label or "exec", ex)
+            try:
+                ch.reconnect()
+            except Exception as re:
+                log.warning("reconnect() перед повтором не удался: %s", re)
+            ch.execute(sql, settings=settings)
+        dur_ms = int((perf_counter() - t0) * 1000)
+        ev = {"stage": stage or (label or "exec"), "part": part, "ms": dur_ms}
+        log.info("Дедуп: %s (part=%s) занял %d мс", ev["stage"], str(ev["part"]), dur_ms)
+        if journal_pub is not None:
+            try:
+                journal_pub.heartbeat(progress={"dedup_event": ev})
+            except Exception as he:
+                log.debug("journal heartbeat (dedup_event) не записан: %s", he)
+        return dur_ms
+
+    def _publish_parts(parts: Set[int]) -> None:
+        """Публикация указанных партиций: BUF DROP → BUF INSERT → CLEAN REPLACE → BUF DROP."""
+        nonlocal last_pub_dt, slices_since_last_pub
+        if not parts:
+            return
+        # reconnect перед тяжёлыми операциями
+        try:
+            ch.reconnect()
+            log.debug("CH reconnect before publish: OK")
+        except Exception as e:
+            log.warning("Не удалось переподключиться к CH перед публикацией: %s", e)
+
+        # Под-журнал публикации
+        pub_since, pub_until = _parts_to_interval(parts)
+        journal_pub = ProcessJournal(pg, cfg.JOURNAL_TABLE, process_name + ":dedup")
+        try:
+            journal_pub.mark_planned(pub_since, pub_until)
+            journal_pub.mark_running(pub_since, pub_until, host=host, pid=pid)
+        except Exception as e:
+            log.warning("Не удалось создать запись под-процесса для публикации: %s", e)
+            journal_pub = None
+
+        non_key_cols = [c for c in CH_COLUMNS if c not in ("c", "t", "opd")]
+        agg_exprs = ",\n          ".join([f"argMax({c}, ingested_at) AS {c}" for c in non_key_cols])
+        select_cols = "c, t, opd,\n          " + agg_exprs
+
+        for part in sorted(parts):
+            lock_key = f"codes_history:dedup:{part}"
+            pg.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (lock_key,))
+            got = bool(pg.fetchone()[0])
+            if not got:
+                log.warning("Партиция %s: лок занят другим инстансом — пропускаю.", part)
+                continue
+            try:
+                log.info("Партиция %s: начинаю дедуп/публикацию…", part)
+                part_t0 = perf_counter()
+
+                _ch_exec(f"ALTER TABLE {ch_table_buf} DROP PARTITION {part}",
+                         label=f"drop buf partition {part}", stage="drop_buf", part=part, journal_pub=journal_pub)
+
+                insert_sql = f"""
+                    INSERT INTO {ch_table_buf} ({CH_COLUMNS_STR})
+                    SELECT
+                      {select_cols}
+                    FROM {ch_table_raw_all}
+                    WHERE toYYYYMMDD(opd) = {part}
+                    GROUP BY c, t, opd
+                """
+                _ch_exec(insert_sql, settings=ch_dedup_settings,
+                         label=f"insert dedup part {part}", stage="insert_dedup", part=part, journal_pub=journal_pub)
+
+                _ch_exec(f"ALTER TABLE {ch_table_clean} REPLACE PARTITION {part} FROM {ch_table_buf}",
+                         label=f"replace clean part {part}", stage="replace_clean", part=part, journal_pub=journal_pub)
+
+                _ch_exec(f"ALTER TABLE {ch_table_buf} DROP PARTITION {part}",
+                         label=f"cleanup buf partition {part}", stage="drop_buf_cleanup", part=part, journal_pub=journal_pub)
+
+                part_ms = int((perf_counter() - part_t0) * 1000)
+                log.info("Дедуп: part=%s total %d мс", part, part_ms)
+                if journal_pub is not None:
+                    try:
+                        journal_pub.heartbeat(progress={"dedup_part_total_ms": {str(part): part_ms}})
+                    except Exception as he:
+                        log.debug("journal heartbeat (dedup_part_total_ms) не записан: %s", he)
+                log.info("Партиция %s: опубликована в %s.", part, ch_table_clean)
+            finally:
+                pg.execute("SELECT pg_advisory_unlock(hashtext(%s))", (lock_key,))
+
+        if journal_pub is not None:
+            try:
+                journal_pub.mark_done(pub_since, pub_until, rows_read=0, rows_written=0)
+            except Exception as e:
+                log.debug("Не удалось завершить запись под-процесса дедупа: %s", e)
+
+        # сброс триггеров
+        slices_since_last_pub = 0
+        last_pub_dt = datetime.now(timezone.utc)
+
+    def _maybe_publish_after_slice() -> None:
+        """Проверяем каденс после слайда и при необходимости публикуем накопленные партиции."""
+        if args.no_publish:
+            return
+        if args.force_publish:
+            _publish_parts(pending_parts)
+            pending_parts.clear()
+            return
+        # по числу слайсов
+        if publish_every_slices > 0 and slices_since_last_pub >= publish_every_slices:
+            _publish_parts(pending_parts)
+            pending_parts.clear()
+            return
+        # по времени
+        if publish_every_min > 0:
+            base_dt = last_pub_dt or journal.last_ok_end(process_name + ":dedup")
+            if base_dt is not None:
+                now_utc = datetime.now(timezone.utc)
+                if (now_utc - base_dt).total_seconds() / 60.0 >= publish_every_min:
+                    _publish_parts(pending_parts)
+                    pending_parts.clear()
 
     try:
         with journal.exclusive_lock() as got:
@@ -221,216 +433,107 @@ def main():
                 log.warning("Другой инстанс '%s' уже выполняется — выходим.", process_name)
                 return
 
-            # Подчистим возможные "висяки" перед планированием новых срезов:
-            # - planned старше 60 мин → skipped
-            # - running без heartbeat &gt; 45 мин → error
-            # - running старше 12 часов (жёсткий TTL) → error
             journal.sanitize_stale(
                 planned_ttl_minutes=60,
                 running_heartbeat_timeout_minutes=45,
                 running_hard_ttl_hours=12,
             )
 
+            is_first_slice = True
             for s, e in iter_slices(since_dt, until_dt, step_min):
-                s_q = s + qshift
-                e_q = e + qshift
-                log.info("Слайс (бизнес): %s → %s | запрос к Phoenix: %s → %s | shift=%+d мин",
-                         s.isoformat(), e.isoformat(), s_q.isoformat(), e_q.isoformat(), int(cfg.PHX_QUERY_SHIFT_MINUTES))
-                journal.mark_planned(s, e)
+                s_q_base = s + qshift
+                e_q_base = e + qshift
+
+                use_overlap = overlap_delta_c if (is_first_slice or not overlap_only_first_slice) else timedelta(0)
+                s_q = s_q_base - use_overlap if use_overlap > timedelta(0) else s_q_base
+
+                e_q = e_q_base - lag_delta if lag_delta > timedelta(0) else e_q_base
+                if e_q <= s_q:
+                    e_q = e_q_base  # защитный откат
+
+                # лог окна
+                if use_overlap > timedelta(0) or lag_delta > timedelta(0):
+                    log.info(
+                        "Слайс (бизнес): %s → %s | Phoenix: %s → %s | shift=%+d мин | overlap=%d мин | lag=%d мин",
+                        s.isoformat(), e.isoformat(), s_q.isoformat(), e_q.isoformat(),
+                        int(getattr(cfg, 'PHX_QUERY_SHIFT_MINUTES', 0)),
+                        int(use_overlap.total_seconds() // 60),
+                        int(lag_delta.total_seconds() // 60),
+                    )
+                else:
+                    log.info(
+                        "Слайс (бизнес): %s → %s | запрос к Phoenix: %s → %s | shift=%+d мин",
+                        s.isoformat(), e.isoformat(), s_q.isoformat(), e_q.isoformat(),
+                        int(getattr(cfg, 'PHX_QUERY_SHIFT_MINUTES', 0))
+                    )
+
+                # Уберём возможные «висящие» planned другого окна (после рестартов/крэшей)
+                try:
+                    journal.clear_conflicting_planned(s, e)
+                except Exception:
+                    # не критично — продолжаем
+                    pass
+                try:
+                    journal.mark_planned(s, e)
+                except UniqueViolation:
+                    # гонка/конфликт: подчистим planned и повторим
+                    journal.clear_conflicting_planned(s, e)
+                    journal.mark_planned(s, e)
+
                 run_id = journal.mark_running(s, e, host=host, pid=pid)
 
                 rows_read = 0
                 ch_rows: List[tuple] = []
 
-                # Обновляем суммарные границы периода (берём уже сдвинутые времена запроса к Phoenix)
                 overall_since = s_q if overall_since is None else min(overall_since, s_q)
                 overall_until = e_q if overall_until is None else max(overall_until, e_q)
 
                 try:
-                    # Phoenix expects offset-naive datetime for TIMESTAMP; strip tzinfo from UTC-aware values
                     s_q_phx = s_q.replace(tzinfo=None) if s_q.tzinfo else s_q
                     e_q_phx = e_q.replace(tzinfo=None) if e_q.tzinfo else e_q
+
                     for batch in phx.fetch_increment(cfg.HBASE_MAIN_TABLE, cfg.HBASE_MAIN_TS_COLUMN, effective, s_q_phx, e_q_phx):
                         rows_read += len(batch)
-
                         for r in batch:
-                            # Дедуп ключ из нормализованных значений
-                            key = (
-                                r.get("c"),
-                                _as_int(r.get("t")),
-                                _to_dt64_obj(r.get("opd")),
-                            )
+                            key = (r.get("c"), _as_int(r.get("t")), _to_dt64_obj(r.get("opd")))
                             if key in seen_keys:
                                 continue
                             seen_keys.add(key)
-
                             ch_rows.append(_row_to_ch_tuple(r))
 
-                        # флаш по батчу
                         if len(ch_rows) >= ch_batch:
                             total_written_ch += ch.insert_rows(ch_table_raw_all, ch_rows, CH_COLUMNS)
                             ch_rows.clear()
                             journal.heartbeat(run_id, progress={"rows_read": rows_read, "rows_written": total_written_ch})
 
-                    # хвост
                     if ch_rows:
                         total_written_ch += ch.insert_rows(ch_table_raw_all, ch_rows, CH_COLUMNS)
                         ch_rows.clear()
 
+                    # накопим партиции текущего слайда
+                    for p in _iter_partitions_by_day(s_q, e_q):
+                        pending_parts.add(p)
+                    slices_since_last_pub += 1
+
+                    is_first_slice = False
                     journal.mark_done(s, e, rows_read=rows_read, rows_written=total_written_ch)
                     total_read += rows_read
+
+                    # проверка каденса
+                    _maybe_publish_after_slice()
 
                 except Exception as ex:
                     journal.heartbeat(run_id, progress={"error": str(ex)})
                     journal.mark_error(s, e, message=str(ex))
                     raise
 
-        # ----- ДЕДУП и ПУБЛИКАЦИЯ партиций (после завершения загрузки) -----
-        if overall_since is not None and overall_until is not None:
-            # Перед тяжёлыми INSERT SELECT/ALTER после серии INSERT'ов в RAW
-            # принудительно переподключаемся к CH, чтобы сбросить возможное "подвешенное" состояние сокета.
-            try:
-                ch.reconnect()
-                log.debug("CH reconnect before dedup: OK")
-            except Exception as e:
-                log.warning("Не удалось переподключиться к CH перед дедупом: %s", e)
+            # финальная публикация (по умолчанию включена)
+            if (always_publish_at_end or args.force_publish) and pending_parts and not args.no_publish:
+                log.info("Финальная публикация: %d партиций.", len(pending_parts))
+                _publish_parts(pending_parts)
+                pending_parts.clear()
 
-            # ------------------------------------------------------------------
-            # Под-процесс в журнале для этапа дедупа/публикации:
-            # ведём отдельную запись '<основной процесс>:dedup' и будем слать туда heartbeat
-            # с подробными метриками времени по этапам (DROP/INSERT/REPLACE/CLEANUP) для каждой партиции.
-            # Это позволяет онлайн отслеживать прогресс и «узкие места» без отдельной схемы метрик.
-            # ------------------------------------------------------------------
-            journal_pub = ProcessJournal(pg, cfg.JOURNAL_TABLE, process_name + ":dedup")
-            try:
-                # Планируем и переводим под-процесс дедупа в running на весь охваченный интервал
-                journal_pub.mark_planned(overall_since, overall_until)
-                journal_pub.mark_running(overall_since, overall_until, host=host, pid=pid)
-            except Exception as e:
-                # Дедуп продолжится даже если под-журнал не удалось создать (не критично для ETL)
-                log.warning("Не удалось создать запись под-процесса для дедупа: %s", e)
-
-            # ------------------------------------------------------------------
-            # Локальная обёртка для ch.execute(..) с:
-            #  * 1 повтором при ch_errors.UnexpectedPacketFromServerError (часто проявляется как EndOfStream)
-            #  * измерением длительности выполнения (perf_counter)
-            #  * отправкой heartbeat с метаданными события в под-журнал дедупа
-            # Возвращает длительность операции в миллисекундах.
-            # ------------------------------------------------------------------
-            def _ch_exec(sql: str, *, settings: dict | None = None, label: str = "",
-                         stage: str | None = None, part: int | None = None) -> int:
-                t0 = perf_counter()
-                try:
-                    ch.execute(sql, settings=settings)
-                except ch_errors.UnexpectedPacketFromServerError as ex:
-                    # Частый сетевой сбой драйвера при длинных сессиях (особенно после bulk INSERT'ов):
-                    # пробуем мягко переподключиться и повторить один раз.
-                    log.warning("CH '%s' упал с UnexpectedPacketFromServerError: %s — reconnect() и повтор",
-                                label or "exec", ex)
-                    try:
-                        ch.reconnect()
-                    except Exception as re:
-                        log.warning("reconnect() перед повтором не удался: %s", re)
-                    # второй (и последний) шанс — если снова ошибка, даём ей проброситься наверх
-                    ch.execute(sql, settings=settings)
-                dur_ms = int((perf_counter() - t0) * 1000)
-                # Лог + heartbeat в под-журнал с меткой этапа/партиции
-                ev = {"stage": stage or (label or "exec"), "part": part, "ms": dur_ms}
-                log.info("Дедуп: %s (part=%s) занял %d мс", ev["stage"], str(ev["part"]), dur_ms)
-                try:
-                    journal_pub.heartbeat(progress={"dedup_event": ev})
-                except Exception as he:
-                    # Не прерываем ETL, если журнал временно недоступен
-                    log.debug("journal heartbeat (dedup_event) не записан: %s", he)
-                return dur_ms
-
-            # 1) Определяем затронутые партиции RAW по диапазону фактического запроса (с учётом qshift)
-            #    Берём дни между overall_since (включительно) и overall_until (исключая правую границу).
-            #    Это эквивалентно партиционированию PARTITION BY toYYYYMMDD(opd).
-            def _iter_partitions_by_day(start_dt: datetime, end_dt: datetime):
-                start_day = start_dt.date()
-                # правая граница открытая → включаем последний день как (end_dt - 1 мс)
-                end_day_inclusive = (end_dt - timedelta(milliseconds=1)).date()
-                d = start_day
-                while d <= end_day_inclusive:
-                    yield int(d.strftime("%Y%m%d"))
-                    d += timedelta(days=1)
-
-            parts = list(_iter_partitions_by_day(overall_since, overall_until))
-            log.info("Затронутые партиции RAW (toYYYYMMDD, вычислено локально): %s", ", ".join(map(str, parts)) if parts else "—")
-
-            # 2) Для каждой партиции — собрать дедуп в буфер и атомарно заменить партицию в CLEAN.
-            # Используем argMax(..., ingested_at), где ingested_at — материализованная колонка в RAW (now64(3)).
-            non_key_cols = [c for c in CH_COLUMNS if c not in ("c", "t", "opd")]
-            agg_exprs = ",\n          ".join([f"argMax({c}, ingested_at) AS {c}" for c in non_key_cols])
-            select_cols = "c, t, opd,\n          " + agg_exprs
-
-            # Щадящие настройки для больших группировок (можно регулировать из .env в будущем)
-            ch_dedup_settings = {
-                "max_threads": 0,  # авто по числу ядер
-                "max_memory_usage": 8 * 1024 * 1024 * 1024,                   # 8G
-                "max_bytes_before_external_group_by": 2 * 1024 * 1024 * 1024,  # 2G — спилл на диск
-                "distributed_aggregation_memory_efficient": 1,
-            }
-
-            for part in parts:
-                # Кооперативный pg_advisory_lock на ключ «dedup:part», чтобы не конфликтовать с другими инстансами
-                lock_key = f"codes_history:dedup:{part}"
-                pg.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (lock_key,))
-                got = bool(pg.fetchone()[0])
-                if not got:
-                    log.warning("Партиция %s: лок занят другим инстансом — пропускаю.", part)
-                    continue
-                try:
-                    log.info("Партиция %s: начинаю дедуп/публикацию…", part)
-                    # Общий таймер по партиции: позволит увидеть total-время на полный цикл (DROP→INSERT→REPLACE→CLEANUP)
-                    part_t0 = perf_counter()
-                    # Чистим буферную партицию, чтобы REPLACE взял ровно свежую выборку (операция идемпотентна)
-                    _ch_exec(f"ALTER TABLE {ch_table_buf} DROP PARTITION {part}",
-                             label=f"drop buf partition {part}", stage="drop_buf", part=part)
-
-                    # Собираем дедуплицированную партицию в BUF
-                    insert_sql = f"""
-                        INSERT INTO {ch_table_buf} ({CH_COLUMNS_STR})
-                        SELECT
-                          {select_cols}
-                        FROM {ch_table_raw_all}
-                        WHERE toYYYYMMDD(opd) = {part}
-                        GROUP BY c, t, opd
-                    """
-                    _ch_exec(insert_sql, settings=ch_dedup_settings,
-                             label=f"insert dedup part {part}", stage="insert_dedup", part=part)
-
-                    # Атомарно заменяем партицию в CLEAN данными из BUF (без дублей)
-                    _ch_exec(f"ALTER TABLE {ch_table_clean} REPLACE PARTITION {part} FROM {ch_table_buf}",
-                             label=f"replace clean part {part}", stage="replace_clean", part=part)
-
-                    # Удаляем временную партицию из BUF, чтобы не занимала место
-                    _ch_exec(f"ALTER TABLE {ch_table_buf} DROP PARTITION {part}",
-                             label=f"cleanup buf partition {part}", stage="drop_buf_cleanup", part=part)
-
-                    # Финальный total по партиции: фиксируем совокупное время всех этапов
-                    part_ms = int((perf_counter() - part_t0) * 1000)
-                    log.info("Дедуп: part=%s total %d мс", part, part_ms)
-                    try:
-                        journal_pub.heartbeat(progress={"dedup_part_total_ms": {str(part): part_ms}})
-                    except Exception as he:
-                        log.debug("journal heartbeat (dedup_part_total_ms) не записан: %s", he)
-
-                    log.info("Партиция %s: опубликована в %s.", part, ch_table_clean)
-                finally:
-                    pg.execute("SELECT pg_advisory_unlock(hashtext(%s))", (lock_key,))
-
-            # Закрываем под-процесс дедупа: записываем завершение интервала публикации
-            try:
-                journal_pub.mark_done(overall_since, overall_until, rows_read=0, rows_written=0)
-            except Exception as e:
-                # Не критично для самого ETL, если фиксация завершения под-журнала не удалась
-                log.debug("Не удалось завершить запись под-процесса дедупа: %s", e)
-
-        # Ретеншн журнала (если включён)
         if int(getattr(cfg, "JOURNAL_RETENTION_DAYS", 0) or 0) > 0:
-            # простая очистка завершённых записей старше N дней (необязательная)
             pass
 
         log.info("Готово. Прочитано: %d | в CH записано: %d", total_read, total_written_ch)
@@ -451,4 +554,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

@@ -1,188 +1,188 @@
-# ETL: Phoenix/HBase → ClickHouse (with PG journal)
+# ETL: Phoenix/HBase → ClickHouse (PG journal, native 9000)
 
-Лёгкий инкрементальный перенос из Phoenix (HBase) в ClickHouse **напрямую** (без CSV),
-с журналом запусков и `watermark` в PostgreSQL. Работает через **native 9000** порт
-ClickHouse с включённой компрессией.
+Инкрементальный перенос из Phoenix (HBase) в ClickHouse **напрямую** (без CSV),
+с журналом запусков и `watermark` в PostgreSQL. Вставки идут через **native 9000**
+сжатый транспорт (lz4/zstd, cityhash).
 
 ---
 ## Что делает
-- Читает окно по времени из таблицы-источника Phoenix (`TBL_JTI_TRACE_CIS_HISTORY`).
-- Пакетно выгружает строки (fetchmany) и сразу пишет в ClickHouse **native** (со сжатием).
-- В PostgreSQL ведёт журнал запусков (planned → running → success/error/skip) и хранит watermark.
-- Защита от параллельных запусков: advisory‑lock + частичный UNIQUE‑индекс (один активный запуск).
-- Автосанация «висячих» запусков перед стартом.
-- **Пост‑обработка партиций в CH:** дедупликация по ключу `(c, t, opd)` и публикация партиций
-  в чистую таблицу через `REPLACE PARTITION` (см. ниже).
-- **Надёжность CH‑вставок и DDL:** авто‑переподключение и один повтор при «плавающих» сетевых
-  сбоях драйвера (`UnexpectedPacketFromServerError`).
-- **Метрики дедупа:** логируются и пишутся в журнал как heartbeat (этап/партиция/время).
+- Читает окно из Phoenix (`TBL_JTI_TRACE_CIS_HISTORY`) по колонке времени `opd`.
+- Буферизует и пишет строки **сразу** в ClickHouse RAW (Distributed) чанками.
+- Ведёт журнал запусков в PostgreSQL: `planned → running → ok/error/skipped` + `watermark`.
+- Гарантирует **один активный запуск**: advisory‑lock + частичный UNIQUE‑индекс.
+- Автоматически санитизирует «висячие» записи журнала перед стартом.
+- После загрузки — выполняет **дедуп/публикацию партиций** в «чистую» таблицу через `REPLACE PARTITION`.
+- Логирует **метрики дедупа** по этапам и пишет их heartbeat‑ами в PG.
 
 ---
-## Новое (ключевые изменения)
-- Клиент ClickHouse (native 9000) с **failover по списку хостов** и health‑check `SELECT 1`.
-- Вставка в RAW таблицу **чанками** (`CH_INSERT_BATCH`) с **повтором** при ошибке соединения
-  (`CH_INSERT_MAX_RETRIES`, по умолчанию 1) и принудительным `reconnect()` при необходимости.
-- Перед тяжёлыми `INSERT SELECT`/`ALTER` в дедупе — **принудительный reconnect** для сброса
-  возможного «подвешенного» состояния сокета после bulk‑вставок.
-- Локальная обёртка для DDL/`INSERT SELECT` с **одним повтором** при
-  `UnexpectedPacketFromServerError` (включая кейс *EndOfStream*).
-- **Метрики времени** по шагам дедупа: `DROP BUF`, `INSERT BUF`, `REPLACE CLEAN`, `CLEANUP BUF`,
-  а также суммарно по партиции.
+## Новое / ключевые изменения
+- Клиент ClickHouse (native 9000) с **failover по списку хостов**, health‑check `SELECT 1`,
+  авто‑`reconnect()` и **одним повтором** при `UnexpectedPacketFromServerError` (в т.ч. EndOfStream).
+- **Чёткая схема таблиц в CH** и выравнивание имён с ENV/DDL:
+  - RAW локальная: `stg.daily_codes_history_raw`
+  - RAW Distributed: `stg.daily_codes_history_raw_all` ← **источник для дедупа**
+  - BUF (для дедупа, без TTL): `stg.daily_codes_history_dedup_buf`
+  - CLEAN локальная: `stg.daily_codes_history`
+  - CLEAN Distributed: `stg.daily_codes_history_all`
+- **ENV приведён к единому виду**: используем `CH_RAW_TABLE`, `CH_CLEAN_TABLE`,
+  `CH_CLEAN_ALL_TABLE`, `CH_DEDUP_BUF_TABLE`; список колонок — `MAIN_COLUMNS`
+  (есть fallback на старое имя `HBASE_MAIN_COLUMNS`).
+- **Грануляция по слайсам** из .env: `STEP_MIN=10` + окно Phoenix сдвигается на
+  `PHX_QUERY_SHIFT_MINUTES`, первый слайс имеет `PHX_QUERY_OVERLAP_MINUTES`, справа — `PHX_QUERY_LAG_MINUTES`.
+- Автокаденс публикаций: `PUBLISH_EVERY_MINUTES` **или** `PUBLISH_EVERY_SLICES`; финальная публикация — `ALWAYS_PUBLISH_AT_END=1`.
+- Под‑журнал для дедупа: отдельный `process_name: "<PROCESS_NAME>:dedup"` на каждую публикацию.
 
 ---
-## Как это работает (коротко)
-1. Итерация по бизнес‑окну времени с шагом `STEP_MIN`; окно запроса в Phoenix
-   сдвигается на `PHX_QUERY_SHIFT_MINUTES` (например, −300 мин).
-2. Чтение из Phoenix батчами; в процессе ETL выполняется **локальный дедуп** в рамках запуска
-   по ключу `(c, t, opd)` (чтобы не гнать дубли в RAW).
-3. Приведение типов под DDL CH (в т.ч. `DateTime64(3)` как `datetime` без TZ, миллисекунды округляются вниз).
-4. Пакетные INSERT'ы сразу в **RAW_ALL** (Distributed) таблицу ClickHouse.
-5. После загрузки всего интервала вычисляются затронутые **партиции** (по `toYYYYMMDD(opd)`):
-   - `DROP PARTITION` в буфере (очистка),
-   - `INSERT INTO BUF SELECT ... FROM RAW_ALL` с агрегацией `argMax(col, ingested_at)`
-     по всем неключевым колонкам — тем самым выбирается **самая свежая** версия строки,
-   - `ALTER ... REPLACE PARTITION` из BUF → в CLEAN (локальная/мерджируемая),
-   - финальный `DROP PARTITION` в BUF.
-6. Каждый шаг сопровождается хартбитом и логами с длительностью по партиции/этапу.
+## Как это работает (поток данных)
+1. Интервал `[--since, --until)` режется на «слайсы» длиной `STEP_MIN`.
+2. Для каждого слайда строится окно **Phoenix** с учётом:
+   - `PHX_QUERY_SHIFT_MINUTES` (технический сдвиг),
+   - `PHX_QUERY_OVERLAP_MINUTES` (захлёст слева на первом слайсе, опционально на всех),
+   - `PHX_QUERY_LAG_MINUTES` (лаг справа, чтобы не брать «кипящее»).
+3. Чтение из Phoenix батчами (`PHX_FETCHMANY_SIZE`), локальный дедуп в рамках запуска по ключу `(c, t, opd)`.
+4. Приведение типов под DDL (`DateTime64(3)` как `datetime` без TZ, микросекунды → миллисекунды).
+5. Пакетные **INSERT VALUES** в `CH_RAW_TABLE` (обычно `stg.daily_codes_history_raw_all`).
+6. Накопление затронутых партиций (`toYYYYMMDD(opd)`). По каденсу выполняется публикация:
+   - `ALTER TABLE …_dedup_buf DROP PARTITION p` (очистка буфера),
+   - `INSERT INTO …_dedup_buf SELECT c, t, opd, argMax(<все прочие>, ingested_at)… FROM RAW_ALL WHERE part=p GROUP BY c,t,opd`,
+   - `ALTER TABLE CLEAN REPLACE PARTITION p FROM …_dedup_buf`,
+   - `ALTER TABLE …_dedup_buf DROP PARTITION p`.
 
 ---
-## Требования
-- **Python 3.12** (рекомендуется).
-- Зависимости для **native‑сжатия**: `lz4`, `zstd`, **`clickhouse-cityhash`** (обязательно для сжатия).
-- Доступ к Phoenix PQS и ClickHouse (native 9000), PostgreSQL для журнала.
-
-> Примечание: Python 3.13 может работать, но готовые колёса `clickhouse-cityhash` часто недоступны — используйте 3.12.
+## DDL (ClickHouse)
+Готовый файл: `ddl/stg_daily_codes_history.sql`.
+Основные объекты (локальные и Distributed) — см. выше. TTL у RAW по `ingested_at`,
+у CLEAN можно задавать бизнес‑TTL (пример в DDL: `TTL toDateTime(opd) + INTERVAL 5 DAY DELETE`).
 
 ---
 ## Быстрый старт
 ```bash
-# 1) Виртуальное окружение (Python 3.12)
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
+# 1) Python 3.12, окружение
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -U pip && pip install -r requirements.txt
 
-# 2) ClickHouse DDL (локальная таблица + Distributed)
+# 2) ClickHouse DDL
 clickhouse-client -n --queries-file=ddl/stg_daily_codes_history.sql
 
-# 3) Настройки окружения
-cp .env.example .env   # заполните значения
+# 3) ENV
+cp .env.example .env   # отредактируйте доступы/хосты при необходимости
 
-# 4) Запуск инкремента
+# 4) Запуск
 python -m scripts.codes_history_etl \
   --since "2025-08-08T00:00:00Z" \
   --until "2025-08-09T00:00:00Z"
 ```
-PG‑таблицы журнала создаются автоматически при первом запуске (см. `journal.ensure()`).
+PG‑таблицы журнала создаются автоматически (см. `journal.ensure()`).
 
 ---
-## ENV (минимум)
-Создайте `.env` на основе `.env.example`. Ключевые переменные:
+## ENV (актуальная схема)
 ```ini
-# file: .env.example
-
 # --- PostgreSQL (журнал) ---
 PG_DSN=postgresql://etl_user:password@10.254.3.91:5432/etl_database?connect_timeout=5&keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5
 JOURNAL_TABLE=public.inc_processing
 PROCESS_NAME=codes_history_increment
-JOURNAL_RETENTION_DAYS=1         # опционально: для функции очистки журнала (ProcessJournal.prune_old)
+JOURNAL_RETENTION_DAYS=1
 
 # --- Phoenix ---
 PQS_URL=http://10.254.3.112:8765
-PHX_FETCHMANY_SIZE=5000
-PHX_TS_UNITS=timestamp             # 'seconds' | 'millis' | 'timestamp' — для phoenixdb
-PHX_QUERY_SHIFT_MINUTES=-300       # сдвиг окна запроса (минуты) относительно бизнес-интервала
 HBASE_MAIN_TABLE=TBL_JTI_TRACE_CIS_HISTORY
 HBASE_MAIN_TS_COLUMN=opd
-HBASE_MAIN_COLUMNS=c,t,opd,id,did,rid,rinn,rn,sid,sinn,sn,gt,prid,st,ste,elr,emd,apd,exd,p,pt,o,pn,b,tt,tm,ch,j,pg,et,pvad,ag
+MAIN_COLUMNS=c,t,opd,id,did,rid,rinn,rn,sid,sinn,sn,gt,prid,st,ste,elr,emd,apd,exd,p,pt,o,pn,b,tt,tm,ch,j,pg,et,pvad,ag
+PHX_FETCHMANY_SIZE=5000
+PHX_TS_UNITS=timestamp
 
-# --- ClickHouse (только native:9000) ---
+# --- Грануляция и PQS окна ---
+STEP_MIN=10
+PHX_QUERY_SHIFT_MINUTES=-300
+PHX_QUERY_OVERLAP_MINUTES=5
+PHX_OVERLAP_ONLY_FIRST_SLICE=1
+PHX_QUERY_LAG_MINUTES=2
+
+# --- ClickHouse (native:9000) ---
 CH_HOSTS=10.254.3.111,10.254.3.112,10.254.3.113,10.254.3.114
 CH_PORT=9000
 CH_DB=stg
 CH_USER=default
 CH_PASSWORD=
-# Имена таблиц (см. DDL):
+# Таблицы:
 CH_RAW_TABLE=stg.daily_codes_history_raw_all
 CH_CLEAN_TABLE=stg.daily_codes_history
 CH_CLEAN_ALL_TABLE=stg.daily_codes_history_all
 CH_DEDUP_BUF_TABLE=stg.daily_codes_history_dedup_buf
-# Параметры вставки
-CH_INSERT_BATCH=20000              # размер чанка при INSERT VALUES
-CH_INSERT_MAX_RETRIES=1            # число повторов на чанк при сетевой ошибке
 
-# --- Параметры ETL ---
-STEP_MIN=60                        # размер слайда (минуты)
+# --- ClickHouse insert ---
+CH_INSERT_BATCH=20000
+CH_INSERT_MAX_RETRIES=1
+
+# --- Каденс публикаций ---
+PUBLISH_EVERY_MINUTES=60
+PUBLISH_EVERY_SLICES=6
+ALWAYS_PUBLISH_AT_END=1
 ```
 
 ---
-## Тонкая настройка и производительность
-- **Phoenix**
-  - `PHX_FETCHMANY_SIZE` — размер пакета для курсора; подбирайте по памяти сети/кластера.
-  - Сдвиг запроса `PHX_QUERY_SHIFT_MINUTES` (обычно −300) компенсирует временную зону/задержки источника.
-- **ClickHouse**
-  - Клиент использует сжатие транспорта (по умолчанию ZSTD). Требуются `lz4`, `zstd`, `clickhouse-cityhash`.
-  - Асинхронные вставки включены: `async_insert=1`, `wait_for_async_insert=1`,
-    для Distributed — `insert_distributed_sync=1`.
-  - Вставки идут **чанками** `CH_INSERT_BATCH`; при ошибках выполняется **failover + reconnect** и повтор.
-- **Дедуп/публикация**
-  - Агрегация: `argMax(col, ingested_at)` для всех неключевых колонок; ключ группировки — `(c, t, opd)`.
-  - Партиции определяются по диапазону фактического запроса (после сдвига) как `toYYYYMMDD(opd)`.
-
----
-## Наблюдаемость (метрики дедупа)
-В лог и в `inc_processing.details` (через heartbeat) попадают записи вида:
+## Наблюдаемость
+В лог и в `inc_processing.details` (heartbeat) попадают метрики вида:
 ```json
-{"stage":"insert dedup part 20250812","part":20250812,"ms":12345}
-{"stage":"replace clean part 20250812","part":20250812,"ms":2345}
-{"stage":"cleanup buf partition 20250812","part":20250812,"ms":321}
-{"stage":"dedup_part_total_ms","part":20250812,"ms":15011}
+{"stage":"drop_buf","part":20250115,"ms":64}
+{"stage":"insert_dedup","part":20250115,"ms":3748}
+{"stage":"replace_clean","part":20250115,"ms":380}
+{"stage":"drop_buf_cleanup","part":20250115,"ms":47}
+{"dedup_part_total_ms":{"20250115":4284}}
 ```
-Это помогает быстро локализовать «узкие места» дедупа.
 
 ---
-## Политика данных в CH
-- Переносим **как есть**: значения колонок совпадают с источником (без искусственных заполнений).
-- Уникальность для дедупа: комбинация `c, t, opd`.
-- Публикация в CLEAN идемпотентна: собираем партицию в BUF → `REPLACE PARTITION` в CLEAN → чистим BUF.
+## Журнал и надёжность
+- **Эксклюзивность**: advisory‑lock по `process_name` + частичный UNIQUE‑индекс
+  `WHERE ts_end IS NULL AND status IN ('planned','running')`.
+- **Автосанация** перед стартом: `sanitize_stale()`
+  - planned > TTL → `skipped`,
+  - running с протухшим heartbeat → `error`,
+  - (опционально) running старше жёсткого TTL → `error`.
+- **Под‑журнал публикации**: имя процесса `<PROCESS_NAME>:dedup`, интервалы строятся по
+  множеству затронутых партиций.
 
 ---
-## Частые проблемы и решения
+## Тонкая настройка
+- Phoenix: `PHX_FETCHMANY_SIZE`, `PHX_TS_UNITS`, сдвиги окна (shift/overlap/lag).
+- ClickHouse: включено сжатие транспорта, для него нужны `lz4`, `zstd`, `clickhouse-cityhash`.
+- Дедуп: `argMax(col, ingested_at)` по всем неключевым столбцам; ключ — `(c,t,opd)`.
+
+---
+## Чек‑лист согласованности (ENV ↔ DDL ↔ код)
+1. Таблицы в CH существуют и совпадают по именам:
+   - `stg.daily_codes_history_raw`, `stg.daily_codes_history_raw_all`,
+   - `stg.daily_codes_history_dedup_buf`,
+   - `stg.daily_codes_history`, `stg.daily_codes_history_all`.
+   Пример проверки:
+   ```sql
+   SHOW TABLES FROM stg LIKE 'daily_codes_history%';
+   ```
+2. В `.env` нет устаревших переменных (`CH_TABLE`, `HBASE_MAIN_COLUMNS`).
+3. В логах слайсы соответствуют `STEP_MIN` (и выводится shift/overlap/lag).
+4. Ошибки CH по сети единичны и гаснут на повторе — иначе проверьте сеть/кластер.
+
+---
+## Частые проблемы
+- **`Could not find table: daily_codes_history_buf`** — неверное имя буфера.
+  Должно быть `CH_DEDUP_BUF_TABLE=stg.daily_codes_history_dedup_buf` и DDL из `ddl/` применён.
 - **`UniqueViolation inc_processing_active_one_uq_idx`** — уже есть активный запуск.
-  - Либо дождитесь завершения, либо выполните санацию: код делает `sanitize_stale()` перед стартом.
-- **`can't subtract offset-naive and offset-aware datetimes`** — передайте `--since/--until` с таймзоной
-  (например, `...T00:00:00Z` или `...T00:00:00+05:00`).
-- **`TTL ... should have DateTime or Date, but has DateTime64`** — используйте в TTL `toDateTime(...)`
-  или поля без суффикса `(3)` (см. актуальный DDL в `ddl/`).
-- **`No module named 'zstd'`** — установите C‑расширение Zstandard:
-  ```bash
-  pip install zstd
-  ```
-- **`Package clickhouse-cityhash is required to use compression`** — установите:
-  ```bash
-  pip install "clickhouse-cityhash==1.0.2.4"
-  ```
-  Временный обходной путь — запустить клиент без сжатия (`compression=False`), но это увеличит трафик.
-- **`clickhouse_driver.errors.UnexpectedPacketFromServerError` (Code 102, EndOfStream и т.п.)** —
-  встроенный обёрткой выполняется `reconnect()` и **один повтор** операции. Обычно этого достаточно.
+  Подождать завершения или запустить снова: перед стартом выполнится `sanitize_stale()`.
+- **`can't subtract offset-naive and offset-aware datetimes`** — передавайте `--since/--until` с TZ или без TZ **оба**.
+- **`TTL ... should have DateTime or Date, but has DateTime64`** — используйте `toDateTime(opd)` в TTL (см. DDL).
+- **`No module named 'zstd'`** — `pip install zstd`.
+- **`Package clickhouse-cityhash is required to use compression`** —
+  `pip install clickhouse-cityhash==1.0.2.4`.
+- **`clickhouse_driver.errors.UnexpectedPacketFromServerError`** — клиент делает reconnect+повтор; если часто, проверьте сеть.
 
 ---
 ## Структура проекта
-- `scripts/codes_history_etl.py` — основной ETL, дедуп/публикация партиций, метрики.
-- `scripts/journal.py` — журнал в PG, watermark, эксклюзивная блокировка, санация stale.
-- `scripts/db/phoenix_client.py` — клиент Phoenix PQS (fetch_increment).
-- `scripts/db/pg_client.py` — тонкая обёртка над psycopg.
-- `scripts/db/clickhouse_client.py` — ClickHouse native (9000, compression, zstd/lz4, failover, retries).
-- `scripts/config.py` — загрузка ENV/валидация.
-- `ddl/stg_daily_codes_history.sql` — DDL ClickHouse (локальная и Distributed таблицы, RAW/CLEAN/BUF).
-
----
-## Локальный гайд по Git
-- В репозитории игнорируется `.env`, но **`.env.example` хранится**.
-- Рекомендуемая команда для обхода глобальных игноров при первом добавлении шаблона:
-  ```bash
-  git add -f etl_codes_history/.env.example && git commit -m "Add .env.example"
-  ```
+- `scripts/codes_history_etl.py` — основной ETL и дедуп/публикация.
+- `scripts/journal.py` — журнал в PG / watermark / эксклюзив.
+- `scripts/db/phoenix_client.py` — клиент PQS (итерация по окну, fetchmany).
+- `scripts/db/clickhouse_client.py` — ClickHouse native (failover, retries, reconnect).
+- `scripts/config.py` — загрузка ENV, дефолты, совместимость имён переменных.
+- `ddl/stg_daily_codes_history.sql` — все таблицы RAW/CLEAN/BUF (+ Distributed).
 
 ---
 ## Лицензия / Авторство
