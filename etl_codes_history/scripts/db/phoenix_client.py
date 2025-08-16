@@ -1,11 +1,86 @@
 # file: scripts/db/phoenix_client.py
 # -*- coding: utf-8 -*-
+"""
+PhoenixClient — лёгкая обёртка над `phoenixdb` для чтения инкремента из Apache Phoenix PQS.
+
+Возможности и поведение:
+- Подключение с авто-выбором протокола: сперва пробуем Avatica protobuf, если библиотека его не поддерживает
+  (TypeError) или подключение падает — корректно откатываемся на JSON. Если оба способа не удались, поднимаем
+  `PhoenixConnectionError` и пишем компактный CRITICAL-лог вида `FATAL: cannot connect to Phoenix PQS ...`.
+- Быстрый fail-fast перед коннектом: опциональный TCP-probe до `host:port` (см. `PHOENIX_TCP_PROBE_TIMEOUT_MS`),
+  чтобы не ждать долгих таймаутов внутри `requests`/`urllib3`.
+- Подавление «портянок» из финализатора `phoenixdb.Connection.__del__`: при GC недоступного PQS библиотека
+  иногда печатает огромные stacktrace. Мы безопасно перехватываем исключения внутри `__del__`, чтобы логи были
+  компактными.
+- Настроенный размер выборки: `cursor.arraysize = fetchmany_size`, чтобы `fetchmany()` реально возвращал кадры
+  нужного масштаба.
+- Прозрачные логи: при каждом запросе логируем SQL, окно `[from; to)`, `ts_units` и размер пакета.
+- Утилиты:
+    * `discover_columns(table)` — быстрый способ получить список колонок по `SELECT * LIMIT 0`;
+    * `fetch_increment(table, ts_col, columns, from_dt, to_dt)` — итератор по блокам словарей, упорядочено по `ts_col`.
+
+Контракты:
+- `from_dt`/`to_dt` должны быть timezone-aware (UTC). Драйвер корректно сериализует UTC в Phoenix.
+- `paramstyle=qmark` — плейсхолдеры `?`.
+- Закрытие: `close()` всегда пытается закрыть курсор, затем соединение; все ошибки при закрытии гасим.
+
+Исключения:
+- `PhoenixConnectionError` — не удалось установить соединение ни через protobuf, ни через JSON. Это сигнал для
+  внешнего уровня (ETL-скрипта) записать «стартовую» ошибку в журнал и завершиться с ненулевым кодом.
+
+Переменные окружения:
+- `PHOENIX_TCP_PROBE_TIMEOUT_MS` — необязательный таймаут (в мс) TCP-проверки доступности PQS перед коннектом.
+  0 или отсутствие переменной — проверка отключена.
+"""
 import logging
 from typing import Dict, Iterator, List
 from datetime import datetime
 import phoenixdb
 
+import os
+import socket
+from urllib.parse import urlparse
+
+# --- Noise suppression for phoenixdb.Connection.__del__ -------------------
+# Некоторые версии `phoenixdb` в __del__ выполняют сетевые вызовы и могут печатать
+# "Exception ignored in: ... Connection.__del__" при недоступном PQS. Чтобы не плодить
+# портянки в логах, аккуратно перехватываем исключения в финализаторе.
+try:
+    import phoenixdb.connection as _phx_conn_mod  # type: ignore
+    _orig_del = getattr(_phx_conn_mod.Connection, "__del__", None)
+    if callable(_orig_del):
+        def _quiet_del(self):  # type: ignore
+            try:
+                _orig_del(self)  # type: ignore
+            except Exception:
+                # Молча игнорируем ошибки при сборке мусора (PQS недоступен и т.п.)
+                return
+        _phx_conn_mod.Connection.__del__ = _quiet_del  # type: ignore
+except Exception:
+    # Если в будущих версиях API изменится — ничего страшного, оставим поведение по умолчанию.
+    pass
+
+# --- Fast-fail TCP probe ---------------------------------------------------
+def _tcp_probe(pqs_url: str, timeout_ms: int) -> None:
+    """
+    Быстрая проверка доступности TCP-сокета Phoenix PQS перед созданием phoenixdb.Connection.
+    Поднимает PhoenixConnectionError при недоступности.
+    """
+    if timeout_ms <= 0:
+        return
+    u = urlparse(pqs_url)
+    host = u.hostname or "127.0.0.1"
+    port = u.port or 8765
+    try:
+        with socket.create_connection((host, port), timeout=timeout_ms / 1000.0):
+            return
+    except Exception as e:
+        raise PhoenixConnectionError(f"TCP probe failed for {host}:{port} in {timeout_ms} ms: {e}")
+
 log = logging.getLogger("scripts.db.phoenix_client")
+
+class PhoenixConnectionError(Exception):
+    """Ошибка подключения к Phoenix PQS (оба способа подключения провалились)."""
 
 class PhoenixClient:
     """
@@ -15,41 +90,103 @@ class PhoenixClient:
     """
 
     def __init__(self, pqs_url: str, fetchmany_size: int = 5000, ts_units: str = "timestamp"):
-        # Пробуем бинарный протокол Avatica (protobuf) — обычно быстрее JSON.
+        """
+        Инициализация клиента Phoenix PQS.
+
+        Args:
+            pqs_url: База Avatica (например, http://host:8765).
+            fetchmany_size: Размер кадра для fetchmany().
+            ts_units: Информационный атрибут для логов ('timestamp' | 'millis' | 'seconds').
+
+        Raises:
+            PhoenixConnectionError: если не удалось подключиться ни по protobuf, ни по JSON.
+        """
+        # Fail fast: при включённом PHOENIX_TCP_PROBE_TIMEOUT_MS быстро проверяем доступность host:port
+        try:
+            probe_ms = int(os.getenv("PHOENIX_TCP_PROBE_TIMEOUT_MS", "0") or "0")
+        except Exception:
+            probe_ms = 0
+        if probe_ms > 0:
+            try:
+                _tcp_probe(pqs_url, probe_ms)
+            except PhoenixConnectionError as probe_err:
+                log.critical("FATAL: %s", probe_err)
+                raise
+            except Exception as probe_err:
+                # Приводим к нашему типу исключения
+                log.critical("FATAL: %s", probe_err)
+                raise PhoenixConnectionError(str(probe_err))
+
         serialization_used = "protobuf"
         try:
-            # Новые версии phoenixdb поддерживают явный выбор protobuf
-            self.conn = phoenixdb.connect(
-                pqs_url,
-                autocommit=True,
-                serialization="protobuf",
-            )
-        except TypeError:
-            # Старые версии phoenixdb не знают параметр `serialization` — используем дефолт (JSON)
-            self.conn = phoenixdb.connect(
-                pqs_url,
-                autocommit=True,
-            )
-            serialization_used = "json"
-        except Exception as e:
-            # Любая другая ошибка при попытке protobuf — откатываемся на JSON по умолчанию
-            log.warning("Phoenix protobuf connect failed (%s) — falling back to JSON.", e)
-            self.conn = phoenixdb.connect(
-                pqs_url,
-                autocommit=True,
-            )
-            serialization_used = "json"
+            # Попытка №1: явный protobuf (на новых версиях phoenixdb быстрее JSON)
+            try:
+                conn = phoenixdb.connect(
+                    pqs_url,
+                    autocommit=True,
+                    serialization="protobuf",
+                )
+            except TypeError:
+                # Библиотека не знает параметр `serialization` — пробуем дефолт (JSON)
+                serialization_used = "json"
+                conn = phoenixdb.connect(
+                    pqs_url,
+                    autocommit=True,
+                )
+            except Exception as e:
+                # Протокол protobuf «доступен», но подключение не удалось — откат на JSON
+                log.warning("Phoenix protobuf connect failed (%s) — falling back to JSON.", e)
+                serialization_used = "json"
+                conn = phoenixdb.connect(
+                    pqs_url,
+                    autocommit=True,
+                )
+        except Exception as json_err:
+            # И JSON-подключение не удалось — поднимаем аккуратное исключение с коротким сообщением
+            msg = f"cannot connect to Phoenix PQS {pqs_url}: {json_err}"
+            log.critical("FATAL: %s", msg)
+            raise PhoenixConnectionError(msg) from json_err
+
+        # Присваиваем только после успешного коннекта
+        self.conn = conn
+
         self.cur = self.conn.cursor()
         self.fetchmany_size = int(fetchmany_size)
         self.ts_units = ts_units
-        self.cur.arraysize = self.fetchmany_size  # подсказка драйверу: размер кадра/пакета
+        # Подсказка драйверу о размере кадров
+        self.cur.arraysize = self.fetchmany_size
+        self._serialization = serialization_used
         log.info("Phoenix PQS подключен (%s), paramstyle=qmark, serialization=%s", pqs_url, serialization_used)
 
     def close(self):
+        """
+        Закрываем курсор и соединение, не шумим, если PQS уже недоступен.
+        """
         try:
-            self.cur.close()
+            cur = getattr(self, "cur", None)
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
         finally:
-            self.conn.close()
+            try:
+                conn = getattr(self, "conn", None)
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            finally:
+                # Чётко обнуляем ссылки — меньше шансов словить шум в __del__
+                self.cur = None
+                self.conn = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def discover_columns(self, table: str) -> List[str]:
         """
@@ -93,4 +230,3 @@ class PhoenixClient:
             names = [d[0] for d in (self.cur.description or [])]
             out = [dict(zip(names, r)) for r in rows]
             yield out
-            

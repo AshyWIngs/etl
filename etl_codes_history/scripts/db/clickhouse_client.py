@@ -1,27 +1,128 @@
 # file: scripts/db/clickhouse_client.py
 # -*- coding: utf-8 -*-
 """
-Только Native (TCP, порт 9000), с компрессией.
-Список хостов — failover с проверкой SELECT 1.
-Вставка батчами, auto retry 1 раз при отвале коннекта.
+ClickHouse Native-клиент для ETL (только TCP:9000).
+
+Ключевые идеи
+─────────────
+• Используем официальную библиотеку `clickhouse-driver` (native протокол).
+• Подключение с failover по списку хостов: случайный порядок → первый успешный ответ на `SELECT 1`.
+• Транспортное сжатие включено по умолчанию (ZSTD) — экономит трафик и даёт хороший баланс CPU/скорость.
+• Безопасное выполнение запросов: защита от «залипания» драйвера в insert-режим после больших вставок.
+• INSERT — порциями (чанками). На каждый чанк допускается N повторов (по умолчанию 1) с переподключением.
+• Для не-INSERT запросов аккуратно сбрасываем внутренние флаги force_insert* перед исполнением.
+• На редкий флап `UnexpectedPacketFromServerError` делаем reconnect() и повтор (1 раз).
+
+Что считать нормой
+──────────────────
+• Вставки в распределённые (`Distributed`) таблицы приемлемы, но для тяжёлых дедупов чаще лучше:
+    INSERT → локальная буферная таблица (ReplicatedMergeTree),
+    затем ALTER … REPLACE PARTITION в «чистую» таблицу.
+• Для SELECT/DDL используется один общий путь исполнения `_execute_with_retry()` с 1 автоповтором.
+
+Настройки по умолчанию
+───────────────────────
+• async_insert / wait_for_async_insert — включены, чтобы не блокировать пайплайн.
+• insert_distributed_sync=1 — безопаснее для распределённых таблиц.
+• network_compression_method=zstd — оптимальный дефолт.
+• input_format_null_as_default=0 — не подменяем NULL.
+• use_client_time_zone=1 — не пересчитываем TZ на сервере.
+
+Диагностика
+───────────
+• При старте логируем удачный хост (host:port, db).
+• При неудаче подключения к конкретному хосту — предупреждение и переход к следующему.
+• При флапе UnexpectedPacketFromServerError — предупреждение и один повтор.
+
+Пример использования
+────────────────────
+>>> ch = ClickHouseClient(hosts=["10.0.0.1","10.0.0.2"], database="stg")
+>>> ch.execute("CREATE TABLE IF NOT EXISTS stg.t (x UInt32) ENGINE = TinyLog")
+>>> ch.insert_rows("stg.t", [(1,), (2,), (3,)], ["x"])
+>>> v = ch.query_scalar("SELECT sum(x) FROM stg.t")
+>>> assert v == 6
+>>> ch.close()
+
+Примечание
+──────────
+Этот модуль не знает про схему ваших таблиц — он лишь безопасно и стабильно ходит в ClickHouse.
 """
 import logging
 import random
+import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from clickhouse_driver import Client as NativeClient
 import re
 from clickhouse_driver import errors as ch_errors
 
+
+# Хелпер для безопасного SQL-литерала (ClickHouse)
+def _quote_literal(value: str) -> str:
+    """
+    Безопасно оборачивает строку в одинарные кавычки для ClickHouse.
+    Используем SQL-совместимое экранирование путём удвоения одинарных кавычек.
+    """
+    s = "" if value is None else str(value)
+    return "'" + s.replace("'", "''") + "'"
+
 log = logging.getLogger("scripts.db.clickhouse_client")
 
-# Регулярка для безопасной проверки «это INSERT?» с учётом пробелов и комментариев
+# Регулярка для безопасной проверки «это INSERT?» с учётом пробелов и комментариев.
+# Нужна из‑за известной особенности clickhouse-driver: если оставить соединение
+# в режиме "force insert" (после большой вставки), то следующий не‑INSERT запрос
+# может быть ошибочно обработан как вставка. Мы явно проверяем начало текста запроса
+# и для не‑INSERT запросов сбрасываем внутренние флаги (см. _clear_force_insert()).
+
 _INSERT_RE = re.compile(
     r"^\s*(?:--.*?$|\s|/\*.*?\*/)*INSERT\b",
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
 
+
+# Подавляет «портянки» от внутреннего логгера clickhouse-driver при неудачных попытках подключения
+def _configure_driver_logging() -> None:
+    """
+    Подавляет «портянки» от внутреннего логгера clickhouse-driver при неудачных попытках
+    подключения (он пишет WARNING с exc_info и stacktrace на каждый хост).
+
+    Поведение:
+    • По умолчанию (если не включён DEBUG/ETL_TRACE_EXC) — опускаем уровень до ERROR,
+      чтобы WARNING с трассировкой не попадали в общий лог.
+    • Можно переопределить через переменную окружения CH_DRIVER_LOG_LEVEL:
+        - OFF    — полностью «выключить» (ставим уровень выше CRITICAL)
+        - ERROR  — по умолчанию (скрывает WARNING)
+        - WARNING/INFO/DEBUG — показать больше.
+    • Если установлен ETL_TRACE_EXC=1 или запущено с --log-level=DEBUG — ничего не подавляем.
+    """
+    try:
+        trace_on = str(os.getenv("ETL_TRACE_EXC", "")).strip().lower() in ("1", "true", "yes", "on")
+        if trace_on or logging.getLogger().isEnabledFor(logging.DEBUG):
+            return  # подробный режим, оставляем дефолтные уровни драйвера
+
+        level_name = str(os.getenv("CH_DRIVER_LOG_LEVEL", "ERROR")).strip().upper()
+        if level_name == "OFF":
+            target_level = logging.CRITICAL + 10  # фактически отключаем
+        else:
+            target_level = getattr(logging, level_name, logging.ERROR)
+
+        for lname in ("clickhouse_driver.connection", "clickhouse_driver.client", "clickhouse_driver.pool"):
+            lg = logging.getLogger(lname)
+            lg.setLevel(target_level)
+    except Exception:
+        # Безопасность прежде всего: любые сбои конфигурации логгера — не мешают ходу программы.
+        pass
+
 class ClickHouseClient:
+    """
+    Тонкая обёртка над `clickhouse-driver` с:
+      • failover-подключением по списку хостов,
+      • безопасным выполнением не‑INSERT запросов (сброс force_insert*),
+      • единообразным автоповтором при UnexpectedPacketFromServerError,
+      • порционной вставкой с ограниченным числом ретраев и переподключением.
+
+    Объект создаёт соединение при инициализации. При необходимости вызывайте `reconnect()`.
+    """
     def __init__(
         self,
         hosts: List[str],
@@ -35,6 +136,7 @@ class ClickHouseClient:
         settings: Optional[Dict[str, Any]] = None,
         insert_chunk_size: Optional[int] = None,   # размер чанка вставки (строк)
         insert_max_retries: Optional[int] = None,  # повторов на чанк при ошибке соединения
+        cluster: Optional[str] = None,  # опционально, используется только для вспомогательных проверок
     ):
         self.hosts = [h.strip() for h in (hosts or []) if h and h.strip()]
         if not self.hosts:
@@ -47,6 +149,11 @@ class ClickHouseClient:
         self.send_receive_timeout = int(send_receive_timeout)
         self.compression = bool(compression)
 
+        # Необязательное имя кластера, используется только для вспомогательных проверок
+        self.cluster = cluster
+
+        # Базовые настройки клиента. Их можно переопределить через аргумент `settings`.
+        # Обоснование значений см. в модульном докстринге.
         self.settings: Dict[str, Any] = {
             "async_insert": 1,
             "wait_for_async_insert": 1,
@@ -78,19 +185,21 @@ class ClickHouseClient:
         self.insert_max_retries = int(insert_max_retries)
         self.client: Optional[NativeClient] = None
         self.current_host: Optional[str] = None
+        _configure_driver_logging()
         self._connect_any()
 
     def _is_insert(self, sql: str) -> bool:
         """
-        Возвращает True, если sql начинается с INSERT (игнорируя пробелы и комментарии).
+        Возвращает True, если запрос начинается с ключевого слова INSERT
+        (игнорируя ведущие пробелы и строки комментариев '--' и '/* ... */').
         """
         return bool(_INSERT_RE.match(sql or ""))
 
     def _clear_force_insert(self) -> None:
         """
-        Страховка от бага clickhouse-driver: после INSERT соединение может
-        остаться в состоянии «force insert». Для любых не-INSERT запросов
-        обнуляем внутренние флаги соединения, если они присутствуют.
+        Сбрасывает внутренние флаги драйвера `force_insert_query` / `force_insert`, если они выставлены.
+        Это предотвращает редкий сценарий, когда после INSERT следующий SELECT/DDL воспринимается как вставка.
+        Безопасно вызывается перед любым не‑INSERT запросом (best-effort, ошибки игнорируются).
         """
         try:
             conn = getattr(self.client, "connection", None)
@@ -110,9 +219,11 @@ class ClickHouseClient:
         settings: Optional[Dict[str, Any]] = None,
     ):
         """
-        Единичный вызов self.client.execute с безопасной обработкой не-INSERT запросов.
-        - для не-INSERT: сбрасываем force_insert* флаги и не передаём пустой params вовсе.
-        - для INSERT: ведём себя стандартно.
+        Единичное выполнение `self.client.execute(...)` с учётом режима запроса:
+          • для не‑INSERT: предварительно сбрасываем force_insert*, и если `params` пуст,
+            не передаём его вовсе (иначе драйвер может переключиться на ветку вставки);
+          • для INSERT: выполняем как обычно.
+        Возвращает результат, как его возвращает `clickhouse-driver`.
         """
         is_insert = self._is_insert(sql)
         exec_settings = settings or {}
@@ -136,10 +247,10 @@ class ClickHouseClient:
         settings: Optional[Dict[str, Any]] = None,
     ):
         """
-        Один автоматический повтор при UnexpectedPacketFromServerError:
-        - на повторе выполняем reconnect() и делаем второй вызов.
-        Это покрывает редкий флап после bulk INSERT/разрывов соединения,
-        когда драйвер ошибочно ждёт пакеты «как при вставке».
+        Выполнение запроса с одним авто‑повтором на `UnexpectedPacketFromServerError`:
+          1) пробуем `\_execute_once`;
+          2) при исключении — логируем предупреждение, делаем `reconnect()` и повторяем ещё раз.
+        Полезно после крупных INSERT или при обрыве соединения сервером.
         """
         try:
             return self._execute_once(sql, params=params, settings=settings)
@@ -152,7 +263,187 @@ class ClickHouseClient:
             self.reconnect()
             return self._execute_once(sql, params=params, settings=settings)
 
+    def exists_table(self, table: str, database: Optional[str] = None) -> bool:
+        """
+        Локальная проверка существования таблицы на текущем хосте.
+        Принимает как FQN ('db.tbl'), так и имя в текущей БД.
+        """
+        db = database or self.db
+        fqn = table if "." in table else f"{db}.{table}"
+        try:
+            val = self.query_scalar(f"EXISTS TABLE {fqn}")
+            return bool(val)
+        except Exception as e:
+            log.warning("EXISTS TABLE %s: ошибка проверки: %s", fqn, e)
+            return False
+
+    def tables_exist_local(self, db: Optional[str], tables: Sequence[str]) -> Dict[str, bool]:
+        """
+        Возвращает карту наличия таблиц на ТЕКУЩЕМ хосте (без кластерной магии).
+        Ключи — FQN ('db.tbl').
+        """
+        database = db or self.db
+        result: Dict[str, bool] = {}
+        for t in tables:
+            fqn = t if "." in t else f"{database}.{t}"
+            result[fqn] = self.exists_table(fqn, database)
+        return result
+
+    def tables_exist_cluster(self, cluster: str, db: Optional[str], tables: Sequence[str]) -> Dict[str, bool]:
+        """
+        Кластерная проверка наличия таблиц: считаем записи в system.tables на всех репликах кластера.
+        Возвращает карту FQN → True/False.
+        """
+        database = db or self.db
+        result: Dict[str, bool] = {}
+        cl = _quote_literal(cluster)
+        for t in tables:
+            name = t.split(".")[-1]
+            sql = (
+                "SELECT count() "
+                f"FROM clusterAllReplicas({cl}, system.tables) "
+                f"WHERE database = {_quote_literal(database)} AND name = {_quote_literal(name)}"
+            )
+            try:
+                cnt = int(self.query_scalar(sql) or 0)
+                fqn = f"{database}.{name}"
+                result[fqn] = cnt > 0
+            except Exception as e:
+                fqn = f"{database}.{name}"
+                log.warning("Проверка таблицы в кластере '%s' для %s: ошибка: %s", cluster, fqn, e)
+                result[fqn] = False
+        return result
+
+    def probe_hosts_for_tables(self, db: Optional[str], tables: Sequence[str]) -> Dict[str, Dict[str, bool]]:
+        """
+        Обходит все CH_HOSTS и возвращает карту: host → {FQN → exists(bool)}.
+        Проверка выполняется ЛОКАЛЬНО на каждом хосте через временный клиент.
+        """
+        database = db or self.db
+        report: Dict[str, Dict[str, bool]] = {}
+        for host in self.hosts:
+            temp: Optional[NativeClient] = None
+            host_map: Dict[str, bool] = {}
+            try:
+                temp = NativeClient(
+                    host=host,
+                    port=self.port,
+                    user=self.user,
+                    password=self.password,
+                    database=database,
+                    client_name="etl_codes_history_probe",
+                    connect_timeout=self.connect_timeout,
+                    send_receive_timeout=self.send_receive_timeout,
+                    compression=self.compression,
+                    settings=self.settings,
+                )
+                temp.execute("SELECT 1")
+                for t in tables:
+                    fqn = t if "." in t else f"{database}.{t}"
+                    try:
+                        val = temp.execute(f"EXISTS TABLE {fqn}")
+                        ok = bool(val and val[0][0])
+                    except Exception as e:
+                        log.warning("EXISTS TABLE %s@%s: ошибка: %s", fqn, host, e)
+                        ok = False
+                    host_map[fqn] = ok
+            except Exception as e:
+                log.warning("Не удалось выполнить probe на хосте %s: %s", host, e)
+                for t in tables:
+                    fqn = t if "." in t else f"{database}.{t}"
+                    host_map[fqn] = False
+            finally:
+                try:
+                    if temp:
+                        temp.disconnect()
+                except Exception:
+                    pass
+            report[host] = host_map
+        return report
+
+    def switch_to_host(self, host: str) -> None:
+        """
+        Принудительное переключение на указанный хост (без перемешивания).
+        Поднимает исключение, если подключение не удалось.
+        """
+        try:
+            if self.client:
+                self.client.disconnect()
+        except Exception:
+            pass
+        self.client = NativeClient(
+            host=host,
+            port=self.port,
+            user=self.user,
+            password=self.password,
+            database=self.db,
+            client_name="etl_codes_history",
+            connect_timeout=self.connect_timeout,
+            send_receive_timeout=self.send_receive_timeout,
+            compression=self.compression,
+            settings=self.settings,
+        )
+        self.client.execute("SELECT 1")
+        self.current_host = host
+        log.info("Переключился на ClickHouse %s:%d, db=%s", host, self.port, self.db)
+
+    def ensure_tables(self, tables: Sequence[str], db: Optional[str] = None, cluster: Optional[str] = None, try_switch_host: bool = True) -> None:
+        """
+        Гарантирует наличие необходимых таблиц.
+        Алгоритм:
+          1) Если задан cluster — проверяем наличие на уровне кластера (clusterAllReplicas).
+             Если всё ок — выходим.
+          2) Иначе/дополнительно — проверяем локально на текущем хосте.
+             Если отсутствуют и try_switch_host=True — пробуем найти хост, где все таблицы есть, и переключаемся.
+             Если таковой не найден — поднимаем RuntimeError с детальным отчётом.
+        """
+        database = db or self.db
+        names = [t if "." in t else f"{database}.{t}" for t in tables]
+
+        # 1) Кластерная проверка (опционально)
+        if cluster:
+            cluster_map = self.tables_exist_cluster(cluster, database, tables)
+            missing_cluster = [n for n in names if not cluster_map.get(n, False)]
+            if not missing_cluster:
+                return  # на кластере всё видно
+
+        # 2) Локальная проверка на текущем хосте
+        local_map = self.tables_exist_local(database, tables)
+        missing_local = [n for n in names if not local_map.get(n, False)]
+        if not missing_local:
+            return
+
+        if not try_switch_host:
+            raise RuntimeError(f"Missing tables on host {self.current_host or '?'}: {', '.join(missing_local)}")
+
+        # 3) Попробуем найти подходящий хост
+        probe = self.probe_hosts_for_tables(database, tables)
+        candidates = []
+        for host, tblmap in probe.items():
+            if all(tblmap.get(n, False) for n in names):
+                candidates.append(host)
+
+        if candidates:
+            # Берём первый подходящий хост и переключаемся
+            self.switch_to_host(candidates[0])
+            return
+
+        # 4) Никто не подошёл — собираем сводку и падаем
+        lines = [f"clickhouse ensure_tables failed: ни на одном хосте не найден полный набор таблиц."]
+        for host, tblmap in probe.items():
+            miss = [n for n in names if not tblmap.get(n, False)]
+            lines.append(f"  - {host}: missing={miss if miss else 'OK'}")
+        raise RuntimeError("\n".join(lines))
+
     def _connect_any(self) -> None:
+        """
+        Подключается к первому «живому» хосту из списка:
+          • перемешиваем хосты для равномерного распределения,
+          • пробуем создать NativeClient и выполнить `SELECT 1`,
+          • при успехе — фиксируем `current_host` и выходим,
+          • при неудаче — предупреждение в лог и пробуем следующий.
+        В случае полного провала возбуждает последнее перехваченное исключение.
+        """
         last_err: Optional[Exception] = None
         hosts = self.hosts[:]
         random.shuffle(hosts)
@@ -183,8 +474,8 @@ class ClickHouseClient:
 
     def _iter_chunks(self, rows: Iterable[Any]) -> Iterable[List[Any]]:
         """
-        Порционно разбивает входной iterable на чанки по self.insert_chunk_size.
-        Возвращает списки (list) для передачи драйверу.
+        Генератор, разбивающий входной iterable `rows` на списки длиной до `insert_chunk_size`.
+        Используем списки (а не кортежи), потому что драйверу удобнее подавать списки батчей.
         """
         chunk: List[Any] = []
         for row in rows:
@@ -196,6 +487,9 @@ class ClickHouseClient:
             yield chunk
 
     def close(self):
+        """
+        Корректно закрывает соединение с ClickHouse. Любые ошибки при disconnect игнорируются.
+        """
         try:
             if self.client:
                 self.client.disconnect()
@@ -204,30 +498,34 @@ class ClickHouseClient:
 
     def query_scalar(self, sql: str) -> Any:
         """
-        Выполняет SELECT и возвращает первое скалярное значение.
-        Использует безопасный путь исполнения + 1 ретрай при UnexpectedPacketFromServerError.
+        Выполняет SELECT и возвращает первое скалярное значение первой строки.
+        Использует безопасный путь исполнения + 1 авто‑повтор при UnexpectedPacketFromServerError.
+        Подходит для EXISTS/COUNT/проверочных запросов.
         """
         res = self._execute_with_retry(sql)
         return res[0][0] if res else None
 
     def execute(self, sql: str, params: Optional[Sequence] = None, settings: Optional[Dict[str, Any]] = None) -> None:
         """
-        Универсальный вызов (DDL/DML/ALTER/INSERT SELECT) с поддержкой settings.
-        Защита от «залипания» драйвера в insert-режиме и 1 авто-повтор при
-        UnexpectedPacketFromServerError.
+        Универсальный вызов для DDL/DML/ALTER/INSERT SELECT с поддержкой `settings`.
+        • Защищён от «залипания» драйвера в insert‑режим на не‑INSERT запросах.
+        • Делает один авто‑повтор при UnexpectedPacketFromServerError.
+        Ничего не возвращает — как и стандартный `Client.execute` для не‑SELECT.
         """
         self._execute_with_retry(sql, params=params, settings=settings)
 
     def query_all(self, sql: str, params: Optional[Sequence] = None, settings: Optional[Dict[str, Any]] = None) -> List[tuple]:
         """
-        SELECT → список строк. Использует безопасный путь исполнения
-        (сброс force_insert для не-INSERT) и 1 авто-повтор при UnexpectedPacketFromServerError.
+        Выполняет SELECT и возвращает список строк (list[tuple]).
+        На вход можно передавать `params` и `settings`. Для не‑INSERT запросов перед вызовом
+        сбрасываются force_insert* флаги; при флапе есть один авто‑повтор.
         """
         return self._execute_with_retry(sql, params=params, settings=settings)  # type: ignore[return-value]
 
     def reconnect(self) -> None:
         """
-        Принудительное переподключение (обход глюков драйвера после bulk INSERT).
+        Принудительно разрывает текущее соединение (если есть) и заново пытается подключиться
+        к одному из доступных хостов (_connect_any). Используется в ретраях и для ручного восстановления.
         """
         try:
             if self.client:
@@ -238,10 +536,19 @@ class ClickHouseClient:
 
     def insert_rows(self, table: str, rows: Iterable[Any], columns: Sequence[str]) -> int:
         """
-        Вставка порциями (чанками). На каждую порцию — до `insert_max_retries` переподключений.
-        Ожидается, что `rows` выдаёт элементы, уже приведённые к tuple/list по порядку `columns`.
-        Здесь НЕ трогаем никаких внутренних "force insert" флагов — драйвер корректно
-        определяет режим по самому SQL (INSERT), а для не-INSERT это делается в _execute_*().
+        Вставка данных в таблицу порциями (чанками).
+        Параметры:
+          • table   — FQN таблицы ('db.tbl') или имя в текущей БД.
+          • rows    — iterable с уже подготовленными записями (tuple/list) в порядке `columns`.
+          • columns — последовательность имён колонок.
+
+        Поведение:
+          • Строится SQL вида `INSERT INTO db.tbl (c1, c2, ...) VALUES`.
+          • Поток `rows` режется на чанки по `insert_chunk_size`.
+          • На каждый чанк допускается до `insert_max_retries` попыток; между попытками — переподключение.
+          • При превышении лимита ретраев — исключение пробрасывается вызывающему коду.
+
+        Возвращает количество реально вставленных строк.
         """
         table_fqn = table if "." in table else f"{self.db}.{table}"
         sql = f"INSERT INTO {table_fqn} ({', '.join(columns)}) VALUES"
