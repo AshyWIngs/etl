@@ -1,190 +1,175 @@
 # -*- coding: utf-8 -*-
-# scripts/config.py
+"""
+Minimal Settings loader for ETL.
+
+Этот модуль сознательно хранит только те переменные, которые реально используются
+в текущем коде. У всех настроек есть безопасные дефолты, так что локальный запуск
+работает «из коробки». Любую настройку можно переопределить через переменные окружения
+(см. .env.example).
+
+Ключевые решения:
+- INPUT_TZ удалён. Если BUSINESS_TZ непустой, наивные даты CLI трактуются в этой TZ;
+  иначе — как UTC. Это делает семантику времени однозначной.
+- Ретенция журнала — только партициями; никаких row-level DELETE.
+- Дефолты консервативные и безопасные для продакшена.
+"""
 from __future__ import annotations
 
 import os
-import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import List, Optional
-from zoneinfo import ZoneInfo
+# --- BEGIN robust .env loader (injected) ---
+# Загружаем переменные окружения из .env надёжно и предсказуемо.
+# Порядок поиска:
+#   1) ENV_FILE (если указан абсолютный или относительный путь)
+#   2) CWD/.env
+#   3) <repo_root>/.env   (родитель каталога, где лежит scripts/)
+#   4) scripts/.env
+# Плюс, если PG_DSN не задан, собираем его из PG_HOST/PG_PORT/PG_DB/PG_USER/PG_PASSWORD.
+import logging as _logging, os as _os, pathlib as _pathlib
 
-# Загружаем .env, если есть python-dotenv
-try:
-    from dotenv import load_dotenv, find_dotenv  # type: ignore
-    _env = find_dotenv(usecwd=True)
-    if _env:
-        load_dotenv(_env, override=False)
-except Exception:
-    pass
-
-def _clean(val: Optional[str]) -> str:
-    if val is None:
-        return ""
-    s = val.strip()
-    if not s:
-        return ""
-    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
-        return s.strip("\"'")
-    sharp = s.find("#")
-    if sharp > 0:
-        s = s[:sharp].strip()
-    return s
-
-def _get_str(name: str, default: str = "") -> str:
-    return _clean(os.getenv(name, default))
-
-def _get_int(name: str, default: int = 0) -> int:
-    raw = _clean(os.getenv(name))
-    if raw == "":
-        return int(default)
+def _load_env_robust() -> str:
+    candidates = []
+    # 1) Явный путь через ENV_FILE
+    env_file = _os.getenv("ENV_FILE", "").strip()
+    if env_file:
+        candidates.append(_pathlib.Path(env_file))
+    # 2) Текущая рабочая директория
+    candidates.append(_pathlib.Path.cwd() / ".env")
+    # 3) Корень репозитория (родитель каталога scripts/)
     try:
-        return int(raw)
+        this_file = _pathlib.Path(__file__).resolve()
+        scripts_dir = this_file.parent
+        repo_root = scripts_dir.parent
+        candidates.append(repo_root / ".env")
+        # 4) Рядом с config.py (на случай локальных запусков из scripts/)
+        candidates.append(scripts_dir / ".env")
     except Exception:
-        return int(default)
+        pass
 
-def _get_bool(name: str, default: bool = False) -> bool:
-    raw = _clean(os.getenv(name))
-    if raw == "":
-        return bool(default)
-    return raw.lower() in ("1", "true", "yes", "y", "on")
+    loaded_from = ""
+    # Пробуем через python-dotenv (если установлен)
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        for p in candidates:
+            if p.is_file():
+                if load_dotenv(dotenv_path=str(p), override=False):
+                    loaded_from = str(p)
+                    break
+    except Exception:
+        # Фолбэк: примитивный парсер KEY=VALUE (без кавычек/экранирования)
+        for p in candidates:
+            if p.is_file():
+                try:
+                    for line in p.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip('"').strip("'")
+                            _os.environ.setdefault(k, v)
+                    loaded_from = str(p)
+                    break
+                except Exception:
+                    continue
 
-def _get_list(name: str, default: str = "", sep: str = ",") -> List[str]:
-    raw = _clean(os.getenv(name, default))
-    if raw == "":
-        return []
-    return [p.strip() for p in raw.split(sep) if p.strip()]
+    if loaded_from:
+        _logging.getLogger(__name__).info("config: .env loaded from %s", loaded_from)
+    else:
+        _logging.getLogger(__name__).warning(
+            "config: .env not found via ENV_FILE/CWD/repo_root/scripts — using process env only"
+        )
+    return loaded_from
 
-def parse_iso_utc(s: Optional[str]) -> datetime:
-    if not s:
-        raise ValueError("parse_iso_utc: empty input")
-    ss = s.strip()
-    if ss.endswith("Z"):
-        ss = ss[:-1] + "+00:00"
-    dt = datetime.fromisoformat(ss)
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+_loaded_env_path = _load_env_robust()
 
-@dataclass
+def _ensure_pg_dsn_in_env():
+    """
+    Если PG_DSN не задан, собираем его из составных частей.
+    Это устраняет кейс, когда в .env задано PG_HOST/PORT/...,
+    но нет единого PG_DSN.
+    """
+    if "PG_DSN" in _os.environ and _os.environ["PG_DSN"].strip():
+        return
+    host = _os.getenv("PG_HOST", "127.0.0.1").strip()
+    port = _os.getenv("PG_PORT", "5432").strip()
+    db   = _os.getenv("PG_DB",   "etl_database").strip()
+    user = _os.getenv("PG_USER", "etl_user").strip()
+    pwd  = _os.getenv("PG_PASSWORD", "etl_password").strip()
+    _os.environ["PG_DSN"] = f"postgresql://{user}:{pwd}@{host}:{port}/{db}"
+    _logging.getLogger(__name__).info("config: PG_DSN synthesized from parts (PG_HOST/PORT/DB/USER/PASSWORD)")
+
+_ensure_pg_dsn_in_env()
+# --- END robust .env loader (injected) ---
+
+from dataclasses import dataclass
+from typing import List
+
+def _as_bool(v: str, default: bool = False) -> bool:
+    s = (v or "").strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return default
+
+@dataclass(frozen=True)
 class Settings:
-    # Процесс и журнал
-    # имя процесса в журнале (совпадает со скриптом)
-    PROCESS_NAME: str = field(default_factory=lambda: _get_str("PROCESS_NAME", "codes_history_increment"))
-    JOURNAL_TABLE: str = field(default_factory=lambda: _get_str("JOURNAL_TABLE", "public.inc_processing"))
-    JOURNAL_RETENTION_DAYS: int = field(default_factory=lambda: _get_int("JOURNAL_RETENTION_DAYS", 30))
+    # --- Identity & logging ---
+    PROCESS_NAME: str = os.getenv("PROCESS_NAME", "codes_history_increment")
+    ETL_TRACE_EXC: bool = _as_bool(os.getenv("ETL_TRACE_EXC", "0"))
 
-    # PostgreSQL
-    PG_DSN: str = field(default_factory=lambda: _get_str("PG_DSN", "postgresql://etl:etl@localhost:5432/etl"))
-    # Необязательный быстрый TCP-probe перед psycopg.connect, 0 — выключено
-    PG_TCP_PROBE_TIMEOUT_MS: int = field(default_factory=lambda: _get_int("PG_TCP_PROBE_TIMEOUT_MS", 0))
+    # --- Time semantics ---
+    # If non-empty -> naive CLI dates are interpreted in this TZ; else -> UTC.
+    BUSINESS_TZ: str = (os.getenv("BUSINESS_TZ", "") or "").strip()
 
-    # Логирование: можно задать дефолтный уровень, если не передан параметр CLI,
-    # и управлять объёмом трейсбека при фатальных ошибках старта (поддержка "короткого" выхода).
-    LOG_LEVEL: str = field(default_factory=lambda: _get_str("LOG_LEVEL", "INFO"))
-    ETL_TRACE_EXC: bool = field(default_factory=lambda: _get_bool("ETL_TRACE_EXC", False))
+    # --- PostgreSQL / Journal ---
+    PG_DSN: str = os.getenv("PG_DSN", "postgresql://etl_user:etl_password@127.0.0.1:5432/etl_database")
+    JOURNAL_TABLE: str = os.getenv("JOURNAL_TABLE", "public.inc_processing")
+    JOURNAL_RETENTION_DAYS: int = int(os.getenv("JOURNAL_RETENTION_DAYS", "30"))
+    JOURNAL_HEARTBEAT_MIN_INTERVAL_SEC: int = int(os.getenv("JOURNAL_HEARTBEAT_MIN_INTERVAL_SEC", "300"))
+    JOURNAL_AUTOPRUNE_ON_DONE: bool = _as_bool(os.getenv("JOURNAL_AUTOPRUNE_ON_DONE", "1"), True)
 
-    # Phoenix / HBase
-    PQS_URL: str = field(default_factory=lambda: _get_str("PQS_URL", "http://127.0.0.1:8765"))
-    HBASE_MAIN_TABLE: str = field(default_factory=lambda: _get_str("HBASE_MAIN_TABLE", "TBL_JTI_TRACE_CIS_HISTORY"))
-    HBASE_MAIN_TS_COLUMN: str = field(default_factory=lambda: _get_str("HBASE_MAIN_TS_COLUMN", "opd"))
-    PHX_FETCHMANY_SIZE: int = field(default_factory=lambda: _get_int("PHX_FETCHMANY_SIZE", 5000))
-    PHX_TS_UNITS: str = field(default_factory=lambda: _get_str("PHX_TS_UNITS", "timestamp"))  # 'timestamp'|'millis'|'micros'
+    # --- Phoenix source ---
+    PQS_URL: str = os.getenv("PQS_URL", "http://127.0.0.1:8765")
+    HBASE_MAIN_TABLE: str = os.getenv("HBASE_MAIN_TABLE", "TBL_JTI_TRACE_CIS_HISTORY")
+    HBASE_MAIN_TS_COLUMN: str = os.getenv("HBASE_MAIN_TS_COLUMN", "opd")
+    PHX_FETCHMANY_SIZE: int = int(os.getenv("PHX_FETCHMANY_SIZE", "20000"))
+    PHX_TS_UNITS: str = os.getenv("PHX_TS_UNITS", "timestamp")  # "timestamp" or "millis"
+    PHX_QUERY_OVERLAP_MINUTES: int = int(os.getenv("PHX_QUERY_OVERLAP_MINUTES", "5"))
+    PHX_OVERLAP_ONLY_FIRST_SLICE: int = int(os.getenv("PHX_OVERLAP_ONLY_FIRST_SLICE", "1"))
 
-    # TCP‑пробник Phoenix PQS перед созданием подключения phoenixdb (мс).
-    # Если PQS недоступен по TCP, не идём в phoenixdb.connect, а падаем управляемо (короткое сообщение + запись в журнал).
-    PHOENIX_TCP_PROBE_TIMEOUT_MS: int = field(default_factory=lambda: _get_int("PHOENIX_TCP_PROBE_TIMEOUT_MS", 3000))
+    # --- ClickHouse sink ---
+    CH_HOSTS: str = os.getenv("CH_HOSTS", "127.0.0.1")
+    CH_PORT: int = int(os.getenv("CH_PORT", "9000"))
+    CH_DB: str = os.getenv("CH_DB", "default")
+    CH_USER: str = os.getenv("CH_USER", "default")
+    CH_PASSWORD: str = os.getenv("CH_PASSWORD", "")
+    CH_CLUSTER: str = (os.getenv("CH_CLUSTER", "") or "").strip()
 
-    # Тайминги окна
-    STEP_MIN: int = field(default_factory=lambda: _get_int("STEP_MIN", 10))
-    # Бизнес-часовой пояс: в нём пользователи задают окно запуска; по умолчанию — Asia/Almaty
-    BUSINESS_TZ: str = field(default_factory=lambda: _get_str("BUSINESS_TZ", "Asia/Almaty"))
-    # Как трактовать НАИВНЫЕ --since/--until: 'business' (в BUSINESS_TZ) или 'utc'
-    INPUT_TZ: str = field(default_factory=lambda: _get_str("INPUT_TZ", "business"))
-    PHX_QUERY_OVERLAP_MINUTES: int = field(default_factory=lambda: _get_int("PHX_QUERY_OVERLAP_MINUTES", 0))
-    PHX_OVERLAP_ONLY_FIRST_SLICE: bool = field(default_factory=lambda: _get_bool("PHX_OVERLAP_ONLY_FIRST_SLICE", True))
+    # RAW — Distributed; CLEAN — локальная (для REPLACE PARTITION);
+    # CLEAN_ALL — Distributed-представление CLEAN.
+    CH_RAW_TABLE: str = os.getenv("CH_RAW_TABLE", "stg.daily_codes_history_raw_all")
+    CH_CLEAN_TABLE: str = os.getenv("CH_CLEAN_TABLE", "stg.daily_codes_history_all_local")
+    CH_CLEAN_ALL_TABLE: str = os.getenv("CH_CLEAN_ALL_TABLE", "stg.daily_codes_history_all")
+    CH_DEDUP_BUF_TABLE: str = os.getenv("CH_DEDUP_BUF_TABLE", "stg.daily_codes_history_buf")
+    CH_INSERT_BATCH: int = int(os.getenv("CH_INSERT_BATCH", "10000"))
 
-    # ClickHouse
-    CH_HOSTS: List[str] = field(default_factory=lambda: _get_list("CH_HOSTS", "127.0.0.1"))
-    CH_PORT: int = field(default_factory=lambda: _get_int("CH_PORT", 9000))
-    CH_DB: str = field(default_factory=lambda: _get_str("CH_DB", "stg"))
-    CH_USER: str = field(default_factory=lambda: _get_str("CH_USER", "default"))
-    CH_PASSWORD: str = field(default_factory=lambda: _get_str("CH_PASSWORD", ""))
+    # --- ETL cadence / gating ---
+    STEP_MIN: int = int(os.getenv("STEP_MIN", "10"))
+    PUBLISH_EVERY_SLICES: int = int(os.getenv("PUBLISH_EVERY_SLICES", "0"))
+    PUBLISH_ONLY_IF_NEW: int = int(os.getenv("PUBLISH_ONLY_IF_NEW", "1"))
+    PUBLISH_MIN_NEW_ROWS: int = int(os.getenv("PUBLISH_MIN_NEW_ROWS", "1"))
 
-    # Имя кластера ClickHouse для health‑чеков и проверок наличие таблиц (clusterAllReplicas).
-    CH_CLUSTER: str = field(default_factory=lambda: _get_str("CH_CLUSTER", "shardless"))
+    # --- Columns fallback (при недоступности авто-дискавери через Phoenix) ---
+    HBASE_MAIN_COLUMNS: str = os.getenv(
+        "HBASE_MAIN_COLUMNS",
+        "c,t,opd,id,did,rid,rinn,rn,sid,sinn,sn,gt,prid,st,ste,elr,emd,apd,exd,p,pt,o,pn,b,tt,tm,ch,j,pg,et,pvad,ag",
+    )
 
-    # RAW (Distributed) источник для дедупа должен указывать на *_raw_all
-    # Поддерживаем совместимость: CH_RAW_TABLE (новое) или CH_TABLE (старое имя)
-    CH_RAW_TABLE: str = field(default_factory=lambda: _get_str("CH_RAW_TABLE", _get_str("CH_TABLE", "stg.daily_codes_history_raw_all")))
-    CH_RAW_LOCAL_TABLE: str = field(default_factory=lambda: _get_str("CH_RAW_LOCAL_TABLE", "stg.daily_codes_history_raw"))  # не используется текущим основным ETL, оставлено для совместимости
-    CH_CLEAN_TABLE: str = field(default_factory=lambda: _get_str("CH_CLEAN_TABLE", "stg.daily_codes_history"))
-    CH_CLEAN_ALL_TABLE: str = field(default_factory=lambda: _get_str("CH_CLEAN_ALL_TABLE", "stg.daily_codes_history_all"))
-    CH_DEDUP_BUF_TABLE: str = field(default_factory=lambda: _get_str("CH_DEDUP_BUF_TABLE", "stg.daily_codes_history_dedup_buf"))
-    CH_INSERT_BATCH: int = field(default_factory=lambda: _get_int("CH_INSERT_BATCH", 20000))
-
-    # Сколько раз пытаться повторно вставить батч в ClickHouse при временных ошибках сети/шардов.
-    CH_INSERT_MAX_RETRIES: int = field(default_factory=lambda: _get_int("CH_INSERT_MAX_RETRIES", 1))
-
-    # Таймзоны: как трактовать наивные CLI-даты и какая «бизнес»-зона по умолчанию
-    # 'utc'|'business'
-    INPUT_TZ: str = field(default_factory=lambda: _get_str("INPUT_TZ", "business"))
-    # локальная бизнес-зона
-    BUSINESS_TZ: str = field(default_factory=lambda: _get_str("BUSINESS_TZ", "Asia/Almaty"))
-
-    # Автокаденс публикаций
-    # «Лёгкая» защита от пустых публикаций (no-op gating)
-    # публиковать только при приросте
-    PUBLISH_ONLY_IF_NEW: bool = field(default_factory=lambda: _get_bool("PUBLISH_ONLY_IF_NEW", True))
-    # минимальный прирост строк в RAW
-    PUBLISH_MIN_NEW_ROWS: int = field(default_factory=lambda: _get_int("PUBLISH_MIN_NEW_ROWS", 1))
-    PUBLISH_EVERY_SLICES: int = field(default_factory=lambda: _get_int("PUBLISH_EVERY_SLICES", 6))
-    ALWAYS_PUBLISH_AT_END: bool = field(default_factory=lambda: _get_bool("ALWAYS_PUBLISH_AT_END", True))
-    # Фильтр «публиковать только если появились новые строки» (no-op gating)
-    PUBLISH_ONLY_IF_NEW: bool = field(default_factory=lambda: _get_bool("PUBLISH_ONLY_IF_NEW", True))
-    PUBLISH_MIN_NEW_ROWS: int = field(default_factory=lambda: _get_int("PUBLISH_MIN_NEW_ROWS", 1))
-
-    # Поддерживаем переменные MAIN_COLUMNS (новая) и HBASE_MAIN_COLUMNS (устаревшая)
-    MAIN_COLUMNS: List[str] = field(default_factory=lambda: _get_list(
-            "MAIN_COLUMNS",
-            _get_str("HBASE_MAIN_COLUMNS",
-                     "c,t,opd,id,did,rid,rinn,rn,sid,sinn,sn,gt,prid,st,ste,elr,emd,apd,exd,p,pt,o,pn,b,tt,tm,ch,j,pg,et,pvad,ag")
-        ))
-
-    def __post_init__(self):
-        """
-        Нормализация и безопасные дефолты.
-        ВНИМАНИЕ: здесь нет ссылок на удалённые поля (например, PUBLISH_EVERY_MINUTES),
-        чтобы Settings() можно было создавать на ранних этапах (даже внутри argparse).
-        """
-        # Лог-уровень
-        self.LOG_LEVEL = (self.LOG_LEVEL or "INFO").upper()
-
-        # Тайминги окна
-        self.STEP_MIN = max(1, int(self.STEP_MIN))
-        self.PHX_QUERY_OVERLAP_MINUTES = max(0, int(self.PHX_QUERY_OVERLAP_MINUTES))
-        self.PHX_OVERLAP_ONLY_FIRST_SLICE = bool(self.PHX_OVERLAP_ONLY_FIRST_SLICE)
-
-        # Публикационный каденс — только по числу слайсов
-        self.PUBLISH_EVERY_SLICES = max(0, int(self.PUBLISH_EVERY_SLICES))
-        self.ALWAYS_PUBLISH_AT_END = bool(self.ALWAYS_PUBLISH_AT_END)
-
-        # Режим трактовки наивных CLI-дат
-        # (дефолт — 'business', т.к. вы обычно задаёте локальные даты по Астане)
-        self.INPUT_TZ = (getattr(self, "INPUT_TZ", "") or "business").lower()
-        if self.INPUT_TZ not in ("business", "utc"):
-            self.INPUT_TZ = "business"
-
-        # Бизнес-часовой пояс
-        self.BUSINESS_TZ = getattr(self, "BUSINESS_TZ", "") or "Asia/Almaty"
-
-        # ClickHouse: список хостов — подстрахуемся, чтобы не было пустого массива
-        if not getattr(self, "CH_HOSTS", None):
-            self.CH_HOSTS = ["127.0.0.1"]
+    # -------- Helpers --------
+    def ch_hosts_list(self) -> List[str]:
+        return [h.strip() for h in self.CH_HOSTS.split(",") if h.strip()]
 
     def main_columns_list(self) -> List[str]:
-        return list(self.MAIN_COLUMNS)
-
-    def ch_hosts_list(self) -> List[str]:
-        return list(self.CH_HOSTS)
-    
+        return [c.strip() for c in self.HBASE_MAIN_COLUMNS.split(",") if c.strip()]

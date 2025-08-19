@@ -10,11 +10,12 @@ from psycopg.types.json import Json
 from psycopg.errors import UniqueViolation
 import os
 import time
+import re
 
-# Настройка таймзоны вывода для ЛОГОВ (не влияет на UTC в БД)
+# Настройка таймзоны вывода для ЛОГОВ (не влияет на UTC в БД, отображение через CLI)
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
-except Exception:  # на всякий случай — если модуль недоступен
+except Exception:
     ZoneInfo = None  # type: ignore
 
 _LOG_TZ_CONFIGURED = False
@@ -27,12 +28,11 @@ class _TzFormatter(logging.Formatter):
     def __init__(self, fmt: str | None = None, datefmt: str | None = None, tzinfo: timezone | None = None):
         super().__init__(fmt=fmt, datefmt=datefmt)
         self._tz = tzinfo or timezone.utc
-    
+
     def formatTime(self, record, datefmt=None):
         dt = datetime.fromtimestamp(record.created, tz=timezone.utc).astimezone(self._tz)
         if datefmt:
             return dt.strftime(datefmt)
-        # ISO‑8601 без микросекунд для компактности
         return dt.isoformat(timespec="seconds")
 
 def _resolve_log_timezone(name: str) -> timezone:
@@ -42,24 +42,21 @@ def _resolve_log_timezone(name: str) -> timezone:
             return ZoneInfo(name)
         except Exception:
             pass
-    # Фолбэк: фиксированный сдвиг +05:00 (Астана)
-    return timezone(timedelta(hours=5))
+    return timezone(timedelta(hours=5))  # Asia/Almaty
 
 def _configure_logger_timezone_once() -> None:
     """
     Один раз перестраивает форматтеры хэндлеров текущего логгера так,
-    чтобы время в логах печаталось в бизнес‑таймзоне.
-    Управляется переменной окружения JOURNAL_LOG_TZ (рекомендуется 'Asia/Almaty', GMT+5).
+    чтобы время в логах печаталось в бизнес-таймзоне.
+    Управляется переменной окружения JOURNAL_LOG_TZ (рекомендуется 'Asia/Almaty').
     """
     global _LOG_TZ_CONFIGURED
     if _LOG_TZ_CONFIGURED:
         return
 
-    # Берём переменную JOURNAL_LOG_TZ (если не задана — используем 'Asia/Almaty', GMT+5); влияет только на вывод логов.
     tz_name = (os.getenv("JOURNAL_LOG_TZ") or "Asia/Almaty").strip()
     tzinfo = _resolve_log_timezone(tz_name)
 
-    # Обновляем форматтеры у хэндлеров корневого и наших логгеров
     def _each_handler():
         seen = set()
         for lname in ("", "scripts", "scripts.journal"):
@@ -72,23 +69,9 @@ def _configure_logger_timezone_once() -> None:
                 yield h
 
     for h in _each_handler():
-        cur_fmt = None
-        cur_datefmt = None
-        if getattr(h, "formatter", None):
-            # Пытаемся максимально сохранить текущий вид форматирования
-            try:
-                cur_fmt = h.formatter._style._fmt  # type: ignore[attr-defined]
-            except Exception:
-                cur_fmt = None
-            try:
-                cur_datefmt = h.formatter.datefmt  # type: ignore[attr-defined]
-            except Exception:
-                cur_datefmt = None
-        # разумные дефолты, если форматтер не был задан
-        if cur_fmt is None:
-            cur_fmt = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
-        if cur_datefmt is None:
-            cur_datefmt = "%Y-%m-%d %H:%M:%S"
+        # Единый компактный формат логов без выравнивания уровня (убираем лишние пробелы у INFO)
+        cur_fmt = os.getenv("JOURNAL_LOG_FORMAT", "%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+        cur_datefmt = os.getenv("JOURNAL_LOG_DATEFMT", "%Y-%m-%d %H:%M:%S")
         h.setFormatter(_TzFormatter(fmt=cur_fmt, datefmt=cur_datefmt, tzinfo=tzinfo))
 
     _LOG_TZ_CONFIGURED = True
@@ -100,35 +83,72 @@ class ProcessJournal:
     """
     Журнал инкрементальных запусков + watermark в PostgreSQL.
 
-    Минимально, но достаточно для эксплуатации:
-      * <schema>.inc_processing      — журнал запусков (planned|running|ok|error|skipped)
-      * <schema>.inc_process_state   — watermark (до какого бизнес-времени обработано)
+    Минимально и стабильно:
+      * <schema>.inc_processing      — журнал запусков (planned|running|ok|error|skipped), PARTITION BY RANGE (ts_start)
+      * <schema>.inc_process_state   — агрегированное состояние (watermark, hb, последний статус)
 
     Основные принципы:
       - В один момент времени может быть только ОДНА «активная» запись по процессу
-        (status in ('planned','running') and ts_end is null) — это гарантирует частичный UNIQUE индекс.
+        (status in ('planned','running') and ts_end is null) — это гарантирует частичный UNIQUE индекс на дочках.
       - Переход planned→running выполняется атомарно (UPDATE по найденному planned).
-      - Все метаданные и показатели складываются в колонку JSONB `details`.
+      - Все метаданные и показатели складываются в JSONB `details`.
       - Watermark — правая граница обработанного бизнес-интервала (UTC).
-      - Для фатальных «стартовых» сбоев (например, не удалось подключиться к внешней БД)
-        предусмотрена запись ошибки БЕЗ привязки к бизнес-срезу — через `mark_startup_error(...)`.
-        Такая запись сразу создаётся со status='error' и ts_end=now(), поэтому не конфликтует
-        с частичным UNIQUE-индексом для active (planned/running).
+      - Для фатальных стартовых сбоев предусмотрена запись ошибки без привязки к окну — mark_startup_error().
 
-    Режим «минимального журнала» и троттлинг heartbeat:
-      - Для высоконагруженных сценариев можно уменьшить число записей в БД.
-      - Если включён минимальный режим, фиксация событий идёт только на ключевых переходах:
-        planned → running → ok/error, плюс авто‑санация; фоновые heartbeat без прогресса
-        можно не писать вовсе.
-      - Порог частоты heartbeat регулируется параметром JOURNAL_HEARTBEAT_MIN_INTERVAL_SEC
-        (по умолчанию 30 секунд). До истечения интервала heartbeat без прогресса не пишется.
-      - Режим включается либо через параметр конструктора `minimal=True`, либо через
-        переменную окружения `JOURNAL_MINIMAL=1|true|yes|on`.
+    Режим «минимального журнала» и heartbeat-троттлинг:
+      - Можно уменьшить число записей в БД: писать только planned → running → ok/error (без пустых heartbeat).
+      - Порог частоты heartbeat регулируется JOURNAL_HEARTBEAT_MIN_INTERVAL_SEC (по умолчанию 30 сек).
 
     Часовой пояс ЛОГОВ:
-      - Переменная окружения JOURNAL_LOG_TZ (по умолчанию 'Asia/Almaty', GMT+5) задаёт TZ только для печати логов.
-      - Все значения времени, которые пишутся в БД (журнал/состояние/метки sanitized_at), остаются строго в UTC.
+      - JOURNAL_LOG_TZ (по умолчанию 'Asia/Almaty') влияет только на печать времени в логах.
+      - Все значения времени, которые пишутся в БД (журнал/состояние/метки sanitized_at), — строго в UTC.
+
+    ENV:
+      - JOURNAL_PARTITION_INTERVAL_DAYS=7|14|30 (def: 7) — длина окна партиции
+      - JOURNAL_PARTITION_BEHIND=1, JOURNAL_PARTITION_AHEAD=1 — количество окон назад/вперёд
+      - JOURNAL_LOG_TZ='Asia/Almaty' — TZ только для логов
     """
+
+    # ---------- PG commit helper ----------
+
+    def _commit_quietly(self) -> None:
+        """
+        Best-effort commit для разных PG-обёрток.
+        Если .commit() нет — предполагаем autocommit. Исключения гасим.
+        """
+        try:
+            commit_fn = getattr(self.pg, "commit", None)
+            if callable(commit_fn):
+                commit_fn()
+                return
+            conn = getattr(self.pg, "conn", None) or getattr(self.pg, "connection", None)
+            if conn and hasattr(conn, "commit"):
+                conn.commit()
+        except Exception:
+            pass
+
+    def _self_check_pg_client(self) -> None:
+        """
+        Разовый self-check PG‑клиента:
+          - если у обёртки нет .commit() и нет .conn/.connection.commit(),
+            выводим предупреждение (считаем, что autocommit).
+          - это чисто диагностическое сообщение для раннего выявления «сырых» клиентов.
+        """
+        try:
+            has_commit = callable(getattr(self.pg, "commit", None))
+            if not has_commit:
+                conn = getattr(self.pg, "conn", None) or getattr(self.pg, "connection", None)
+                if conn and hasattr(conn, "commit"):
+                    has_commit = True
+            if not has_commit:
+                log.warning(
+                    "ProcessJournal: предоставленный PG‑клиент не имеет .commit() "
+                    "или .connection.commit(). Предполагаю autocommit; транзакции "
+                    "будут зависеть от настроек драйвера/сервера."
+                )
+        except Exception:
+            # Диагностика не должна ломать основной поток.
+            pass
 
     def __init__(self, pg, table: str, process_name: str, state_table: Optional[str] = None,
                  minimal: Optional[bool] = None, heartbeat_min_interval_sec: Optional[int] = None):
@@ -139,192 +159,551 @@ class ProcessJournal:
         self.state_table = state_table or self._derive_state_table_name(table)
         self._current_run_id: Optional[int] = None
         self._lock_acquired: bool = False
-        # Режим «минимального журнала» и троттлинг heartbeat.
-        # Можно передать явно через параметры конструктора либо задать через ENV.
-        env_min = os.getenv("JOURNAL_MINIMAL", "").strip().lower()
-        self.minimal: bool = (minimal if minimal is not None else env_min in ("1", "true", "yes", "on"))
-        try:
-            default_hb_interval = int(os.getenv("JOURNAL_HEARTBEAT_MIN_INTERVAL_SEC", "30"))
-        except Exception:
-            default_hb_interval = 30
-        self.hb_min_interval: int = int(heartbeat_min_interval_sec if heartbeat_min_interval_sec is not None else default_hb_interval)
-        # монотонные тики для дешёвого контроля частоты обращений к БД
-        self._last_hb_mono: float = 0.0
 
-    # -------------------- базовое --------------------
+        # Минимальный режим журналирования жёстко включён:
+        # пишем только planned → running → ok/error. Heartbeat отключён полностью.
+        self.minimal: bool = True
+        try:
+            self.hb_min_interval = int(os.getenv("JOURNAL_HEARTBEAT_MIN_INTERVAL_SEC", "300"))
+        except Exception:
+            self.hb_min_interval = 300
+        self._last_hb_mono: float = 0.0
+        self._self_check_pg_client()
+
+    # ---------- утилиты имён/схем ----------
 
     @staticmethod
     def _tail_identifier(ident: str) -> str:
-        """Возвращает «хвост» имени объекта БД (без схемы), чтобы формировать имена индексов."""
         tail = ident.split(".")[-1]
         return tail.strip('"')
 
     @staticmethod
     def _derive_state_table_name(journal_table: str) -> str:
-        """Строит имя state-таблицы по схеме журнала: <schema>.inc_process_state."""
         parts = journal_table.split(".")
         return f"{parts[0]}.inc_process_state" if len(parts) == 2 else "inc_process_state"
 
+    @staticmethod
+    def _split_schema_table(fqname: str) -> Tuple[str, str]:
+        parts = fqname.split(".")
+        if len(parts) == 2:
+            return parts[0], parts[1]
+        return "public", parts[0]
+
+    def _table_relkind(self) -> Optional[str]:
+        """'p' — partitioned table (родитель), 'r' — обычная таблица, None — таблицы нет."""
+        schema, name = self._split_schema_table(self.table)
+        self.pg.execute(
+            "SELECT c.relkind "
+            "FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname=%s AND c.relname=%s",
+            (schema, name)
+        )
+        row = self.pg.fetchone()
+        return row[0] if row else None
+
+    def _is_parent_partitioned(self) -> bool:
+        return self._table_relkind() == "p"
+
+    # ---------- расчёт партиций ----------
+
+    @staticmethod
+    def _floor_to_interval_utc(dt: datetime, days: int) -> datetime:
+        """
+        Округляет вниз до границы интервала (7/14/30 суток), якорь — понедельник 1970-01-05.
+        Это даёт стабильные окна, начинающиеся по понедельникам.
+        """
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        anchor = datetime(1970, 1, 5, tzinfo=timezone.utc)  # Monday
+        delta_days = (dt.date() - anchor.date()).days
+        step = (delta_days // days) * days
+        start = anchor + timedelta(days=step)
+        return start
+
+    @staticmethod
+    def _fmt_ts(dt: datetime) -> str:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S+00:00")
+
+    def _norm_tz_offset_str(self, s: str) -> str:
+        """
+        Нормализует строку времени с оффсетом зоны:
+          • '+05'    -> '+05:00'
+          • '-03'    -> '-03:00'
+          • '+0530'  -> '+05:30'
+          • '-0330'  -> '-03:30'
+        Остальные варианты возвращаются без изменений.
+        """
+        if not isinstance(s, str):
+            return s
+        # '+HH' or '-HH' at the end
+        m = re.search(r'([+\-]\d{2})$', s)
+        if m:
+            return s[:-len(m.group(1))] + m.group(1) + ":00"
+        # '+HHMM' or '-HHMM' at the end
+        m = re.search(r'([+\-]\d{4})$', s)
+        if m:
+            hhmm = m.group(1)
+            return s[:-len(hhmm)] + hhmm[:3] + ":" + hhmm[3:]
+        return s
+
+    def _parse_ts_any(self, text: str) -> datetime:
+        """
+        Парсит timestamptz в Python datetime с поддержкой оффсетов '+05' / '+0530'.
+        Возвращает aware-UTC datetime.
+        """
+        s = self._norm_tz_offset_str(text)
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def _ensure_partitions_around_now(self) -> None:
+        """
+        Если журнал — партиционированный, создаёт недостающие партиции вокруг «сейчас»:
+          - N прошлых окон (JOURNAL_PARTITION_BEHIND, дефолт 1),
+          - текущее окно,
+          - N будущих окон (JOURNAL_PARTITION_AHEAD, дефолт 1).
+
+        Длина окна — JOURNAL_PARTITION_INTERVAL_DAYS (7 по умолчанию; допускаются 7/14/30).
+
+        Оптимизации:
+          • все DDL/CREATE INDEX выполняем через один курсор (если self.pg поддерживает .cursor()),
+            чтобы сократить накладные расходы на round-trip;
+          • один общий commit в конце (best‑effort через _commit_quietly()).
+        """
+        try:
+            if not self._is_parent_partitioned():
+                return
+
+            try:
+                interval_days = int(os.getenv("JOURNAL_PARTITION_INTERVAL_DAYS", "7"))
+            except Exception:
+                interval_days = 7
+            if interval_days not in (7, 14, 30):
+                interval_days = 7
+
+            try:
+                behind = max(0, int(os.getenv("JOURNAL_PARTITION_BEHIND", "1")))
+            except Exception:
+                behind = 1
+            try:
+                ahead = max(0, int(os.getenv("JOURNAL_PARTITION_AHEAD", "1")))
+            except Exception:
+                ahead = 1
+
+            schema, parent = self._split_schema_table(self.table)
+            now_utc = datetime.now(timezone.utc)
+            cur_start = self._floor_to_interval_utc(now_utc, interval_days)
+
+            def part_name(st: datetime, en: datetime) -> str:
+                return f"{parent}_p_{st.strftime('%Y%m%d')}_{en.strftime('%Y%m%d')}"
+
+            def _fmt(dt: datetime) -> str:
+                return self._fmt_ts(dt)
+
+            # Выбираем API выполнения: один курсор, если доступен
+            cur = None
+            try:
+                cur_factory = getattr(self.pg, "cursor", None)
+                if callable(cur_factory):
+                    cur = cur_factory()
+                    _exec = cur.execute
+                else:
+                    _exec = self.pg.execute
+
+                def create_one(st: datetime) -> None:
+                    en = st + timedelta(days=interval_days)
+                    child = part_name(st, en)
+                    st_s = _fmt(st)
+                    en_s = _fmt(en)
+                    # 1) партиция
+                    _exec(
+                        f"CREATE TABLE IF NOT EXISTS {schema}.{child} PARTITION OF {self.table} "
+                        f"FOR VALUES FROM ('{st_s}') TO ('{en_s}')"
+                    )
+                    # 2) индексы: активная уникальность + быстрый выбор завершённых
+                    ix_active = f"{child}_active_one_uq_idx"
+                    ix_ended  = f"{child}_ended_notnull_idx"
+                    _exec(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS {ix_active} "
+                        f"ON {schema}.{child} (process_name) "
+                        f"WHERE ts_end IS NULL AND status IN ('planned','running')"
+                    )
+                    _exec(
+                        f"CREATE INDEX IF NOT EXISTS {ix_ended} "
+                        f"ON {schema}.{child} (ts_end) WHERE ts_end IS NOT NULL"
+                    )
+
+                for i in range(behind, 0, -1):
+                    create_one(cur_start - timedelta(days=i * interval_days))
+                create_one(cur_start)
+                for i in range(1, ahead + 1):
+                    create_one(cur_start + timedelta(days=i * interval_days))
+            finally:
+                try:
+                    if cur is not None:
+                        cur.close()
+                except Exception:
+                    pass
+
+            self._commit_quietly()
+        except Exception:
+            log.warning("ensure_partitions_around_now(): не удалось создать/индексировать партиции.", exc_info=True)
+
+    def _list_partitions_with_bounds(self) -> List[Tuple[str, datetime, datetime]]:
+        """[(child_relname, from_ts, to_ts)] по pg_inherits/pg_get_expr()."""
+        schema, parent = self._split_schema_table(self.table)
+        self.pg.execute(
+            "SELECT c.relname, pg_get_expr(c.relpartbound, c.oid) "
+            "FROM pg_inherits i "
+            "JOIN pg_class c ON c.oid = i.inhrelid "
+            "JOIN pg_class p ON p.oid = i.inhparent "
+            "JOIN pg_namespace n ON n.oid = p.relnamespace "
+            "WHERE n.nspname=%s AND p.relname=%s "
+            "ORDER BY c.relname",
+            (schema, parent)
+        )
+        rows = self.pg.fetchall() or []
+        out: List[Tuple[str, datetime, datetime]] = []
+        rx = re.compile(r"FROM \('(.*?)'\) TO \('(.*?)'\)")
+        for relname, bound in rows:
+            m = rx.search(bound or "")
+            if not m:
+                continue
+            try:
+                st = self._parse_ts_any(m.group(1))
+                en = self._parse_ts_any(m.group(2))
+                out.append((relname, st, en))
+            except Exception:
+                # Если не смогли распарсить — пропускаем партицию, но не падаем
+                log.debug("Не удалось разобрать границы партиции %s: %s", relname, bound, exc_info=True)
+        return out
+    def resolve_active_conflicts_for_slice(self, slice_from: datetime, slice_to: datetime, keep_run_id: Optional[int] = None) -> None:
+        """
+        Расклеивает гонки: для того же бизнес-окна переводит чужие активные записи
+        (planned|running, ts_end IS NULL) в безопасные статусы.
+          • planned  -> skipped
+          • running  -> error (ts_end=now())
+        keep_run_id — запись, которую сохраняем активной (если известна).
+        """
+        sf, st = self._slice_iso_texts(slice_from, slice_to)
+        # planned -> skipped
+        sql_pl = f"""
+        UPDATE {self.table}
+           SET status='skipped'
+         WHERE process_name=%s
+           AND status='planned'
+           AND ts_end IS NULL
+           AND (details->>'slice_from')=%s
+           AND (details->>'slice_to')=%s
+           { "AND id<>%s" if keep_run_id is not None else "" }
+        """
+        params_pl = [self.process_name, sf, st]
+        if keep_run_id is not None:
+            params_pl.append(keep_run_id)
+        self.pg.execute(sql_pl, tuple(params_pl))
+
+        # running -> error
+        sql_ru = f"""
+        UPDATE {self.table}
+           SET status='error',
+               ts_end=now()
+         WHERE process_name=%s
+           AND status='running'
+           AND ts_end IS NULL
+           AND (details->>'slice_from')=%s
+           AND (details->>'slice_to')=%s
+           { "AND id<>%s" if keep_run_id is not None else "" }
+        """
+        params_ru = [self.process_name, sf, st]
+        if keep_run_id is not None:
+            params_ru.append(keep_run_id)
+        self.pg.execute(sql_ru, tuple(params_ru))
+        self._commit_quietly()
+
+    def _prune_by_partitions(self, days: int) -> int:
+        """
+        Ретенция партициями: DETACH + DROP дочерних секций, верхняя граница которых
+        строго меньше (now() - days).
+        """
+        if days <= 0:
+            return 0
+        schema, _ = self._split_schema_table(self.table)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
+        parts = self._list_partitions_with_bounds()
+        victims = [(name, st, en) for (name, st, en) in parts if en < cutoff]
+        if not victims:
+            return 0
+
+        # Всегда берём advisory-lock: один инстанс — одна чистка партиций.
+        self.pg.execute("SELECT pg_try_advisory_lock(hashtext(%s))", ("journal_prune_global",))
+        got = bool(self.pg.fetchone()[0])
+        if not got:
+            log.info("prune_by_partitions: другой инстанс уже чистит — выходим.")
+            return 0
+        try:
+            dropped = 0
+            for child, st, en in victims:
+                self.pg.execute(f"ALTER TABLE {self.table} DETACH PARTITION {schema}.{child}")
+                self.pg.execute(f"DROP TABLE IF EXISTS {schema}.{child}")
+                dropped += 1
+            self._commit_quietly()
+            if dropped:
+                log.warning("prune_by_partitions(days=%d): удалено партиций: %d.", days, dropped)
+            return dropped
+        finally:
+            self.pg.execute("SELECT pg_advisory_unlock(hashtext(%s))", ("journal_prune_global",))
+
+    # ---------- ensure() с режимом «партиции по умолчанию» ----------
     def ensure(self) -> None:
         """
         Создаёт таблицы и индексы, если их нет (идемпотентно).
+        СТРОГИЙ режим: поддерживается ТОЛЬКО партиционированный журнал (PARTITION BY RANGE(ts_start)).
+        Если существует непартиционированная таблица — возбуждаем RuntimeError и просим миграцию.
+
+        Причины:
+          • код проще, нет медленных «фолбэков»;
+          • ретенция рассчитана на секции (DETACH/DROP);
+          • крупные объёмы чистятся быстро и без долгих блокировок.
         """
-        self.pg.execute(f"""
-        -- ЖУРНАЛ ЗАПУСКОВ: чистое создание таблицы со встроенным CHECK без ALTER'ов.
-        CREATE TABLE IF NOT EXISTS {self.table} (
-            id            BIGSERIAL PRIMARY KEY,       -- суррогатный PK
-            process_name  TEXT        NOT NULL,        -- имя процесса/подпроцесса
-            ts_start      TIMESTAMPTZ NOT NULL DEFAULT now(), -- когда стартанули (UTC)
-            ts_end        TIMESTAMPTZ NULL,            -- когда завершили (UTC), NULL для активных
-            status        TEXT        NOT NULL CHECK (status IN ('planned','running','ok','error','skipped')),
-            details       JSONB       NULL,            -- произвольные метаданные/метрики/ошибка
-            host          TEXT        NULL,            -- хост, на котором шли
-            pid           INTEGER     NULL             -- PID процесса
-        );
-        """)
+        relkind = self._table_relkind()
 
-        # Индексы: быстрые выборки и частичный UNIQUE на одну активную запись
-        self.pg.execute(f"""
-        CREATE INDEX IF NOT EXISTS {self._tail_identifier(self.table)}_pname_started_desc_idx
-          ON {self.table} (process_name, ts_start DESC);
-        """)
-        self.pg.execute(f"""
-        CREATE UNIQUE INDEX IF NOT EXISTS {self._tail_identifier(self.table)}_active_one_uq_idx
-          ON {self.table} (process_name)
-          WHERE ts_end IS NULL AND status IN ('planned','running');
-        """)
-        self.pg.execute(f"""
-        CREATE INDEX IF NOT EXISTS {self._tail_identifier(self.table)}_ended_notnull_idx
-          ON {self.table} (ts_end) WHERE ts_end IS NOT NULL;
-        """)
+        if relkind is None:
+            self.pg.execute(f"""
+            CREATE TABLE {self.table} (
+                id            BIGINT GENERATED BY DEFAULT AS IDENTITY,
+                process_name  TEXT        NOT NULL,
+                ts_start      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                ts_end        TIMESTAMPTZ NULL,
+                status        TEXT        NOT NULL CHECK (status IN ('planned','running','ok','error','skipped')),
+                details       JSONB       NULL,
+                host          TEXT        NULL,
+                pid           INTEGER     NULL
+            ) PARTITION BY RANGE (ts_start);
+            """)
+            self.pg.execute(f"""
+            CREATE INDEX IF NOT EXISTS {self._tail_identifier(self.table)}_pname_started_desc_idx
+              ON {self.table} (process_name, ts_start DESC);
+            """)
+            log.info("Проверка таблицы журнала: OK (partitioned, %s)", self.table)
+            self._ensure_partitions_around_now()
+            self._auto_prune_if_due()
+        elif relkind == "p":
+            log.info("Проверка таблицы журнала: OK (partitioned, %s)", self.table)
+            self.pg.execute(f"""
+            CREATE INDEX IF NOT EXISTS {self._tail_identifier(self.table)}_pname_started_desc_idx
+              ON {self.table} (process_name, ts_start DESC);
+            """)
+            self._ensure_partitions_around_now()
+            self._auto_prune_if_due()
+        else:
+            raise RuntimeError(
+                f"Журнал {self.table} непартиционирован (relkind={relkind}). "
+                "Требуется миграция на PARTITION BY RANGE(ts_start)."
+            )
 
-        # STATE: агрегированное состояние процесса и водяной знак публикации.
-        # расширенная схема: храним здоровье, конец последнего успешного окна, hb и последнюю ошибку.
+        # STATE — без изменений
         self.pg.execute(f"""
         CREATE TABLE IF NOT EXISTS {self.state_table} (
-            process_name          TEXT PRIMARY KEY,           -- процесс/подпроцесс
-            last_status           TEXT,                       -- 'ok' | 'error' | 'running' | 'planned' | NULL
-            healthy               BOOLEAN,                    -- TRUE когда последний статус 'ok'
-            last_ok_end           TIMESTAMPTZ,                -- правая граница последнего УСПЕШНО обработанного окна (UTC)
-            last_started_at       TIMESTAMPTZ,                -- последний старт (UTC)
-            last_heartbeat        TIMESTAMPTZ,                -- последнее heartbeat (UTC)
-            last_error_at         TIMESTAMPTZ,                -- когда упали
-            last_error_component  TEXT,                       -- где упали (phoenix|clickhouse|postgres|runtime|config|...)
-            last_error_message    TEXT,                       -- короткое описание ошибки
-            progress              JSONB,                      -- произвольные метрики
-            extra                 JSONB,                      -- расширяемое поле
+            process_name          TEXT PRIMARY KEY,
+            last_status           TEXT,
+            healthy               BOOLEAN,
+            last_ok_end           TIMESTAMPTZ,
+            last_started_at       TIMESTAMPTZ,
+            last_heartbeat        TIMESTAMPTZ,
+            last_error_at         TIMESTAMPTZ,
+            last_error_component  TEXT,
+            last_error_message    TEXT,
+            progress              JSONB,
+            extra                 JSONB,
             updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         """)
         self.pg.execute(f"CREATE INDEX IF NOT EXISTS {self._tail_identifier(self.state_table)}_updated_at_idx ON {self.state_table}(updated_at DESC);")
         self.pg.execute(f"CREATE INDEX IF NOT EXISTS {self._tail_identifier(self.state_table)}_last_ok_end_idx ON {self.state_table}(last_ok_end);")
-
-        log.info("Проверка таблицы журнала: OK (%s)", self.table)
-        log.debug("Проверка индексов журнала: OK (%s, %s, %s)",
-                 f"{self._tail_identifier(self.table)}_pname_started_desc_idx",
-                 f"{self._tail_identifier(self.table)}_active_one_uq_idx",
-                 f"{self._tail_identifier(self.table)}_ended_notnull_idx")
         log.info("Проверка таблицы состояния: OK (%s)", self.state_table)
+    def _state_upsert(
+        self,
+        *,
+        status: Optional[str] = None,
+        healthy: Optional[bool] = None,
+        last_ok_end: Optional[datetime] = None,
+        last_started_at: Optional[datetime] = None,
+        last_heartbeat: Optional[datetime] = None,
+        last_error_at: Optional[datetime] = None,
+        last_error_component: Optional[str] = None,
+        last_error_message: Optional[str] = None,
+        progress: Optional[Dict[str, Any]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Надёжный UPSERT агрегированного состояния процесса в inc_process_state.
 
-    # -------------------- утилиты времени --------------------
+        Важно:
+          • Только позиционные параметры (%s), без именованных плейсхолдеров — совместимо с любыми простыми обёртками.
+          • Все timestamptz передаются в виде ISO‑строк в UTC и приводятся в SQL с ::timestamptz.
+          • progress/extra пишем как JSONB; extra при UPSERT аккуратно мёрджим (old.extra || new.extra).
+        """
+        # Собираем полезную нагрузку: пишем только непустые поля
+        payload: Dict[str, Any] = {}
+
+        if status is not None:
+            payload["last_status"] = str(status)
+        if healthy is not None:
+            payload["healthy"] = bool(healthy)
+
+        def _iso(v: Optional[datetime]) -> Optional[str]:
+            if v is None:
+                return None
+            dv = v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+            return dv.astimezone(timezone.utc).isoformat()
+
+        if last_ok_end is not None:
+            payload["last_ok_end"] = _iso(last_ok_end)
+        if last_started_at is not None:
+            payload["last_started_at"] = _iso(last_started_at)
+        if last_heartbeat is not None:
+            payload["last_heartbeat"] = _iso(last_heartbeat)
+        if last_error_at is not None:
+            payload["last_error_at"] = _iso(last_error_at)
+
+        if last_error_component is not None:
+            payload["last_error_component"] = str(last_error_component)
+        if last_error_message is not None:
+            payload["last_error_message"] = str(last_error_message)
+
+        if progress:
+            payload["progress"] = progress
+        if extra:
+            payload["extra"] = extra
+
+        if not payload:
+            return
+
+        # Извлекаем значения по ключам; отсутствующие оставляем None (INSERT пройдёт с NULL'ами)
+        vals = {
+            "last_status":          payload.get("last_status"),
+            "healthy":              payload.get("healthy"),
+            "last_ok_end":          payload.get("last_ok_end"),
+            "last_started_at":      payload.get("last_started_at"),
+            "last_heartbeat":       payload.get("last_heartbeat"),
+            "last_error_at":        payload.get("last_error_at"),
+            "last_error_component": payload.get("last_error_component"),
+            "last_error_message":   payload.get("last_error_message"),
+            "progress":             payload.get("progress") or {},
+            "extra":                payload.get("extra") or {},
+        }
+
+        # Единый UPSERT без именованных плейсхолдеров
+        sql = f"""
+            INSERT INTO {self.state_table} (
+                process_name,
+                last_status,
+                healthy,
+                last_ok_end,
+                last_started_at,
+                last_heartbeat,
+                last_error_at,
+                last_error_component,
+                last_error_message,
+                progress,
+                extra,
+                updated_at
+            ) VALUES (
+                %s,  -- process_name
+                %s,  -- last_status
+                %s,  -- healthy
+                %s::timestamptz,  -- last_ok_end
+                %s::timestamptz,  -- last_started_at
+                %s::timestamptz,  -- last_heartbeat
+                %s::timestamptz,  -- last_error_at
+                %s,  -- last_error_component
+                %s,  -- last_error_message
+                %s::jsonb,  -- progress
+                %s::jsonb,  -- extra
+                now()
+            )
+            ON CONFLICT (process_name) DO UPDATE SET
+                last_status          = COALESCE(EXCLUDED.last_status, {self.state_table}.last_status),
+                healthy              = COALESCE(EXCLUDED.healthy, {self.state_table}.healthy),
+                last_ok_end          = COALESCE(EXCLUDED.last_ok_end, {self.state_table}.last_ok_end),
+                last_started_at      = COALESCE(EXCLUDED.last_started_at, {self.state_table}.last_started_at),
+                last_heartbeat       = COALESCE(EXCLUDED.last_heartbeat, {self.state_table}.last_heartbeat),
+                last_error_at        = COALESCE(EXCLUDED.last_error_at, {self.state_table}.last_error_at),
+                last_error_component = COALESCE(EXCLUDED.last_error_component, {self.state_table}.last_error_component),
+                last_error_message   = COALESCE(EXCLUDED.last_error_message, {self.state_table}.last_error_message),
+                progress             = COALESCE(EXCLUDED.progress, {self.state_table}.progress),
+                extra                = COALESCE({self.state_table}.extra, '{{}}'::jsonb)
+                                       || COALESCE(EXCLUDED.extra, '{{}}'::jsonb),
+                updated_at           = now()
+        """
+
+        params = (
+            self.process_name,
+            vals["last_status"],
+            vals["healthy"],
+            vals["last_ok_end"],
+            vals["last_started_at"],
+            vals["last_heartbeat"],
+            vals["last_error_at"],
+            vals["last_error_component"],
+            vals["last_error_message"],
+            Json(vals["progress"]),
+            Json(vals["extra"]),
+        )
+
+        # Выполняем и фиксируем (best‑effort)
+        self.pg.execute(sql, params)
+        self._commit_quietly()
+
+    def get_state(self) -> Dict[str, Any]:
+        """Возвращает текущую строку из inc_process_state по процессу (или пустой dict)."""
+        self.pg.execute(f"SELECT last_status, healthy, last_ok_end, last_started_at, last_heartbeat, progress, extra FROM {self.state_table} WHERE process_name=%s", (self.process_name,))
+        row = self.pg.fetchone()
+        if not row:
+            return {}
+        keys = ["last_status", "healthy", "last_ok_end", "last_started_at", "last_heartbeat", "progress", "extra"]
+        out = dict(zip(keys, row))
+        # Приводим временные поля к строкам ISO (если они datetime)
+        for k in ("last_ok_end", "last_started_at", "last_heartbeat"):
+            v = out.get(k)
+            if isinstance(v, datetime):
+                out[k] = (v if v.tzinfo else v.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).isoformat()
+        return out
+
+    # ---------- утилиты времени ----------
 
     @staticmethod
     def _to_aware_utc(v: Any) -> datetime:
-        """
-        Любой datetime → UTC-aware. Если пришёл naive, считаем его UTC и помечаем tzinfo=UTC.
-        """
         if isinstance(v, datetime):
             return (v if v.tzinfo else v.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
         raise TypeError("expected datetime")
 
     def _slice_iso_texts(self, slice_from: datetime, slice_to: datetime) -> Tuple[str, str]:
-        """
-        Приводит границы среза к ISO-строкам в UTC.
-        Нужен для корректной работы JSONB/текстовых сравнений в SQL.
-        Границы хранятся и сравниваются в UTC.
-        """
         sf = self._to_aware_utc(slice_from).isoformat()
         st = self._to_aware_utc(slice_to).isoformat()
         return sf, st
 
-    def resolve_active_conflicts_for_slice(self, slice_from: datetime, slice_to: datetime) -> Tuple[int, int]:
-        """
-        Мягко разрешает конфликты «активных» записей (planned|running) для *других* срезов:
-          - planned → skipped (reason=conflict_new_slice)
-          - running → error  (reason=conflict_new_slice)
-
-        Возвращает кортеж (planned_skipped, running_errored).
-        Важно: новые значения границ пишем как ::text, иначе PG не выведет тип (IndeterminateDatatype).
-        """
-        sf, st = self._slice_iso_texts(slice_from, slice_to)
-
-        # planned (другого окна) → skipped
-        self.pg.execute(f"""
-        UPDATE {self.table} t
-           SET status='skipped',
-               ts_end=now(),
-               details = COALESCE(t.details,'{{}}'::jsonb)
-                         || jsonb_build_object('sanitized', true,
-                                               'reason','conflict_new_slice',
-                                               'new_slice_from', %s::text,
-                                               'new_slice_to',   %s::text,
-                                               'sanitized_at', to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"'))
-         WHERE t.process_name=%s
-           AND t.status='planned'
-           AND t.ts_end IS NULL
-           AND ( (t.details->>'slice_from') IS DISTINCT FROM %s
-              OR (t.details->>'slice_to')   IS DISTINCT FROM %s )
-        RETURNING t.id
-        """, (sf, st, self.process_name, sf, st))
-        planned_skipped = len(self.pg.fetchall() or [])
-
-        # running (другого окна) → error
-        self.pg.execute(f"""
-        UPDATE {self.table} t
-           SET status='error',
-               ts_end=now(),
-               details = COALESCE(t.details,'{{}}'::jsonb)
-                         || jsonb_build_object('sanitized', true,
-                                               'reason','conflict_new_slice',
-                                               'new_slice_from', %s::text,
-                                               'new_slice_to',   %s::text,
-                                               'sanitized_at', to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"'))
-         WHERE t.process_name=%s
-           AND t.status='running'
-           AND t.ts_end IS NULL
-           AND ( (t.details->>'slice_from') IS DISTINCT FROM %s
-              OR (t.details->>'slice_to')   IS DISTINCT FROM %s )
-        RETURNING t.id
-        """, (sf, st, self.process_name, sf, st))
-        running_errored = len(self.pg.fetchall() or [])
-
-        if planned_skipped or running_errored:
-            log.warning(
-                "resolve_active_conflicts_for_slice(): planned→skipped=%d, running→error=%d",
-                planned_skipped, running_errored
-            )
-        return planned_skipped, running_errored
-
-    # -------------------- эксклюзив --------------------
+    # ---------- эксклюзивные блокировки ----------
 
     def try_acquire_exclusive_lock(self) -> bool:
-        """Пробуем взять advisory-lock на имя процесса (true/false)."""
         self.pg.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (self.process_name,))
         got = bool(self.pg.fetchone()[0])
         self._lock_acquired = got
         return got
 
     def release_exclusive_lock(self) -> None:
-        """Отпускаем захваченный advisory-lock."""
         if self._lock_acquired:
             self.pg.execute("SELECT pg_advisory_unlock(hashtext(%s))", (self.process_name,))
             self._lock_acquired = False
 
     @contextmanager
     def exclusive_lock(self):
-        """
-        Контекстный менеджер для «глобального» взаимного исключения по процессу.
-        """
         got = self.try_acquire_exclusive_lock()
         try:
             yield got
@@ -332,24 +711,13 @@ class ProcessJournal:
             if got:
                 self.release_exclusive_lock()
 
-    # -------------------- действия --------------------
+    # ---------- API журнала ----------
 
     def mark_planned(self, slice_from: datetime, slice_to: datetime) -> int:
-        """
-        Регистрирует новый запуск со статусом 'planned' для заданного бизнес-среза.
-
-        Защита от гонок и дублей:
-          1) Сначала проверяем, нет ли уже активной записи (planned|running) по процессу.
-             Если есть — возвращаем её id (и не делаем INSERT).
-          2) Если активной записи нет — пробуем вставить planned.
-             В редкой гонке ловим UniqueViolation и возвращаем уже существующую активную запись.
-        Границы slice_from/slice_to — всегда в UTC.
-        """
         sf = self._to_aware_utc(slice_from).isoformat()
         st = self._to_aware_utc(slice_to).isoformat()
         payload = {"slice_from": sf, "slice_to": st, "planned": True}
 
-        # 1) Предварительная проверка на активную запись (быстро и безопасно)
         self.pg.execute(
             f"SELECT id FROM {self.table} "
             "WHERE process_name=%s AND ts_end IS NULL AND status IN ('planned','running') "
@@ -362,7 +730,6 @@ class ProcessJournal:
             log.warning("Активный запуск уже существует (id=%s) — пропускаю вставку planned.", rid)
             return rid
 
-        # 2) Пытаемся вставить planned
         try:
             self.pg.execute(
                 f"INSERT INTO {self.table} (process_name, status, details) VALUES (%s, 'planned', %s::jsonb) RETURNING id",
@@ -370,9 +737,9 @@ class ProcessJournal:
             )
             rid = self.pg.fetchone()[0]
             log.info("Запланирован запуск %s: id=%s [%s → %s]", self.process_name, rid, sf, st)
+            self._commit_quietly()
             return rid
         except UniqueViolation:
-            # Гонка: параллельно уже появился active planned|running — возвращаем его.
             self.pg.execute(
                 f"SELECT id FROM {self.table} "
                 "WHERE process_name=%s AND ts_end IS NULL AND status IN ('planned','running') "
@@ -387,23 +754,9 @@ class ProcessJournal:
             return rid
 
     def mark_running(self, slice_from: datetime, slice_to: datetime, host: Optional[str] = None, pid: Optional[int] = None) -> int:
-        """
-        Атомарный перевод planned→running для указанного среза.
-        Идемпотентность/устойчивость:
-          1) если есть planned этого же окна — переводим в running;
-          2) если уже есть running этого же окна — переиспользуем (обновляем heartbeat/host/pid);
-          3) если висит активный planned/running другого окна — мягко снимаем конфликт и создаём новую running.
-        Границы slice_from/slice_to — всегда в UTC.
-        """
         sf, st = self._slice_iso_texts(slice_from, slice_to)
-        # slice_from/slice_to всегда в UTC; heartbeat_ts — для первичной метки запуска окна
-        upd = {
-            "slice_from": sf,
-            "slice_to": st,
-            "heartbeat_ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        }
+        upd = {"slice_from": sf, "slice_to": st, "heartbeat_ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
 
-        # 1) Пытаемся planned→running (м.б. UniqueViolation из-за другого active)
         try:
             self.pg.execute(f"""
             WITH cand AS (
@@ -421,7 +774,6 @@ class ProcessJournal:
             RETURNING t.id
             """, (self.process_name, sf, st, Json(upd)))
         except UniqueViolation:
-            # Активный running уже есть — чистим конфликты и повторяем попытку
             self.resolve_active_conflicts_for_slice(slice_from, slice_to)
             self.pg.execute(f"""
             WITH cand AS (
@@ -450,16 +802,12 @@ class ProcessJournal:
             log.info("planned→running: id=%s [%s → %s]", rid, sf, st)
             self._current_run_id = rid
             try:
-                self._state_upsert(
-                    status="running",
-                    healthy=None,
-                    last_started_at=datetime.now(timezone.utc)
-                )
+                self._state_upsert(status="running", healthy=None, last_started_at=datetime.now(timezone.utc))
             except Exception:
                 pass
+            self._commit_quietly()
             return rid
 
-        # 2) Переиспользуем существующую running этого же окна (после рестарта)
         self.pg.execute(
             f"""SELECT id FROM {self.table}
                  WHERE process_name=%s AND status='running' AND ts_end IS NULL
@@ -470,38 +818,28 @@ class ProcessJournal:
         row = self.pg.fetchone()
         if row:
             rid = row[0]
-            # обновим host/pid и heartbeat
             hb = {"heartbeat_ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
             self.pg.execute(
                 f"UPDATE {self.table} SET host=COALESCE(%s,host), pid=COALESCE(%s,pid), details=COALESCE(details,'{{}}'::jsonb)||%s::jsonb WHERE id=%s",
                 (host, pid, Json(hb), rid)
             )
             log.info("running (reuse): id=%s [%s → %s]", rid, sf, st)
-            # Даже в минимальном режиме переход в running сохраняется (важная веха).
             self._current_run_id = rid
             try:
-                self._state_upsert(
-                    status="running",
-                    healthy=None,
-                    last_started_at=datetime.now(timezone.utc)
-                )
+                self._state_upsert(status="running", healthy=None, last_started_at=datetime.now(timezone.utc))
             except Exception:
                 pass
+            self._commit_quietly()
             return rid
 
-        # 3) Конфликты других окон — снимаем и создаём новую running
         self.resolve_active_conflicts_for_slice(slice_from, slice_to)
-        meta = {
-            "slice_from": sf, "slice_to": st,
-            "heartbeat_ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        }
+        meta = {"slice_from": sf, "slice_to": st, "heartbeat_ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
         try:
             self.pg.execute(
                 f"INSERT INTO {self.table} (process_name, status, details, host, pid) VALUES (%s,'running',%s::jsonb,%s,%s) RETURNING id",
                 (self.process_name, Json(meta), host, pid)
             )
         except UniqueViolation:
-            # На случай гонки между очисткой и вставкой — пробуем ещё раз переиспользовать running этого окна
             self.pg.execute(
                 f"""SELECT id FROM {self.table}
                      WHERE process_name=%s AND status='running' AND ts_end IS NULL
@@ -520,382 +858,45 @@ class ProcessJournal:
                 log.info("running (reuse after UniqueViolation): id=%s [%s → %s]", rid, sf, st)
                 self._current_run_id = rid
                 try:
-                    self._state_upsert(
-                        status="running",
-                        healthy=None,
-                        last_started_at=datetime.now(timezone.utc)
-                    )
+                    self._state_upsert(status="running", healthy=None, last_started_at=datetime.now(timezone.utc))
                 except Exception:
                     pass
+                self._commit_quietly()
                 return rid
-            # если и тут никого — отдаём исключение наверх
             raise
 
         rid = self.pg.fetchone()[0]
         log.info("running (new): id=%s [%s → %s]", rid, sf, st)
         self._current_run_id = rid
         try:
+            self._state_upsert(status="running", healthy=None, last_started_at=datetime.now(timezone.utc))
+        except Exception:
+            pass
+        self._commit_quietly()
+        return rid
+
+
+    def heartbeat(self, run_id: Optional[int] = None, progress: Optional[Dict[str, Any]] = None) -> None:
+        """
+        «Лёгкий» heartbeat:
+          • НЕ пишет новых строк в журнал (inc_processing);
+          • обновляет только inc_process_state.last_heartbeat (и progress при наличии);
+          • троттлинг: не чаще чем раз в JOURNAL_HEARTBEAT_MIN_INTERVAL_SEC секунд (def: 300).
+        """
+        now_mono = time.monotonic()
+        if now_mono - self._last_hb_mono < max(1, int(self.hb_min_interval)):
+            return
+        self._last_hb_mono = now_mono
+        try:
             self._state_upsert(
                 status="running",
                 healthy=None,
-                last_started_at=datetime.now(timezone.utc)
-            )
-        except Exception:
-            pass
-        return rid
-
-    def heartbeat(self, run_id: Optional[int] = None, progress: Optional[Dict[str, Any]] = None) -> None:
-        """Обновляет heartbeat текущего (или указанного) running-запуска и опциональный прогресс.
-
-        Оптимизации под нагрузку:
-          - если включён минимальный режим (self.minimal=True) и прогресса нет — heartbeat пропускается;
-          - троттлинг по времени: если с последнего успешного heartbeat прошло меньше
-            self.hb_min_interval секунд и прогресса нет — пропускаем запись, чтобы не бить по БД.
-        """
-        rid = run_id or self._current_run_id
-        if not rid:
-            return
-
-        # пропуск при «минимальном журнале», когда нет прогресса
-        if self.minimal and not progress:
-            return
-
-        now_mono = time.monotonic()
-        if self.hb_min_interval > 0 and not progress:
-            elapsed = now_mono - self._last_hb_mono
-            if elapsed < self.hb_min_interval:
-                return
-
-        upd = {"heartbeat_ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
-        if progress:
-            upd.update(progress)
-
-        self.pg.execute(
-            f"UPDATE {self.table} SET details = COALESCE(details,'{{}}'::jsonb) || %s::jsonb WHERE id=%s AND status='running' AND ts_end IS NULL",
-            (Json(upd), rid)
-        )
-        # после успешного апдейта фиксируем «последний heartbeat» для троттлинга
-        self._last_hb_mono = now_mono
-
-        try:
-            # Агрегированное состояние обновляем только «лёгкими» полями: heartbeat и прогресс.
-            self._state_upsert(
                 last_heartbeat=datetime.now(timezone.utc),
-                progress=progress or None
+                progress=progress or {}
             )
         except Exception:
+            # heartbeat не должен валить основной ETL-поток
             pass
-
-    def mark_done(self, slice_from: datetime, slice_to: datetime, rows_read: int, rows_written: int) -> None:
-        """
-        Завершает текущий срез (status='ok'), пишет фактические метрики и обновляет watermark правой границей среза.
-        slice_from/slice_to трактуются как UTC.
-        """
-        sf = self._to_aware_utc(slice_from).isoformat()
-        st = self._to_aware_utc(slice_to).isoformat()
-        upd = {"rows_read": int(rows_read), "rows_written": int(rows_written)}
-        self.pg.execute(f"""
-        UPDATE {self.table} t
-           SET status='ok', ts_end=now(), details = COALESCE(t.details,'{{}}'::jsonb) || %s::jsonb
-         WHERE t.process_name=%s AND t.status='running' AND t.ts_end IS NULL
-           AND (t.details->>'slice_from')=%s AND (t.details->>'slice_to')=%s
-        RETURNING t.id
-        """, (Json(upd), self.process_name, sf, st))
-        row = self.pg.fetchone()
-        rid = row[0] if row else None
-        log.info("Запуск %s завершён: OK", rid if rid else "-")
-        self._current_run_id = None
-
-        # Успешное завершение: обновляем агрегированное состояние и водяной знак.
-        try:
-            self._state_upsert(
-                status="ok",
-                healthy=True,
-                last_ok_end=self._to_aware_utc(slice_to),
-                last_heartbeat=datetime.now(timezone.utc),
-                progress={"rows_read": int(rows_read), "rows_written": int(rows_written)}
-            )
-        except Exception:
-            pass
-
-        # Опциональный авто‑прон (ретенция журнала) — ровно один раз в сутки (UTC).
-        # Включается переменной окружения JOURNAL_AUTOPRUNE_ON_DONE=1 (по умолчанию включено).
-        # Если сегодня уже чистили (флажок в state.extra), повторно не запускаем.
-        try:
-            self._maybe_autoprune_on_done()
-        except Exception:
-            # Любые сбои ретенции не должны влиять на основной пайплайн.
-            log.warning("auto-prune: ошибка при фоновом запуске ретенции, будет проигнорирована.", exc_info=True)
-    def _maybe_autoprune_on_done(self) -> None:
-        """
-        Опционально запускает мягкую ретенцию журнала (prune_old) один раз в сутки (UTC).
-        Управляется переменными окружения:
-          - JOURNAL_AUTOPRUNE_ON_DONE = 1|true|yes|on (включено по умолчанию), чтобы не плодить сервисов/cron;
-          - JOURNAL_PRUNE_BATCH_SIZE  = число (по умолчанию 20000) — размер батча DELETE;
-          - JOURNAL_RETENTION_DAYS    = число (по умолчанию 30) — сколько дней хранить.
-        Флажок «уже чистили сегодня» хранится в {state_table}.extra -> 'autoprune_last_done' (строка YYYY-MM-DD, UTC день).
-        Любые ошибки ретенции логируются и не прерывают основной поток.
-        """
-        # Флаг включения через ENV (по умолчанию — включено).
-        env = os.getenv("JOURNAL_AUTOPRUNE_ON_DONE", "").strip().lower()
-        enabled = (env in ("", "1", "true", "yes", "on"))
-        if not enabled:
-            return
-
-        # Проверка «чистили ли уже сегодня».
-        today = datetime.now(timezone.utc).date().isoformat()
-        self.pg.execute(f"SELECT extra->>'autoprune_last_done' FROM {self.state_table} WHERE process_name=%s", (self.process_name,))
-        row = self.pg.fetchone()
-        last_done = row[0] if row else None
-        if last_done == today:
-            return  # уже чистили сегодня — выходим тихо
-
-        # Параметры батча: берём из ENV, но с безопасными дефолтами.
-        try:
-            batch_size = int(os.getenv("JOURNAL_PRUNE_BATCH_SIZE", "20000"))
-        except Exception:
-            batch_size = 20000
-
-        # Запускаем мягкую ретенцию. days берётся внутри prune_old() из JOURNAL_RETENTION_DAYS (или 30 по умолчанию).
-        try:
-            deleted = self.prune_old(days=None, batch_size=batch_size)
-        except Exception as e:
-            log.warning("auto-prune: ошибка prune_old(): %s", e, exc_info=True)
-            return
-
-        # Отмечаем в aggregated-state, что сегодня чистка отработала (и сколько строк удалено).
-        # ВАЖНО: делаем merge JSONB, чтобы не терять прочие ключи в extra.
-        self.pg.execute(f"""
-        INSERT INTO {self.state_table} AS s (process_name, extra)
-        VALUES (%s, %s::jsonb)
-        ON CONFLICT (process_name) DO UPDATE SET
-            extra = COALESCE(s.extra, '{{}}'::jsonb) || EXCLUDED.extra,
-            updated_at = now()
-        """, (self.process_name, Json({"autoprune_last_done": today, "autoprune_deleted": int(deleted)})))
-        # Коммитим апдейт aggregated-state; вместе с ним зафиксируются и DELETE из prune_old() (если автокоммит выключен).
-        try:
-            self.pg.commit()
-        except Exception:
-            pass
-
-        log.info("auto-prune: выполнено за текущие сутки (UTC=%s), удалено %d записей.", today, int(deleted))
-
-    def mark_error(self, slice_from: datetime, slice_to: datetime, message: str) -> None:
-        """Фиксирует ошибку для текущего среза (status='error') без изменения watermark.
-        slice_from/slice_to трактуются как UTC.
-        """
-        sf = self._to_aware_utc(slice_from).isoformat()
-        st = self._to_aware_utc(slice_to).isoformat()
-        self.pg.execute(f"""
-        UPDATE {self.table}
-           SET status='error', ts_end=now(),
-               details = COALESCE(details,'{{}}'::jsonb) || %s::jsonb
-         WHERE process_name=%s AND status='running' AND ts_end IS NULL
-           AND (details->>'slice_from')=%s AND (details->>'slice_to')=%s
-        """, (Json({"error": str(message)}), self.process_name, sf, st))
-        log.info("Запуск завершён: ERROR: %s", message)
-        self._current_run_id = None
-        try:
-            self._state_upsert(
-                status="error",
-                healthy=False,
-                last_error_at=datetime.now(timezone.utc),
-                last_error_component="runtime",
-                last_error_message=str(message)
-            )
-        except Exception:
-            pass
-
-    def mark_startup_error(
-        self,
-        message: str,
-        *,
-        component: Optional[str] = None,
-        since: Optional[datetime] = None,
-        until: Optional[datetime] = None,
-        host: Optional[str] = None,
-        pid: Optional[int] = None,
-        extra: Optional[Dict[str, Any]] = None,
-    ) -> int:
-        """
-        Фиксирует «стартовую» ошибку процесса (до начала обработки срезов).
-        Используйте, когда упали подключения к внешним БД/сервисам, конфиг невалиден и т.п.
-
-        Поведение:
-          - создаётся отдельная строка в журнале со status='error' и ts_end=now();
-          - запись НЕ активная (ts_end не NULL), поэтому не блокирует planned/running;
-          - в details пишется phase='bootstrap', error, component и при наличии границы запуска.
-
-        Аргументы:
-          message   — человекочитаемое сообщение об ошибке.
-          component — источник сбоя: 'phoenix' | 'clickhouse' | 'postgres' | 'config' | и т.п.
-          since/until — опциональные рамки бизнес-запуска, если известны на момент сбоя.
-          host/pid  — опциональные идентификаторы узла/процесса.
-          extra     — дополнительные поля, будут добавлены в details (значения приводятся к str при необходимости).
-
-        Возвращает:
-          id — идентификатор созданной строки журнала.
-        """
-        det: Dict[str, Any] = {"phase": "bootstrap", "error": str(message)}
-        if component:
-            det["component"] = component
-        if since:
-            det["slice_from"] = self._to_aware_utc(since).isoformat()
-        if until:
-            det["slice_to"] = self._to_aware_utc(until).isoformat()
-        if extra:
-            # Аккуратно приводим небезопасные для JSONB типы к строке.
-            try:
-                det.update({k: (v if isinstance(v, (int, float, str, bool, type(None))) else str(v)) for k, v in extra.items()})
-            except Exception:
-                pass
-
-        self.pg.execute(
-            f"INSERT INTO {self.table} (process_name, status, ts_end, details, host, pid) "
-            "VALUES (%s, 'error', now(), %s::jsonb, %s, %s) RETURNING id",
-            (self.process_name, Json(det), host, pid)
-        )
-        rid = self.pg.fetchone()[0]
-        log.error("Стартовый сбой процесса '%s': id=%s, component=%s, message=%s",
-                  self.process_name, rid, component or "-", message)
-        # Синхронизируем агрегированное состояние: фатальный стартовый сбой.
-        try:
-            self._state_upsert(
-                status="error",
-                healthy=False,
-                last_error_at=datetime.now(timezone.utc),
-                last_error_component=component or "bootstrap",
-                last_error_message=message,
-                extra=extra or {},
-            )
-        except Exception:
-            pass
-        return rid
-
-    # -------------------- watermark и вспомогательные --------------------
-
-    def get_watermark(self) -> Optional[datetime]:
-        """Текущий watermark для процесса (UTC) или None, если ещё не выставлялся."""
-        self.pg.execute(f"SELECT last_ok_end FROM {self.state_table} WHERE process_name=%s", (self.process_name,))
-        row = self.pg.fetchone()
-        return row[0] if row else None
-
-    def last_ok_end(self, process_name: Optional[str] = None) -> Optional[datetime]:
-        """
-        Возвращает ts_end последнего успешного запуска указанного процесса
-        (или текущего self.process_name, если не указан).
-        Полезно для автокаденса публикаций.
-        """
-        pname = process_name or self.process_name
-        self.pg.execute(
-            f"SELECT ts_end FROM {self.table} "
-            "WHERE process_name=%s AND status='ok' AND ts_end IS NOT NULL "
-            "ORDER BY ts_end DESC LIMIT 1",
-            (pname,)
-        )
-        row = self.pg.fetchone()
-        return row[0] if row else None
-
-    def ok_count_since(self, since_ts: datetime, process_name: Optional[str] = None) -> int:
-        """
-        Количество успешных запусков (status='ok') указанного процесса с момента since_ts.
-        Используется для логики PUBLISH_EVERY_SLICES.
-        """
-        pname = process_name or self.process_name
-        self.pg.execute(
-            f"SELECT count(*) FROM {self.table} "
-            "WHERE process_name=%s AND status='ok' AND ts_start >= %s",
-            (pname, since_ts)
-        )
-        row = self.pg.fetchone()
-        try:
-            return int(row[0]) if row else 0
-        except Exception:
-            return 0
-
-    def clear_conflicting_planned(self, slice_from: datetime, slice_to: datetime) -> int:
-        """
-        Переводит любые активные planned для ЭТОГО процесса со срезами, отличными от (slice_from, slice_to),
-        в статус 'skipped'. Нужно для случаев, когда прошлый процесс упал до mark_running().
-
-        ВАЖНО: параметры new_slice_from/new_slice_to явно приводим к text,
-        чтобы PostgreSQL не ругался 'could not determine data type of parameter $1'
-        внутри jsonb_build_object (иначе тип 'unknown' не выводится).
-        """
-        sf = self._to_aware_utc(slice_from).isoformat()
-        st = self._to_aware_utc(slice_to).isoformat()
-        self.pg.execute(f"""
-        UPDATE {self.table} t
-           SET status='skipped',
-               ts_end=now(),
-               details = COALESCE(t.details,'{{}}'::jsonb)
-                        || jsonb_build_object('sanitized', true,
-                                              'reason','superseded_by_new_slice',
-                                              'new_slice_from', %s::text,
-                                              'new_slice_to', %s::text,
-                                              'sanitized_at', to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"'))
-         WHERE t.process_name=%s
-           AND t.status='planned'
-           AND t.ts_end IS NULL
-           AND ((t.details->>'slice_from') IS DISTINCT FROM %s
-             OR (t.details->>'slice_to')   IS DISTINCT FROM %s)
-        RETURNING t.id
-        """, (sf, st, self.process_name, sf, st))
-        rows = self.pg.fetchall() or []
-        n = len(rows)
-        if n:
-            log.warning("clear_conflicting_planned(): перевели planned→skipped, строк: %d.", n)
-        return n
-
-    def prune_old(self, days: Optional[int] = None, batch_size: int = 10000) -> int:
-        """
-        Мягкая ретенция журнала: удаляет завершённые записи (ok|error|skipped) старше N дней
-        батчами по batch_size. Минимизирует длительные блокировки. Возвращает суммарное число удалённых строк.
-        """
-        # Если days не передан — берём из ENV JOURNAL_RETENTION_DAYS (по умолчанию 30).
-        if days is None:
-            import os
-            env_val = os.getenv("JOURNAL_RETENTION_DAYS", "").strip()
-            if env_val == "":
-                days = 30
-            else:
-                try:
-                    days = int(env_val)
-                except ValueError:
-                    log.warning("JOURNAL_RETENTION_DAYS некорректно (%r) — использую 30.", env_val)
-                    days = 30
-
-        if days <= 0:
-            log.info("prune_old: отключено (days=%d).", days)
-            return 0
-
-        days = int(days)
-        batch_size = int(batch_size)
-        total = 0
-        while True:
-            self.pg.execute(f"""
-            WITH del AS (
-                SELECT id
-                  FROM {self.table}
-                 WHERE ts_end IS NOT NULL
-                   AND status IN ('ok','error','skipped')
-                   AND ts_end < now() - INTERVAL '{days} days'
-                 ORDER BY ts_end, id
-                 LIMIT {batch_size}
-            )
-            DELETE FROM {self.table} t
-              USING del
-             WHERE t.id = del.id
-            RETURNING t.id
-            """)
-            rows = self.pg.fetchall() or []
-            n = len(rows)
-            total += n
-            if n < batch_size:
-                break
-        if total:
-            log.warning("prune_old(%d, batch=%d): удалено %d завершённых записей.", days, batch_size, total)
-        return total
 
     def sanitize_stale(
         self,
@@ -904,20 +905,17 @@ class ProcessJournal:
         running_hard_ttl_hours: Optional[int] = 12,
     ) -> None:
         """
-        Автосанация «висячих» записей:
-        - planned без ts_end, старше planned_ttl_minutes → status='skipped'
-        - running без ts_end и с протухшим heartbeat → status='error'
-        - (опционально) running старше жёсткого TTL часов → status='error'
+        «Мягкая» санация висящих запусков ТОЛЬКО для текущего процесса:
+          • planned старше planned_ttl_minutes → status='skipped'
+          • running без heartbeat дольше running_heartbeat_timeout_minutes → status='error', ts_end=now()
+          • (опц.) running старше running_hard_ttl_hours → status='error', ts_end=now()
+
+        Ничего не удаляет — только меняет статусы. Все отметки времени — UTC.
         """
-        # planned → skipped
+        # planned → skipped (слишком старые planned без завершения)
         sql_planned = f"""
         UPDATE {self.table} t
-           SET status = 'skipped',
-               ts_end = now(),
-               details = COALESCE(t.details, '{{}}'::jsonb)
-                         || jsonb_build_object('sanitized', true,
-                                               'reason', 'planned_ttl',
-                                               'sanitized_at', to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"'))
+           SET status = 'skipped'
          WHERE t.process_name = %s
            AND t.status = 'planned'
            AND t.ts_end IS NULL
@@ -925,17 +923,13 @@ class ProcessJournal:
         RETURNING t.id
         """
         self.pg.execute(sql_planned, (self.process_name,))
-        planned_skipped = len(self.pg.fetchall() or [])
+        skipped = len(self.pg.fetchall() or [])
 
-        # running с протухшим heartbeat → error
+        # running с «протухшим» heartbeat → error
         sql_running_hb = f"""
         UPDATE {self.table} t
            SET status = 'error',
-               ts_end = now(),
-               details = COALESCE(t.details, '{{}}'::jsonb)
-                         || jsonb_build_object('sanitized', true,
-                                               'reason', 'heartbeat_timeout',
-                                               'sanitized_at', to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"'))
+               ts_end = now()
          WHERE t.process_name = %s
            AND t.status = 'running'
            AND t.ts_end IS NULL
@@ -944,18 +938,15 @@ class ProcessJournal:
         RETURNING t.id
         """
         self.pg.execute(sql_running_hb, (self.process_name,))
-        running_err = len(self.pg.fetchall() or [])
+        hb_err = len(self.pg.fetchall() or [])
 
+        # running старше жёсткого TTL → error
         hard_err = 0
         if running_hard_ttl_hours is not None:
             sql_running_hard = f"""
             UPDATE {self.table} t
                SET status = 'error',
-                   ts_end = now(),
-                   details = COALESCE(t.details, '{{}}'::jsonb)
-                             || jsonb_build_object('sanitized', true,
-                                                   'reason', 'hard_ttl',
-                                                   'sanitized_at', to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"'))
+                   ts_end = now()
              WHERE t.process_name = %s
                AND t.status = 'running'
                AND t.ts_end IS NULL
@@ -965,59 +956,254 @@ class ProcessJournal:
             self.pg.execute(sql_running_hard, (self.process_name,))
             hard_err = len(self.pg.fetchall() or [])
 
-        if planned_skipped or running_err or hard_err:
+        if skipped or hb_err or hard_err:
             log.warning(
-                "sanitize_stale(): planned→skipped=%d, running hb→error=%d, running hard→error=%d",
-                planned_skipped, running_err, hard_err
+                "sanitize_stale(): planned→skipped=%s, running→error (heartbeat)=%s, running→error (hard_ttl)=%s",
+                skipped, hb_err, hard_err
+            )
+        self._commit_quietly()
+
+    def mark_done(
+        self,
+        slice_from: datetime,
+        slice_to: datetime,
+        rows_read: int | None = None,
+        rows_written: int | None = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """
+        Завершить текущий запуск со статусом OK для окна [slice_from, slice_to).
+        Ищем «running, ts_end IS NULL» запись именно для этого окна; если вдруг
+        не находим — берём последнюю «running» по процессу (safety net).
+
+        Также обновляем агрегированное состояние в inc_process_state:
+          • last_status='ok', healthy=true
+          • last_ok_end=slice_to (UTC)
+          • progress = {rows_read, rows_written}
+        """
+        sf, st = self._slice_iso_texts(slice_from, slice_to)
+        metrics = {
+            "rows_read": int(rows_read) if rows_read is not None else None,
+            "rows_written": int(rows_written) if rows_written is not None else None,
+            "finished": True,
+        }
+        if extra:
+            metrics.update(extra)
+        # Убираем None, чтобы не писать null-поля в JSONB
+        metrics = {k: v for k, v in metrics.items() if v is not None}
+
+        # 1) Пытаемся закрыть именно запись по нашему окну
+        self.pg.execute(
+            f"""
+            WITH cand AS (
+              SELECT id FROM {self.table}
+               WHERE process_name=%s AND status='running' AND ts_end IS NULL
+                 AND (details->>'slice_from')=%s AND (details->>'slice_to')=%s
+               ORDER BY ts_start DESC LIMIT 1
+            )
+            UPDATE {self.table} t
+               SET status='ok',
+                   ts_end=now(),
+                   details=COALESCE(t.details, '{{}}'::jsonb) || %s::jsonb
+              FROM cand
+             WHERE t.id=cand.id
+            RETURNING t.id
+            """,
+            (self.process_name, sf, st, Json(metrics))
+        )
+        row = self.pg.fetchone()
+
+        # 2) Если нет точного совпадения — закрываем последнюю активную запись
+        if not row:
+            self.pg.execute(
+                f"""
+                WITH cand AS (
+                  SELECT id FROM {self.table}
+                   WHERE process_name=%s AND status='running' AND ts_end IS NULL
+                   ORDER BY ts_start DESC LIMIT 1
+                )
+                UPDATE {self.table} t
+                   SET status='ok',
+                       ts_end=now(),
+                       details=COALESCE(t.details, '{{}}'::jsonb) || %s::jsonb
+                  FROM cand
+                 WHERE t.id=cand.id
+                RETURNING t.id
+                """,
+                (self.process_name, Json(metrics))
+            )
+            row = self.pg.fetchone()
+
+        rid: Optional[int] = row[0] if row else None
+        if rid:
+            log.info(
+                "Запуск завершён: OK (id=%s) — [%s → %s], rows_read=%s, rows_written=%s",
+                rid, sf, st, rows_read, rows_written,
+            )
+        else:
+            log.warning(
+                "mark_done(): не нашёл активной записи для завершения [%s → %s] — возможно, гонка/параллелизм",
+                sf, st,
             )
 
-    def _state_upsert(
-        self,
-        *,
-        status: Optional[str] = None,
-        healthy: Optional[bool] = None,
-        last_ok_end: Optional[datetime] = None,
-        last_started_at: Optional[datetime] = None,
-        last_heartbeat: Optional[datetime] = None,
-        last_error_at: Optional[datetime] = None,
-        last_error_component: Optional[str] = None,
-        last_error_message: Optional[str] = None,
-        progress: Optional[Dict[str, Any]] = None,
-        extra: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """
-        Идемпотентный апсерт агрегированного состояния процесса.
-        last_ok_end только растёт (GREATEST()), при 'ok' очищаем поля ошибки.
-        """
-        now = datetime.now(timezone.utc)
-        msg = (last_error_message or None)
-        if msg and len(msg) > 1000:
-            msg = msg[:1000]
+        # Best‑effort commit и апдейт состояния
+        self._commit_quietly()
+        try:
+            self._state_upsert(
+                status='ok',
+                healthy=True,
+                last_ok_end=self._to_aware_utc(slice_to),
+                progress={k: v for k, v in metrics.items() if k in ("rows_read", "rows_written")},
+            )
+        except Exception:
+            pass
 
-        sql = f"""
-        INSERT INTO {self.state_table} AS s
-            (process_name, last_status, healthy, last_ok_end, last_started_at, last_heartbeat,
-             last_error_at, last_error_component, last_error_message, progress, extra, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, now())
-        ON CONFLICT (process_name) DO UPDATE SET
-            last_status     = COALESCE(EXCLUDED.last_status, s.last_status),
-            healthy         = COALESCE(EXCLUDED.healthy, s.healthy),
-            last_ok_end     = GREATEST(COALESCE(s.last_ok_end, EXCLUDED.last_ok_end), EXCLUDED.last_ok_end),
-            last_started_at = COALESCE(EXCLUDED.last_started_at, s.last_started_at),
-            last_heartbeat  = COALESCE(EXCLUDED.last_heartbeat,  now()),
-            last_error_at        = CASE WHEN EXCLUDED.last_status = 'ok' THEN NULL ELSE COALESCE(EXCLUDED.last_error_at, s.last_error_at) END,
-            last_error_component = CASE WHEN EXCLUDED.last_status = 'ok' THEN NULL ELSE COALESCE(EXCLUDED.last_error_component, s.last_error_component) END,
-            last_error_message   = CASE WHEN EXCLUDED.last_status = 'ok' THEN NULL ELSE COALESCE(EXCLUDED.last_error_message, s.last_error_message) END,
-            progress        = COALESCE(EXCLUDED.progress, s.progress),
-            extra           = COALESCE(EXCLUDED.extra, s.extra),
-            updated_at      = now()
+        # Тихо запускаем авто‑ретенцию, если пора
+        try:
+            self._auto_prune_if_due()
+        except Exception:
+            pass
+
+        return rid
+
+    def mark_error(
+        self,
+        slice_from: datetime,
+        slice_to: datetime,
+        message: str,
+        component: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
         """
-        self.pg.execute(sql, (
-            self.process_name,
-            status, healthy, last_ok_end, last_started_at,
-            last_heartbeat or now,
-            last_error_at, last_error_component, msg,
-            json.dumps(progress) if progress is not None else None,
-            json.dumps(extra) if extra is not None else None,
-        ))
-        self.pg.commit()
+        Завершить текущий запуск со статусом ERROR для окна [slice_from, slice_to).
+        Пишем ошибку в details (message, component, finished=false) и закрываем запись ts_end=now().
+        Обновляем inc_process_state: last_status='error', healthy=false, last_error_*.
+        """
+        sf, st = self._slice_iso_texts(slice_from, slice_to)
+        payload = {"error": str(message), "component": component, "finished": False}
+        if extra:
+            payload.update(extra)
+        payload = {k: v for k, v in payload.items() if v is not None}
+
+        # 1) Попытка по точному окну
+        self.pg.execute(
+            f"""
+            WITH cand AS (
+              SELECT id FROM {self.table}
+               WHERE process_name=%s AND status IN ('planned','running') AND ts_end IS NULL
+                 AND (details->>'slice_from')=%s AND (details->>'slice_to')=%s
+               ORDER BY ts_start DESC LIMIT 1
+            )
+            UPDATE {self.table} t
+               SET status='error',
+                   ts_end=now(),
+                   details=COALESCE(t.details, '{{}}'::jsonb) || %s::jsonb
+              FROM cand
+             WHERE t.id=cand.id
+            RETURNING t.id
+            """,
+            (self.process_name, sf, st, Json(payload))
+        )
+        row = self.pg.fetchone()
+
+        # 2) Fallback — последняя активная запись по процессу
+        if not row:
+            self.pg.execute(
+                f"""
+                WITH cand AS (
+                  SELECT id FROM {self.table}
+                   WHERE process_name=%s AND status IN ('planned','running') AND ts_end IS NULL
+                   ORDER BY ts_start DESC LIMIT 1
+                )
+                UPDATE {self.table} t
+                   SET status='error',
+                       ts_end=now(),
+                       details=COALESCE(t.details, '{{}}'::jsonb) || %s::jsonb
+                  FROM cand
+                 WHERE t.id=cand.id
+                RETURNING t.id
+                """,
+                (self.process_name, Json(payload))
+            )
+            row = self.pg.fetchone()
+
+        rid: Optional[int] = row[0] if row else None
+        if rid:
+            log.error("Запуск завершён: ERROR (id=%s) — [%s → %s]: %s", rid, sf, st, message)
+        else:
+            log.error("mark_error(): не нашёл активной записи для завершения [%s → %s]; error=%s", sf, st, message)
+
+        self._commit_quietly()
+        try:
+            self._state_upsert(
+                status='error',
+                healthy=False,
+                last_error_at=datetime.now(timezone.utc),
+                last_error_component=component or 'etl',
+                last_error_message=str(message),
+                extra={},
+            )
+        except Exception:
+            pass
+        return rid
+
+    def _auto_prune_if_due(self) -> None:
+        """
+        Автоматическая ретенция партиций (раз в сутки).
+        JOURNAL_RETENTION_DAYS (def: 30) — сколько хранить.
+        Метка последней чистки: inc_process_state(process_name='__journal__', extra.last_prune_at).
+        """
+        try:
+            if not self._is_parent_partitioned():
+                return
+            try:
+                days = int(os.getenv("JOURNAL_RETENTION_DAYS", "30"))
+            except Exception:
+                days = 30
+            if days <= 0:
+                return
+
+            # Когда чистили в прошлый раз?
+            self.pg.execute(f"SELECT extra FROM {self.state_table} WHERE process_name=%s", ("__journal__",))
+            row = self.pg.fetchone()
+            last_prune_at = None
+            if row and row[0]:
+                try:
+                    last_prune_at_txt = (row[0] or {}).get("last_prune_at")
+                    if last_prune_at_txt:
+                        last_prune_at = datetime.fromisoformat(last_prune_at_txt)
+                        if last_prune_at.tzinfo is None:
+                            last_prune_at = last_prune_at.replace(tzinfo=timezone.utc)
+                        last_prune_at = last_prune_at.astimezone(timezone.utc)
+                except Exception:
+                    last_prune_at = None
+
+            now_utc = datetime.now(timezone.utc)
+            need = (last_prune_at is None) or ((now_utc - last_prune_at) >= timedelta(days=1))
+            if not need:
+                return
+
+            # Глобальная защита от гонок
+            self.pg.execute("SELECT pg_try_advisory_lock(hashtext(%s))", ("journal_prune_global",))
+            got = bool(self.pg.fetchone()[0])
+            if not got:
+                return
+            try:
+                dropped = self._prune_by_partitions(days)
+                new_extra = {"last_prune_at": now_utc.isoformat()}
+                self.pg.execute(
+                    f"""
+                    INSERT INTO {self.state_table} (process_name, extra, updated_at)
+                    VALUES (%s, %s::jsonb, now())
+                    ON CONFLICT (process_name)
+                    DO UPDATE SET extra = COALESCE({self.state_table}.extra, '{{}}'::jsonb) || EXCLUDED.extra,
+                                  updated_at = now()
+                    """,
+                    ("__journal__", Json(new_extra))
+                )
+                if dropped:
+                    log.warning("Auto-prune: удалено партиций: %d (retention=%d дн.)", dropped, days)
+            finally:
+                self.pg.execute("SELECT pg_advisory_unlock(hashtext(%s))", ("journal_prune_global",))
+        except Exception:
+            log.debug("auto_prune_if_due(): skipped due to error", exc_info=True)
