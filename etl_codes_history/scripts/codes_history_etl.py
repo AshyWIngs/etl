@@ -47,7 +47,7 @@ Incremental ETL: Phoenix(HBase) → ClickHouse (native 9000, с компресс
 
 CLI (минимальный)
 ------------------
---since / --until      — окно обработки от и до.
+--since / --until      — окно обработки от и до. --since можно опустить: будет взят watermark из inc_processing_state; --until можно опустить: тогда until = since + RUN_WINDOW_HOURS (по умолчанию 24 ч).
 --manual-start         — ручной запуск (журнал: manual_<PROCESS_NAME>).
                          В manual-режиме дополнительно:
                          • публикация выполняется всегда (гейтинг по «новизне» отключён),
@@ -444,9 +444,9 @@ def main():
     #  - --manual-start — пометить запуск как ручной (для журнала);
     #  - --log-level — уровень логирования (по умолчанию INFO).
     parser.add_argument("--since", required=False, help="ISO. Наивные значения трактуются в BUSINESS_TZ (если задана), иначе в UTC. Пр: 2025-08-08T00:00:00")
-    parser.add_argument("--until", required=True,  help="ISO. Наивные значения трактуются в BUSINESS_TZ (если задана), иначе в UTC. Пр: 2025-08-09T00:00:00")
+    parser.add_argument("--until", required=False, help="ISO. Наивные значения трактуются в BUSINESS_TZ (если задана), иначе в UTC. Если не указан — используется since + RUN_WINDOW_HOURS (по умолчанию 24 ч). Пр: 2025-08-09T00:00:00")
     parser.add_argument("--manual-start", action="store_true", help="Если указан, журнал ведётся под именем 'manual_<PROCESS_NAME>' (ручной запуск).")
-    parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--log-level", "--log", dest="log_level", default="INFO", help="Уровень логирования (alias: --log)")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -493,13 +493,36 @@ def main():
     business_tz_name = business_tz_raw or "UTC"
     input_tz_mode = "business" if business_tz_raw else "utc"
     # since: если не задан, используем watermark (он уже в UTC)
-    since_dt = _parse_cli_dt(args.since, input_tz_mode, business_tz_name) if args.since else (getattr(journal, "get_watermark", lambda: None)() or None)
+    used_watermark = False
+    if args.since:
+        since_dt = _parse_cli_dt(args.since, input_tz_mode, business_tz_name)
+    else:
+        since_dt = getattr(journal, "get_watermark", lambda: None)() or None
+        used_watermark = True
     if since_dt is None:
         raise SystemExit("Не задан --since и нет watermark в журнале")
-    # until всегда обязателен, разбираем согласно режиму
-    until_dt = _parse_cli_dt(args.until, input_tz_mode, business_tz_name)
-    if until_dt is None:
-        raise SystemExit("Не задан --until или не удалось разобрать дату/время")
+    # until: если не указан — берём since + RUN_WINDOW_HOURS (из Settings/ENV), иначе разбираем из CLI
+    auto_until = False
+    _auto_window_hours = 0
+    if args.until:
+        until_dt = _parse_cli_dt(args.until, input_tz_mode, business_tz_name)
+        if until_dt is None:
+            raise SystemExit("Не удалось разобрать --until (проверьте формат даты/времени)")
+    else:
+        # Читаем окно по умолчанию; допускаем оба имени для совместимости
+        try:
+            win_h_raw = getattr(cfg, "RUN_WINDOW_HOURS", None)
+            if win_h_raw is None:
+                win_h_raw = getattr(cfg, "RUN_WINDOW_HOURS", None)
+            window_hours = int(win_h_raw) if win_h_raw is not None else 24
+        except Exception:
+            window_hours = 24
+        if window_hours <= 0:
+            window_hours = 24
+        until_dt = since_dt + timedelta(hours=window_hours)
+        auto_until = True
+        _auto_window_hours = window_hours
+
     # На этом этапе since_dt уже проверен выше (если None — мы бы завершились)
     if until_dt <= since_dt:
         raise SystemExit(f"Некорректное окно: since({since_dt.isoformat()}) >= until({until_dt.isoformat()})")
@@ -510,8 +533,10 @@ def main():
     step_min = int(getattr(cfg, "STEP_MIN", 60))
     # Отдельный сдвиг к Phoenix больше не используем: окно запроса = бизнес-окну
 
-    log.info("Запуск: input_tz=%s, business_tz=%s, step_min=%d; since(UTC)=%s, until(UTC)=%s; manual_start=%s",
-            input_tz_mode, business_tz_name, step_min, since_dt.isoformat(), until_dt.isoformat(), str(manual_mode))
+    if used_watermark:
+        log.info("since не указан: использую watermark из журнала (inc_process_state).")
+    if auto_until:
+        log.info("until не указан: использую since + %d ч (RUN_WINDOW_HOURS).", _auto_window_hours)
 
     # Вспомогательная функция стартовой ошибки
     def _startup_fail(component: str, exc: Exception, extra: Optional[Dict[str, Any]] = None) -> None:
@@ -788,6 +813,31 @@ def main():
                 running_hard_ttl_hours=12,
             )
 
+            # --- Стартовый бэкфилл последних N дней (защита от падений между запуском и публикацией) ---
+            # Если предыдущий запуск упал после вставки в RAW и до публикации в CLEAN,
+            # при старте допубликуем недостающие партиции за недавний период.
+            # Лёгкая и безопасная операция: REPLACE PARTITION идемпотентен.
+            try:
+                backfill_days = int(getattr(cfg, "STARTUP_BACKFILL_DAYS", 0) or 0)
+            except Exception:
+                backfill_days = 0
+            if backfill_days > 0:
+                # Опорной точкой берём правую границу текущего окна запуска (until_dt).
+                bf_end = until_dt
+                bf_start = bf_end - timedelta(days=backfill_days)
+                try:
+                    parts_recent = _collect_missing_parts_between(ch, bf_start, bf_end)
+                except Exception as ex:
+                    parts_recent = set()
+                    _log_maybe_trace(logging.WARNING, f"Стартовый бэкфилл: не удалось собрать партиции за {backfill_days} дн.: {ex}", exc=ex, cfg=cfg)
+                if parts_recent:
+                    log.info("Стартовый бэкфилл: допубликую %d партиций за последние %d дней.", len(parts_recent), backfill_days)
+                    # Публикуем без гейтинга «новизны» — спасение после возможного падения.
+                    _publish_parts(ch, parts_recent, force=True)
+                else:
+                    if log.isEnabledFor(logging.DEBUG):
+                        log.debug("Стартовый бэкфилл: в RAW нет данных за последние %d дней — пропускаю.", backfill_days)
+
             logged_tz_context = False
             is_first_slice = True
             # === Чтение из Phoenix и запись в RAW ======================================
@@ -1014,3 +1064,4 @@ if __name__ == "__main__":
         else:
             _log.error(_msg + " (стек скрыт; установите ETL_TRACE_EXC=1 или запустите с --log-level=DEBUG, чтобы напечатать трейсбек)")
         raise SystemExit(1)
+    

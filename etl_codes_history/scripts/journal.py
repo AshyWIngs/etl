@@ -237,8 +237,13 @@ class ProcessJournal:
 
     @staticmethod
     def _derive_state_table_name(journal_table: str) -> str:
+        """
+        Имя таблицы состояния берём в той же схеме, что и журнал.
+        Если схема не указана — используем public (явно), чтобы не зависеть от search_path.
+        """
         parts = journal_table.split(".")
-        return f"{parts[0]}.inc_process_state" if len(parts) == 2 else "inc_process_state"
+        schema = parts[0] if len(parts) == 2 else "public"
+        return f"{schema}.inc_process_state"
 
     @staticmethod
     def _split_schema_table(fqname: str) -> Tuple[str, str]:
@@ -619,6 +624,49 @@ class ProcessJournal:
             except Exception:
                 pass
             self._commit_quietly()
+
+    def get_watermark(self) -> Optional[datetime]:
+        """
+        Возвращает watermark — последнюю успешно обработанную правую границу окна (last_ok_end)
+        из таблицы состояния процесса (self.state_table). Всегда приводит время к UTC (aware).
+        Если записи нет или поле пустое — возвращает None.
+        """
+        try:
+            # Читаем last_ok_end для текущего процесса
+            self.pg.execute(
+                f"SELECT last_ok_end FROM {self.state_table} WHERE process_name=%s LIMIT 1",
+                (self.process_name,)
+            )
+            row = self.pg.fetchone()
+            if not row or not row[0]:
+                return None
+
+            val = row[0]
+            # Поддерживаем как datetime, так и текстовый ISO-формат (включая суффикс 'Z')
+            if isinstance(val, datetime):
+                dt = val
+            else:
+                s = str(val).strip()
+                if not s:
+                    return None
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                try:
+                    dt = datetime.fromisoformat(s)
+                except Exception:
+                    return None
+
+            # Гарантируем UTC-aware
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+
+            return dt
+        except Exception:
+            # Безопасная деградация: при ошибке возвращаем None; основная логика корректно обработает это.
+            return None
+
     def _state_upsert(
         self,
         *,
@@ -1310,3 +1358,5 @@ class ProcessJournal:
                 self.pg.execute("SELECT pg_advisory_unlock(hashtext(%s))", ("journal_prune_global",))
         except Exception:
             log.debug("auto_prune_if_due(): skipped due to error", exc_info=True)
+
+            
