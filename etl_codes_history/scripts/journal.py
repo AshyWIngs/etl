@@ -3,14 +3,24 @@
 from __future__ import annotations
 import json
 import logging
-from typing import Any, Dict, Optional, List, Tuple
-from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Optional, List, Tuple, Protocol, runtime_checkable, Callable, cast
+from datetime import datetime, timezone, timedelta, tzinfo
 from contextlib import contextmanager
-from psycopg.types.json import Json
-from psycopg.errors import UniqueViolation
 import os
 import time
 import re
+try:
+    from psycopg.types.json import Json  # type: ignore[import]
+except Exception:
+    # Fallback stub for type-checkers / dev environments without psycopg
+    def Json(obj):  # type: ignore[misc]
+        return obj
+try:
+    from psycopg.errors import UniqueViolation  # type: ignore[import]
+except Exception:
+    # Fallback stub exception to satisfy type-checkers
+    class UniqueViolation(Exception):  # type: ignore[misc]
+        ...
 
 # Настройка таймзоны вывода для ЛОГОВ (не влияет на UTC в БД, отображение через CLI)
 try:
@@ -20,22 +30,63 @@ except Exception:
 
 _LOG_TZ_CONFIGURED = False
 
+# Предкомпилированный шаблон для разбора границ партиций: быстрее, чем компилировать в цикле каждый раз
+_RX_PART_BOUND = re.compile(r"FROM \('(.*?)'\) TO \('(.*?)'\)")
+
+# Предкомпилированные шаблоны для быстрой нормализации оффсетов таймзоны
+
+_RX_TZ_OFF_HH   = re.compile(r'([+\-]\d{2})$')   # '+05' / '-03' в конце строки
+_RX_TZ_OFF_HHMM = re.compile(r'([+\-]\d{4})$')   # '+0530' / '-0330' в конце строки
+
+# --- Узкие протоколы для подсказок типизации (Pylance/pyright) ---
+@runtime_checkable
+class _HasExecute(Protocol):
+    def execute(self, sql: str, params: Any = ...) -> Any: ...
+
+@runtime_checkable
+class _HasClose(Protocol):
+    def close(self) -> Any: ...
+
+@runtime_checkable
+class _HasFetchone(Protocol):
+    def fetchone(self) -> Optional[tuple]: ...
+
+@runtime_checkable
+class _HasFetchall(Protocol):
+    def fetchall(self) -> List[tuple]: ...
+
+@runtime_checkable
+class _CursorLikeProto(_HasExecute, _HasClose, Protocol):
+    ...
+
+@runtime_checkable
+class _HasCursor(Protocol):
+    def cursor(self) -> "_CursorLikeProto": ...
+
+@runtime_checkable
+class _HasCommit(Protocol):
+    def commit(self) -> Any: ...
+
+@runtime_checkable
+class _PgLikeProto(_HasExecute, _HasFetchone, _HasFetchall, _HasCursor, _HasCommit, Protocol):
+    ...
+
 class _TzFormatter(logging.Formatter):
     """
     Форматтер, печатающий %(asctime)s в заданной таймзоне.
     Время берём как UTC и переводим в нужный TZ только для логов.
     """
-    def __init__(self, fmt: str | None = None, datefmt: str | None = None, tzinfo: timezone | None = None):
+    def __init__(self, fmt: str | None = None, datefmt: str | None = None, tzinfo: tzinfo | None = None):
         super().__init__(fmt=fmt, datefmt=datefmt)
         self._tz = tzinfo or timezone.utc
 
-    def formatTime(self, record, datefmt=None):
+    def formatTime(self, record, datefmt: str | None = None):
         dt = datetime.fromtimestamp(record.created, tz=timezone.utc).astimezone(self._tz)
         if datefmt:
             return dt.strftime(datefmt)
         return dt.isoformat(timespec="seconds")
 
-def _resolve_log_timezone(name: str) -> timezone:
+def _resolve_log_timezone(name: str) -> tzinfo:
     """Подбирает tzinfo по имени зоны; если не найдено — fallback на GMT+5."""
     if ZoneInfo is not None:
         try:
@@ -150,10 +201,10 @@ class ProcessJournal:
             # Диагностика не должна ломать основной поток.
             pass
 
-    def __init__(self, pg, table: str, process_name: str, state_table: Optional[str] = None,
+    def __init__(self, pg: _PgLikeProto, table: str, process_name: str, state_table: Optional[str] = None,
                  minimal: Optional[bool] = None, heartbeat_min_interval_sec: Optional[int] = None):
         _configure_logger_timezone_once()
-        self.pg = pg
+        self.pg: _PgLikeProto = pg  # типизация для Pylance: есть execute/fetchone/fetchall/cursor/commit
         self.table = table
         self.process_name = process_name
         self.state_table = state_table or self._derive_state_table_name(table)
@@ -169,6 +220,13 @@ class ProcessJournal:
             self.hb_min_interval = 300
         self._last_hb_mono: float = 0.0
         self._self_check_pg_client()
+
+        # Кэш разбора имён и relkind для снижения накладных расходов на повторные SELECT и split()
+        self._schema, self._parent_name = self._split_schema_table(self.table)
+        self._tail_table = self._tail_identifier(self.table)
+        self._state_schema, self._state_name = self._split_schema_table(self.state_table)
+        self._tail_state_table = self._tail_identifier(self.state_table)
+        self._relkind_cache: Optional[str] = None  # 'p' — партиционированная, 'r' — обычная, None — неизвестно
 
     # ---------- утилиты имён/схем ----------
 
@@ -190,8 +248,13 @@ class ProcessJournal:
         return "public", parts[0]
 
     def _table_relkind(self) -> Optional[str]:
-        """'p' — partitioned table (родитель), 'r' — обычная таблица, None — таблицы нет."""
-        schema, name = self._split_schema_table(self.table)
+        """'p' — партиционированная родительская таблица, 'r' — обычная, None — таблицы нет. Использует кэш."""
+        # Быстрый путь: если уже знаем тип — возвращаем без запроса к каталогу
+        if getattr(self, "_relkind_cache", None) is not None:
+            return self._relkind_cache
+        # Медленный путь: один раз читаем из системного каталога
+        schema = getattr(self, "_schema", None) or self._split_schema_table(self.table)[0]
+        name = getattr(self, "_parent_name", None) or self._split_schema_table(self.table)[1]
         self.pg.execute(
             "SELECT c.relkind "
             "FROM pg_class c "
@@ -200,7 +263,8 @@ class ProcessJournal:
             (schema, name)
         )
         row = self.pg.fetchone()
-        return row[0] if row else None
+        self._relkind_cache = row[0] if row else None
+        return self._relkind_cache
 
     def _is_parent_partitioned(self) -> bool:
         return self._table_relkind() == "p"
@@ -232,23 +296,24 @@ class ProcessJournal:
     def _norm_tz_offset_str(self, s: str) -> str:
         """
         Нормализует строку времени с оффсетом зоны:
-          • '+05'    -> '+05:00'
-          • '-03'    -> '-03:00'
-          • '+0530'  -> '+05:30'
-          • '-0330'  -> '-03:30'
+          • '+05'    → '+05:00'
+          • '-03'    → '-03:00'
+          • '+0530'  → '+05:30'
+          • '-0330'  → '-03:30'
         Остальные варианты возвращаются без изменений.
         """
         if not isinstance(s, str):
             return s
-        # '+HH' or '-HH' at the end
-        m = re.search(r'([+\-]\d{2})$', s)
+        # '+HH' или '-HH' в конце
+        m = _RX_TZ_OFF_HH.search(s)
         if m:
-            return s[:-len(m.group(1))] + m.group(1) + ":00"
-        # '+HHMM' or '-HHMM' at the end
-        m = re.search(r'([+\-]\d{4})$', s)
+            off = m.group(1)
+            return s[:-len(off)] + off + ":00"
+        # '+HHMM' или '-HHMM' в конце
+        m = _RX_TZ_OFF_HHMM.search(s)
         if m:
-            hhmm = m.group(1)
-            return s[:-len(hhmm)] + hhmm[:3] + ":" + hhmm[3:]
+            off = m.group(1)
+            return s[:-len(off)] + off[:3] + ":" + off[3:]
         return s
 
     def _parse_ts_any(self, text: str) -> datetime:
@@ -296,7 +361,7 @@ class ProcessJournal:
             except Exception:
                 ahead = 1
 
-            schema, parent = self._split_schema_table(self.table)
+            schema, parent = self._schema, self._parent_name
             now_utc = datetime.now(timezone.utc)
             cur_start = self._floor_to_interval_utc(now_utc, interval_days)
 
@@ -307,14 +372,14 @@ class ProcessJournal:
                 return self._fmt_ts(dt)
 
             # Выбираем API выполнения: один курсор, если доступен
-            cur = None
+            cur: Optional[_CursorLikeProto] = None
             try:
                 cur_factory = getattr(self.pg, "cursor", None)
                 if callable(cur_factory):
-                    cur = cur_factory()
-                    _exec = cur.execute
+                    cur = cast(_CursorLikeProto, cur_factory())
+                    _exec: Callable[..., Any] = cast(_HasExecute, cur).execute
                 else:
-                    _exec = self.pg.execute
+                    _exec: Callable[..., Any] = cast(_HasExecute, self.pg).execute
 
                 def create_one(st: datetime) -> None:
                     en = st + timedelta(days=interval_days)
@@ -357,7 +422,7 @@ class ProcessJournal:
 
     def _list_partitions_with_bounds(self) -> List[Tuple[str, datetime, datetime]]:
         """[(child_relname, from_ts, to_ts)] по pg_inherits/pg_get_expr()."""
-        schema, parent = self._split_schema_table(self.table)
+        schema, parent = self._schema, self._parent_name
         self.pg.execute(
             "SELECT c.relname, pg_get_expr(c.relpartbound, c.oid) "
             "FROM pg_inherits i "
@@ -370,9 +435,8 @@ class ProcessJournal:
         )
         rows = self.pg.fetchall() or []
         out: List[Tuple[str, datetime, datetime]] = []
-        rx = re.compile(r"FROM \('(.*?)'\) TO \('(.*?)'\)")
         for relname, bound in rows:
-            m = rx.search(bound or "")
+            m = _RX_PART_BOUND.search(bound or "")
             if not m:
                 continue
             try:
@@ -403,7 +467,7 @@ class ProcessJournal:
            AND (details->>'slice_to')=%s
            { "AND id<>%s" if keep_run_id is not None else "" }
         """
-        params_pl = [self.process_name, sf, st]
+        params_pl: List[Any] = [self.process_name, sf, st]
         if keep_run_id is not None:
             params_pl.append(keep_run_id)
         self.pg.execute(sql_pl, tuple(params_pl))
@@ -420,7 +484,7 @@ class ProcessJournal:
            AND (details->>'slice_to')=%s
            { "AND id<>%s" if keep_run_id is not None else "" }
         """
-        params_ru = [self.process_name, sf, st]
+        params_ru: List[Any] = [self.process_name, sf, st]
         if keep_run_id is not None:
             params_ru.append(keep_run_id)
         self.pg.execute(sql_ru, tuple(params_ru))
@@ -433,7 +497,7 @@ class ProcessJournal:
         """
         if days <= 0:
             return 0
-        schema, _ = self._split_schema_table(self.table)
+        schema = self._schema
         cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
         parts = self._list_partitions_with_bounds()
         victims = [(name, st, en) for (name, st, en) in parts if en < cutoff]
@@ -442,7 +506,8 @@ class ProcessJournal:
 
         # Всегда берём advisory-lock: один инстанс — одна чистка партиций.
         self.pg.execute("SELECT pg_try_advisory_lock(hashtext(%s))", ("journal_prune_global",))
-        got = bool(self.pg.fetchone()[0])
+        _row_lock = self.pg.fetchone()
+        got = bool(_row_lock[0]) if _row_lock else False  # без индексации None
         if not got:
             log.info("prune_by_partitions: другой инстанс уже чистит — выходим.")
             return 0
@@ -466,67 +531,94 @@ class ProcessJournal:
         СТРОГИЙ режим: поддерживается ТОЛЬКО партиционированный журнал (PARTITION BY RANGE(ts_start)).
         Если существует непартиционированная таблица — возбуждаем RuntimeError и просим миграцию.
 
-        Причины:
-          • код проще, нет медленных «фолбэков»;
-          • ретенция рассчитана на секции (DETACH/DROP);
-          • крупные объёмы чистятся быстро и без долгих блокировок.
+        Оптимизация: все DDL внутри выполняем через ОДИН курсор (если у PG‑клиента есть .cursor()),
+        чтобы сократить число round‑trip в БД; в конце — один общий commit (best‑effort).
         """
         relkind = self._table_relkind()
 
-        if relkind is None:
-            self.pg.execute(f"""
-            CREATE TABLE {self.table} (
-                id            BIGINT GENERATED BY DEFAULT AS IDENTITY,
-                process_name  TEXT        NOT NULL,
-                ts_start      TIMESTAMPTZ NOT NULL DEFAULT now(),
-                ts_end        TIMESTAMPTZ NULL,
-                status        TEXT        NOT NULL CHECK (status IN ('planned','running','ok','error','skipped')),
-                details       JSONB       NULL,
-                host          TEXT        NULL,
-                pid           INTEGER     NULL
-            ) PARTITION BY RANGE (ts_start);
-            """)
-            self.pg.execute(f"""
-            CREATE INDEX IF NOT EXISTS {self._tail_identifier(self.table)}_pname_started_desc_idx
-              ON {self.table} (process_name, ts_start DESC);
-            """)
-            log.info("Проверка таблицы журнала: OK (partitioned, %s)", self.table)
-            self._ensure_partitions_around_now()
-            self._auto_prune_if_due()
-        elif relkind == "p":
-            log.info("Проверка таблицы журнала: OK (partitioned, %s)", self.table)
-            self.pg.execute(f"""
-            CREATE INDEX IF NOT EXISTS {self._tail_identifier(self.table)}_pname_started_desc_idx
-              ON {self.table} (process_name, ts_start DESC);
-            """)
-            self._ensure_partitions_around_now()
-            self._auto_prune_if_due()
-        else:
-            raise RuntimeError(
-                f"Журнал {self.table} непартиционирован (relkind={relkind}). "
-                "Требуется миграция на PARTITION BY RANGE(ts_start)."
-            )
+        # Выбираем API выполнения: один курсор, если доступен
+        cur: Optional[_CursorLikeProto] = None
+        try:
+            cur_factory = getattr(self.pg, "cursor", None)
+            if callable(cur_factory):
+                cur = cast(_CursorLikeProto, cur_factory())
+                _exec: Callable[..., Any] = cast(_HasExecute, cur).execute
+            else:
+                _exec: Callable[..., Any] = cast(_HasExecute, self.pg).execute
 
-        # STATE — без изменений
-        self.pg.execute(f"""
-        CREATE TABLE IF NOT EXISTS {self.state_table} (
-            process_name          TEXT PRIMARY KEY,
-            last_status           TEXT,
-            healthy               BOOLEAN,
-            last_ok_end           TIMESTAMPTZ,
-            last_started_at       TIMESTAMPTZ,
-            last_heartbeat        TIMESTAMPTZ,
-            last_error_at         TIMESTAMPTZ,
-            last_error_component  TEXT,
-            last_error_message    TEXT,
-            progress              JSONB,
-            extra                 JSONB,
-            updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-        """)
-        self.pg.execute(f"CREATE INDEX IF NOT EXISTS {self._tail_identifier(self.state_table)}_updated_at_idx ON {self.state_table}(updated_at DESC);")
-        self.pg.execute(f"CREATE INDEX IF NOT EXISTS {self._tail_identifier(self.state_table)}_last_ok_end_idx ON {self.state_table}(last_ok_end);")
-        log.info("Проверка таблицы состояния: OK (%s)", self.state_table)
+            if relkind is None:
+                # Родительской таблицы ещё нет — создаём и сразу нужный индекс
+                _exec(f"""
+                CREATE TABLE {self.table} (
+                    id            BIGINT GENERATED BY DEFAULT AS IDENTITY,
+                    process_name  TEXT        NOT NULL,
+                    ts_start      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    ts_end        TIMESTAMPTZ NULL,
+                    status        TEXT        NOT NULL CHECK (status IN ('planned','running','ok','error','skipped')),
+                    details       JSONB       NULL,
+                    host          TEXT        NULL,
+                    pid           INTEGER     NULL
+                ) PARTITION BY RANGE (ts_start);
+                """)
+                _exec(f"""
+                CREATE INDEX IF NOT EXISTS {self._tail_table}_pname_started_desc_idx
+                  ON {self.table} (process_name, ts_start DESC);
+                """)
+                log.info("Проверка таблицы журнала: OK (partitioned, %s)", self.table)
+                # Кешируем тип, чтобы ниже не делать повторные проверки
+                self._relkind_cache = "p"
+
+                # Дочерние партиции и ретенция — отдельными вызовами (они сами используют единый commit)
+                self._ensure_partitions_around_now()
+                self._auto_prune_if_due()
+
+            elif relkind == "p":
+                # Таблица уже партиционированная — убеждаемся, что есть нужный индекс
+                log.info("Проверка таблицы журнала: OK (partitioned, %s)", self.table)
+                self._relkind_cache = "p"
+                _exec(f"""
+                CREATE INDEX IF NOT EXISTS {self._tail_table}_pname_started_desc_idx
+                  ON {self.table} (process_name, ts_start DESC);
+                """)
+                self._ensure_partitions_around_now()
+                self._auto_prune_if_due()
+
+            else:
+                # Если открыли курсор — аккуратно закроем его перед исключением
+                raise RuntimeError(
+                    f"Журнал {self.table} непартиционирован (relkind={relkind}). "
+                    "Требуется миграция на PARTITION BY RANGE(ts_start)."
+                )
+
+            # STATE — создаём/добавляем индексы тем же курсором
+            _exec(f"""
+            CREATE TABLE IF NOT EXISTS {self.state_table} (
+                process_name          TEXT PRIMARY KEY,
+                last_status           TEXT,
+                healthy               BOOLEAN,
+                last_ok_end           TIMESTAMPTZ,
+                last_started_at       TIMESTAMPTZ,
+                last_heartbeat        TIMESTAMPTZ,
+                last_error_at         TIMESTAMPTZ,
+                last_error_component  TEXT,
+                last_error_message    TEXT,
+                progress              JSONB,
+                extra                 JSONB,
+                updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """)
+            _exec(f"CREATE INDEX IF NOT EXISTS {self._tail_state_table}_updated_at_idx ON {self.state_table}(updated_at DESC);")
+            _exec(f"CREATE INDEX IF NOT EXISTS {self._tail_state_table}_last_ok_end_idx ON {self.state_table}(last_ok_end);")
+            log.info("Проверка таблицы состояния: OK (%s)", self.state_table)
+
+        finally:
+            # Закрываем курсор, если создавали, и фиксируем все DDL одним коммитом (best‑effort)
+            try:
+                if cur is not None:
+                    cur.close()
+            except Exception:
+                pass
+            self._commit_quietly()
     def _state_upsert(
         self,
         *,
@@ -693,7 +785,8 @@ class ProcessJournal:
 
     def try_acquire_exclusive_lock(self) -> bool:
         self.pg.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (self.process_name,))
-        got = bool(self.pg.fetchone()[0])
+        _row_lock = self.pg.fetchone()
+        got = bool(_row_lock[0]) if _row_lock else False  # fetchone() может вернуть None
         self._lock_acquired = got
         return got
 
@@ -735,7 +828,11 @@ class ProcessJournal:
                 f"INSERT INTO {self.table} (process_name, status, details) VALUES (%s, 'planned', %s::jsonb) RETURNING id",
                 (self.process_name, Json(payload)),
             )
-            rid = self.pg.fetchone()[0]
+            _row_new = self.pg.fetchone()
+            if _row_new is None:
+                # Нестандартно для INSERT ... RETURNING, но явно защищаемся для статической типизации
+                raise RuntimeError("INSERT ... RETURNING id не вернул строку с id")
+            rid = int(_row_new[0])
             log.info("Запланирован запуск %s: id=%s [%s → %s]", self.process_name, rid, sf, st)
             self._commit_quietly()
             return rid
@@ -865,7 +962,12 @@ class ProcessJournal:
                 return rid
             raise
 
-        rid = self.pg.fetchone()[0]
+        # Безопасно извлекаем результат fetchone() с защитой от None
+        _row_run_new = self.pg.fetchone()
+        if _row_run_new is None:
+            # INSERT ... RETURNING должен вернуть строку; защита от None для статического анализатора
+            raise RuntimeError("INSERT ... RETURNING id не вернул строку с id")
+        rid = int(_row_run_new[0])
         log.info("running (new): id=%s [%s → %s]", rid, sf, st)
         self._current_run_id = rid
         try:
@@ -1139,7 +1241,7 @@ class ProcessJournal:
                 status='error',
                 healthy=False,
                 last_error_at=datetime.now(timezone.utc),
-                last_error_component=component or 'etl',
+                last_error_component=component or self.process_name,
                 last_error_message=str(message),
                 extra={},
             )
@@ -1185,7 +1287,8 @@ class ProcessJournal:
 
             # Глобальная защита от гонок
             self.pg.execute("SELECT pg_try_advisory_lock(hashtext(%s))", ("journal_prune_global",))
-            got = bool(self.pg.fetchone()[0])
+            _row_lock2 = self.pg.fetchone()
+            got = bool(_row_lock2[0]) if _row_lock2 else False  # безопасно для pyright/pylance
             if not got:
                 return
             try:

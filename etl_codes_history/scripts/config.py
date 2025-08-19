@@ -135,9 +135,7 @@ class Settings:
     HBASE_MAIN_TABLE: str = os.getenv("HBASE_MAIN_TABLE", "TBL_JTI_TRACE_CIS_HISTORY")
     HBASE_MAIN_TS_COLUMN: str = os.getenv("HBASE_MAIN_TS_COLUMN", "opd")
     PHX_FETCHMANY_SIZE: int = int(os.getenv("PHX_FETCHMANY_SIZE", "20000"))
-    PHX_TS_UNITS: str = os.getenv("PHX_TS_UNITS", "timestamp")  # "timestamp" or "millis"
     PHX_QUERY_OVERLAP_MINUTES: int = int(os.getenv("PHX_QUERY_OVERLAP_MINUTES", "5"))
-    PHX_OVERLAP_ONLY_FIRST_SLICE: int = int(os.getenv("PHX_OVERLAP_ONLY_FIRST_SLICE", "1"))
 
     # --- ClickHouse sink ---
     CH_HOSTS: str = os.getenv("CH_HOSTS", "127.0.0.1")

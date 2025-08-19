@@ -31,8 +31,8 @@ import os
 import socket
 from typing import Any, Iterable, Optional, Tuple
 
-import psycopg
-from psycopg import OperationalError
+import psycopg  # type: ignore
+from psycopg import OperationalError  # type: ignore
 
 try:  # удобный парсер DSN из psycopg3; если нет, упадём на urlparse
     from psycopg.conninfo import conninfo_to_dict  # type: ignore
@@ -98,7 +98,15 @@ class PGClient:
     - **дружественные ошибки коннекта** + аккуратное закрытие.
     """
 
+    # Явные атрибуты соединения/курсора для статического анализа
+    conn: Any | None = None
+    cur: Any | None = None
+
     def __init__(self, dsn: str, autocommit: bool = True):
+        # Атрибуты по умолчанию (важно для корректной работы статического анализатора)
+        self.conn = None
+        self.cur = None
+
         host, port, dbname = _dsn_info(dsn)
 
         # 1) Опциональный быстрый отказ, чтобы не ждать общий connect_timeout
@@ -117,8 +125,11 @@ class PGClient:
 
         # 2) Основной connect с ловлей OperationalError и формированием читаемого текста
         try:
-            self.conn = psycopg.connect(dsn, autocommit=autocommit)
-            self.cur = self.conn.cursor()
+            # Локальные переменные помогают статическому анализатору понять, что объекты не None
+            conn = psycopg.connect(dsn, autocommit=autocommit)
+            cur = conn.cursor()
+            self.conn = conn
+            self.cur = cur
             log.info(
                 "PostgreSQL подключен (host=%s port=%s db=%s)",
                 host,
@@ -144,35 +155,47 @@ class PGClient:
     # но в некоторых местах мы явно оборачиваем в journal.py для наглядности.
 
     def execute(self, sql: str, params: Optional[Iterable[Any]] = None) -> None:
-        self.cur.execute(sql, params or ())
+        """Выполнить произвольный SQL одной командой курсора.
+        Поддерживается несколько выражений, разделённых `;` — PostgreSQL и psycopg3
+        исполняют их последовательно в рамках одного `execute()`. Методы `fetch*`
+        относятся к РЕЗУЛЬТАТУ ПОСЛЕДНЕГО `SELECT` в пакете.
+        """
+        c = self.cur
+        if c is None:
+            raise RuntimeError("Курсор PostgreSQL закрыт — соединение уже завершено")
+        c.execute(sql, params or ())
 
     def fetchone(self) -> Optional[Tuple[Any, ...]]:
-        return self.cur.fetchone()
+        c = self.cur
+        if c is None:
+            raise RuntimeError("Курсор PostgreSQL закрыт — нечего читать")
+        return c.fetchone()
 
     def fetchall(self) -> list[Tuple[Any, ...]]:
-        return self.cur.fetchall() or []
+        c = self.cur
+        if c is None:
+            raise RuntimeError("Курсор PostgreSQL закрыт — нечего читать")
+        rows = c.fetchall()
+        return rows or []
 
     def close(self) -> None:
         """Безопасно закрываем курсор и соединение, игнорируя ошибки в финализаторах."""
+        cur = self.cur
+        conn = self.conn
         try:
-            try:
-                if getattr(self, "cur", None) is not None:
-                    self.cur.close()
-            finally:
-                if getattr(self, "conn", None) is not None:
-                    self.conn.close()
-        except Exception:
-            # ничего страшного: закрытие может падать при разрыве сети — это штатно
-            pass
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         finally:
-            try:
-                self.cur = None  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            try:
-                self.conn = None  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            self.cur = None
+            self.conn = None
 
     def __del__(self):  # на случай GC/аварийного пути
         try:

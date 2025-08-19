@@ -52,9 +52,9 @@ import random
 import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from clickhouse_driver import Client as NativeClient
+from clickhouse_driver import Client as NativeClient  # type: ignore[reportMissingImports]
 import re
-from clickhouse_driver import errors as ch_errors
+from clickhouse_driver import errors as ch_errors  # type: ignore[reportMissingImports]
 
 
 # Хелпер для безопасного SQL-литерала (ClickHouse)
@@ -212,6 +212,16 @@ class ClickHouseClient:
             # best-effort: не мешаем основному потоку
             pass
 
+    def _cli(self) -> NativeClient:
+        """
+        Возвращает активный клиент ClickHouse.
+        Нужен для того, чтобы явным образом показать анализатору типов, что self.client не None.
+        """
+        c = self.client
+        if c is None:
+            raise RuntimeError("ClickHouse client не инициализирован.")
+        return c
+
     def _execute_once(
         self,
         sql: str,
@@ -229,16 +239,11 @@ class ClickHouseClient:
         exec_settings = settings or {}
         if not is_insert:
             self._clear_force_insert()
-            # ВАЖНО: если params пустой — НЕ передавать его, чтобы драйвер не переключился на insert-ветку
-            if params is None or (isinstance(params, (list, tuple)) and len(params) == 0):
-                return self.client.execute(sql, settings=exec_settings)
-            else:
-                return self.client.execute(sql, params=params, settings=exec_settings)
-        else:
-            if params is None or (isinstance(params, (list, tuple)) and len(params) == 0):
-                return self.client.execute(sql, settings=exec_settings)
-            else:
-                return self.client.execute(sql, params=params, settings=exec_settings)
+
+        # ВАЖНО: если params пустой — вообще не передавать его, чтобы драйвер не переключился на ветку вставки
+        if params is None or (isinstance(params, (list, tuple)) and len(params) == 0):
+            return self._cli().execute(sql, settings=exec_settings)
+        return self._cli().execute(sql, params=params, settings=exec_settings)
 
     def _execute_with_retry(
         self,
@@ -248,7 +253,7 @@ class ClickHouseClient:
     ):
         """
         Выполнение запроса с одним авто‑повтором на `UnexpectedPacketFromServerError`:
-          1) пробуем `\_execute_once`;
+          1) пробуем _execute_once;
           2) при исключении — логируем предупреждение, делаем `reconnect()` и повторяем ещё раз.
         Полезно после крупных INSERT или при обрыве соединения сервером.
         """
@@ -325,7 +330,7 @@ class ClickHouseClient:
             temp: Optional[NativeClient] = None
             host_map: Dict[str, bool] = {}
             try:
-                temp = NativeClient(
+                temp_cli = NativeClient(
                     host=host,
                     port=self.port,
                     user=self.user,
@@ -337,11 +342,12 @@ class ClickHouseClient:
                     compression=self.compression,
                     settings=self.settings,
                 )
-                temp.execute("SELECT 1")
+                temp = temp_cli
+                temp_cli.execute("SELECT 1")
                 for t in tables:
                     fqn = t if "." in t else f"{database}.{t}"
                     try:
-                        val = temp.execute(f"EXISTS TABLE {fqn}")
+                        val = temp_cli.execute(f"EXISTS TABLE {fqn}")
                         ok = bool(val and val[0][0])
                     except Exception as e:
                         log.warning("EXISTS TABLE %s@%s: ошибка: %s", fqn, host, e)
@@ -354,7 +360,7 @@ class ClickHouseClient:
                     host_map[fqn] = False
             finally:
                 try:
-                    if temp:
+                    if temp is not None:
                         temp.disconnect()
                 except Exception:
                     pass
@@ -371,7 +377,7 @@ class ClickHouseClient:
                 self.client.disconnect()
         except Exception:
             pass
-        self.client = NativeClient(
+        cli = NativeClient(
             host=host,
             port=self.port,
             user=self.user,
@@ -383,7 +389,8 @@ class ClickHouseClient:
             compression=self.compression,
             settings=self.settings,
         )
-        self.client.execute("SELECT 1")
+        cli.execute("SELECT 1")
+        self.client = cli
         self.current_host = host
         log.info("Переключился на ClickHouse %s:%d, db=%s", host, self.port, self.db)
 
@@ -449,7 +456,7 @@ class ClickHouseClient:
         random.shuffle(hosts)
         for host in hosts:
             try:
-                self.client = NativeClient(
+                cli = NativeClient(
                     host=host,
                     port=self.port,
                     user=self.user,
@@ -461,7 +468,8 @@ class ClickHouseClient:
                     compression=self.compression,
                     settings=self.settings,
                 )
-                self.client.execute("SELECT 1")
+                cli.execute("SELECT 1")
+                self.client = cli
                 self.current_host = host
                 log.info("Подключен к ClickHouse (native) %s:%d, db=%s", host, self.port, self.db)
                 return
@@ -558,7 +566,7 @@ class ClickHouseClient:
             attempt = 0
             while True:
                 try:
-                    self.client.execute(sql, chunk, types_check=True)
+                    self._cli().execute(sql, chunk, types_check=True)
                     total += len(chunk)
                     break
                 except Exception as e:

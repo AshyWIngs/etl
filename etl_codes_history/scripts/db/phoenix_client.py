@@ -33,9 +33,16 @@ PhoenixClient — лёгкая обёртка над `phoenixdb` для чтен
   0 или отсутствие переменной — проверка отключена.
 """
 import logging
-from typing import Dict, Iterator, List
+from typing import Dict, Iterator, List, Any, Optional
 from datetime import datetime
-import phoenixdb
+
+# Динамический импорт phoenixdb: снимаем предупреждение Pylance в IDE,
+# при настоящем запуске пакет всё равно должен быть установлен.
+try:
+    import importlib
+    phoenixdb = importlib.import_module("phoenixdb")  # type: ignore[import-not-found]
+except Exception:
+    phoenixdb = None  # type: ignore[assignment]
 
 import os
 import socket
@@ -46,7 +53,8 @@ from urllib.parse import urlparse
 # "Exception ignored in: ... Connection.__del__" при недоступном PQS. Чтобы не плодить
 # портянки в логах, аккуратно перехватываем исключения в финализаторе.
 try:
-    import phoenixdb.connection as _phx_conn_mod  # type: ignore
+    import importlib
+    _phx_conn_mod = importlib.import_module("phoenixdb.connection")  # type: ignore[import-not-found]
     _orig_del = getattr(_phx_conn_mod.Connection, "__del__", None)
     if callable(_orig_del):
         def _quiet_del(self):  # type: ignore
@@ -89,6 +97,9 @@ class PhoenixClient:
     - постранично читать инкремент за интервал [from; to).
     """
 
+    conn: Optional[Any] = None
+    cur: Optional[Any] = None
+
     def __init__(self, pqs_url: str, fetchmany_size: int = 5000, ts_units: str = "timestamp"):
         """
         Инициализация клиента Phoenix PQS.
@@ -116,6 +127,11 @@ class PhoenixClient:
                 # Приводим к нашему типу исключения
                 log.critical("FATAL: %s", probe_err)
                 raise PhoenixConnectionError(str(probe_err))
+
+        if phoenixdb is None:
+            msg = "Библиотека 'phoenixdb' не установлена в активном окружении"
+            log.critical("FATAL: %s", msg)
+            raise PhoenixConnectionError(msg)
 
         serialization_used = "protobuf"
         try:
@@ -150,11 +166,16 @@ class PhoenixClient:
         # Присваиваем только после успешного коннекта
         self.conn = conn
 
-        self.cur = self.conn.cursor()
+        # Локальная ссылка + assert для узкого типа: подсказка анализатору, что объект не None
+        conn_local = self.conn
+        assert conn_local is not None
+        self.cur = conn_local.cursor()
         self.fetchmany_size = int(fetchmany_size)
         self.ts_units = ts_units
-        # Подсказка драйверу о размере кадров
-        self.cur.arraysize = self.fetchmany_size
+        # Подсказка драйверу о размере кадров, строго по отступам
+        cur_local = self.cur
+        if cur_local is not None:
+            cur_local.arraysize = self.fetchmany_size
         self._serialization = serialization_used
         log.info("Phoenix PQS подключен (%s), paramstyle=qmark, serialization=%s", pqs_url, serialization_used)
 
@@ -188,12 +209,23 @@ class PhoenixClient:
         except Exception:
             pass
 
+    def _cur(self):
+        """
+        Возвращает активный курсор; если клиент закрыт — кидает RuntimeError.
+        Нужен для того, чтобы статический анализ понимал, что дальше объект не None.
+        """
+        cur = getattr(self, "cur", None)
+        if cur is None:
+            raise RuntimeError("Клиент Phoenix закрыт: курсор недоступен")
+        return cur
+
     def discover_columns(self, table: str) -> List[str]:
         """
         SELECT * LIMIT 0 → имена колонок как в описании таблицы.
         """
-        self.cur.execute(f'SELECT * FROM "{table}" LIMIT 0')
-        return [d[0] for d in (self.cur.description or [])]
+        cur = self._cur()
+        cur.execute(f'SELECT * FROM "{table}" LIMIT 0')
+        return [d[0] for d in (cur.description or [])]
 
     def fetch_increment(
         self,
@@ -220,13 +252,26 @@ class PhoenixClient:
             from_dt.isoformat(), to_dt.isoformat(),
             self.ts_units, self.fetchmany_size
         )
-        self.cur.execute(sql, (from_dt, to_dt))
+        cur = self._cur()
+        cur.execute(sql, (from_dt, to_dt))
+
+        # Имена колонок в рамках одного запроса неизменны — вычисляем один раз.
+        # Некоторые версии драйвера могут отложенно заполнять description,
+        # поэтому допускаем отложенное вычисление при первой выборке.
+        names: Optional[List[str]] = [d[0] for d in (cur.description or [])] or None
+
+        # Локальные ссылки на builtins/переменные — дешёвая микрооптимизация,
+        # убирает глобальные поиска имён внутри горячего цикла.
+        dict_ = dict
+        zip_ = zip
+        size = self.fetchmany_size
 
         while True:
-            rows = self.cur.fetchmany(self.fetchmany_size)
+            rows = cur.fetchmany(size)
             if not rows:
                 break
-            # описание курсора → имена колонок, порядок = как в SELECT
-            names = [d[0] for d in (self.cur.description or [])]
-            out = [dict(zip(names, r)) for r in rows]
+            if names is None:
+                names = [d[0] for d in (cur.description or [])]
+            n = names  # локальная ссылка для list comprehension ниже
+            out = [dict_(zip_(n, r)) for r in rows]
             yield out

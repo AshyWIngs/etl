@@ -10,17 +10,20 @@ Incremental ETL: Phoenix(HBase) → ClickHouse (native 9000, с компресс
 • Поля переносим «как есть» (без вычислений id/md5, без sys-атрибутов).
 • Дедуп на публикации по ключу (c, t, opd) через argMax(..., ingested_at).
 • Окно запроса в Phoenix совпадает с бизнес-окном слайса; при желании можно добавить
-  только «захлёст» назад PHX_QUERY_OVERLAP_MINUTES на первом (или каждом) слайсе.
+  «захлёст» назад PHX_QUERY_OVERLAP_MINUTES только на первом слайсе.
   Правую границу не «замораживаем».
 • DateTime64(3) передаём как python datetime (naive), микросекунды обрезаем до миллисекунд.
+• Столбец `ingested_at` в ClickHouse не передаём в INSERT — он заполняется `DEFAULT now('UTC')`.
+  Это устраняет несоответствие числа колонок и не влияет на дедуп (агрегация идёт по `ingested_at` в RAW).
 • Никаких CSV — сразу INSERT в ClickHouse (native, compression).
 
 Каденс публикаций
 -----------------
 • Публикация управляется ТОЛЬКО числом успешных слайсов: PUBLISH_EVERY_SLICES.
 • В конце запуска всегда выполняется финальная публикация (ALWAYS_PUBLISH_AT_END зафиксирован).
-• Для защиты от «пустых» публикаций действует лёгкий гейтинг:
-  PUBLISH_ONLY_IF_NEW=1 и порог PUBLISH_MIN_NEW_ROWS (по count() в RAW на партицию).
+• Для защиты от «пустых» публикаций действует лёгкий гейтинг: считаем «новые» строки в памяти
+  по каждой партиции в рамках текущего запуска и публикуем партицию только если новых строк
+  ≥ PUBLISH_MIN_NEW_ROWS (когда PUBLISH_ONLY_IF_NEW=1). В manual-режиме гейтинг отключён.
 
 Как это работает
 ----------------
@@ -59,12 +62,16 @@ import os
 import json
 import socket
 import signal
-import inspect
 from collections import defaultdict
 from threading import Event
-from psycopg.errors import UniqueViolation
+try:
+    from psycopg.errors import UniqueViolation  # type: ignore[reportMissingImports]
+except Exception:  # pragma: no cover - editor/type-checker fallback
+    class UniqueViolation(Exception):  # type: ignore[misc]
+        """Запасной класс-стаб для psycopg UniqueViolation, когда типовые заглушки недоступны в редакторе."""
+        pass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Tuple, Iterable, Optional, Set
+from typing import Any, Dict, List, Tuple, Iterable, Optional, Set, cast
 from zoneinfo import ZoneInfo
 
 from .logging_setup import setup_logging
@@ -74,9 +81,9 @@ from .db.phoenix_client import PhoenixClient
 from .db.pg_client import PGClient, PGConnectionError
 from .db.clickhouse_client import ClickHouseClient as CHClient
 from .journal import ProcessJournal
-from clickhouse_driver import errors as ch_errors
 from time import perf_counter
 from functools import lru_cache
+from urllib.parse import urlparse
 
 log = logging.getLogger("codes_history_increment")
 
@@ -110,8 +117,34 @@ def _log_maybe_trace(level: int, msg: str, *, exc: Optional[BaseException] = Non
         log.log(level, msg, exc_info=True)
     else:
         if exc is not None:
-            msg = msg + " (stack suppressed; set ETL_TRACE_EXC=1 или --log-level=DEBUG для traceback)"
+            msg = msg + " (стек скрыт; установите ETL_TRACE_EXC=1 или запустите с --log-level=DEBUG, чтобы напечатать трейсбек)"
         log.log(level, msg)
+
+
+# --- Вспомогательный метод для снижения шума логов при INFO ---
+def _reduce_noise_for_info_mode() -> None:
+    """При уровне INFO приглушаем «болтливые» под-логгеры, чтобы логи были чище.
+    Ничего не меняем, если включён DEBUG (для полноценной диагностики).
+    """
+    try:
+        # Смотрим именно на наш основной логгер, а не на root
+        main_logger = logging.getLogger("codes_history_increment")
+        if main_logger.isEnabledFor(logging.DEBUG):
+            return
+        # В INFO режиме прячем подробные SQL и частые статусы планировщика
+        for name in (
+            "scripts.db.phoenix_client",   # Phoenix SQL и параметры
+            "phoenixdb",                   # внутренние сообщения драйвера
+            "urllib3.connectionpool",      # лишние HTTP-диагностики (если PQS/HTTP)
+            "scripts.journal",             # planned→running и т.п.
+        ):
+            try:
+                logging.getLogger(name).setLevel(logging.WARNING)
+            except Exception:
+                pass
+    except Exception:
+        # Не даём диагностике сломать запуск
+        pass
 
 # Грейсфул-остановка по сигналам ОС (SIGTERM/SIGINT/...)
 shutdown_event = Event()
@@ -142,14 +175,16 @@ def _install_signal_handlers() -> None:
 def _interrupt_message() -> str:
     """Единое текстовое сообщение для журналирования отмены по сигналу/пользователю."""
     if shutdown_event.is_set() and _shutdown_reason != "SIGINT":
-        return f"Interrupted by signal ({_shutdown_reason})"
-    return "Interrupted by user (SIGINT)"
+        return f"Остановлено сигналом ({_shutdown_reason})"
+    return "Остановлено пользователем (SIGINT)"
 
 def _check_stop() -> None:
     if shutdown_event.is_set():
         raise KeyboardInterrupt()
 
-# Порядок колонок должен 1-в-1 совпадать с DDL stg.daily_codes_history
+# Порядок колонок соответствует физическим входным полям источника
+# (без алиасов/материализованных полей и БЕЗ ingested_at).
+# В ClickHouse `ingested_at` выставляется по DEFAULT now('UTC'), поэтому мы его не передаём.
 # Tuple вместо list — неизменяемая константа (меньше аллокаций и защита от случайной модификации).
 CH_COLUMNS = (
     "c","t","opd",
@@ -164,7 +199,8 @@ CH_COLUMNS = (
     "pvad","ag"
 )
 CH_COLUMNS_STR = ", ".join(CH_COLUMNS)
-# Предвычисления для дедупа (ускоряет и упрощает код публикации)
+# Предвычисления для дедупа (ускоряет и упрощает код публикации).
+# Агрегируем argMax(..., ingested_at) по данным из RAW.
 NON_KEY_COLS = [c for c in CH_COLUMNS if c not in ("c", "t", "opd")]
 DEDUP_AGG_EXPRS = ",\n              ".join([f"argMax({c}, ingested_at) AS {c}" for c in NON_KEY_COLS])
 DEDUP_SELECT_COLS = "c, t, opd,\n              " + DEDUP_AGG_EXPRS
@@ -328,7 +364,7 @@ def _get_tz(tz_name: str) -> ZoneInfo:
     try:
         return ZoneInfo(tz_name)
     except Exception:
-        log.warning("Unknown TZ='%s', falling back to UTC", tz_name)
+        log.warning("Неизвестная таймзона '%s' — использую UTC", tz_name)
         return ZoneInfo("UTC")
 
 
@@ -390,7 +426,7 @@ def _iter_phx_batches(phx: PhoenixClient, cfg: Settings, from_utc: datetime, to_
     if not table or not ts_col:
         raise TypeError("HBASE_MAIN_TABLE/HBASE_MAIN_TS_COLUMN не заданы в конфиге")
 
-    cols = list(CH_COLUMNS)
+    cols: List[str] = [str(c) for c in CH_COLUMNS]
 
     # Приводим к naive UTC (tzinfo=None)
     f_naive = from_utc.replace(tzinfo=None) if from_utc.tzinfo is not None else from_utc
@@ -414,6 +450,7 @@ def main():
     args = parser.parse_args()
 
     setup_logging(args.log_level)
+    _reduce_noise_for_info_mode()
     cfg = Settings()
     _install_signal_handlers()
 
@@ -422,10 +459,8 @@ def main():
     manual_mode = bool(args.manual_start)
 
     if manual_mode:
-        # В ручном режиме:
-        #  • отключаем гейтинг по «новизне» (публиковать можно сразу),
-        #  • включаем backfill пропущенных дней, но только в финале запуска.
-        publish_only_if_new = False
+        # В ручном режиме включаем backfill пропущенных дней (только в финале запуска).
+        # Гейтинг публикации отключается ниже через publish_only_if_new = ... and (not manual_mode).
         backfill_missing_enabled = True
     else:
         backfill_missing_enabled = False
@@ -438,7 +473,7 @@ def main():
         _log_maybe_trace(logging.CRITICAL, f"FATAL: unexpected error during postgres init: {e.__class__.__name__}: {e}", exc=e, cfg=cfg)
         raise SystemExit(2)
 
-    journal = ProcessJournal(pg, cfg.JOURNAL_TABLE, process_name)
+    journal = ProcessJournal(cast(Any, pg), cfg.JOURNAL_TABLE, process_name)  # Приведение типов для Pylance: наш PGClient совместим по факту
     journal.ensure()
 
     # Безопасно создаём/обновляем строку состояния процесса (если поддерживается журналом).
@@ -458,13 +493,19 @@ def main():
     business_tz_name = business_tz_raw or "UTC"
     input_tz_mode = "business" if business_tz_raw else "utc"
     # since: если не задан, используем watermark (он уже в UTC)
-    since_dt = _parse_cli_dt(args.since, input_tz_mode, business_tz_name) if args.since else journal.get_watermark() or None
+    since_dt = _parse_cli_dt(args.since, input_tz_mode, business_tz_name) if args.since else (getattr(journal, "get_watermark", lambda: None)() or None)
     if since_dt is None:
         raise SystemExit("Не задан --since и нет watermark в журнале")
     # until всегда обязателен, разбираем согласно режиму
     until_dt = _parse_cli_dt(args.until, input_tz_mode, business_tz_name)
+    if until_dt is None:
+        raise SystemExit("Не задан --until или не удалось разобрать дату/время")
+    # На этом этапе since_dt уже проверен выше (если None — мы бы завершились)
     if until_dt <= since_dt:
         raise SystemExit(f"Некорректное окно: since({since_dt.isoformat()}) >= until({until_dt.isoformat()})")
+    # Узкие assert'ы для type checker (Pylance): ниже обе даты гарантированно не None
+    assert isinstance(since_dt, datetime)
+    assert isinstance(until_dt, datetime)
 
     step_min = int(getattr(cfg, "STEP_MIN", 60))
     # Отдельный сдвиг к Phoenix больше не используем: окно запроса = бизнес-окну
@@ -477,24 +518,37 @@ def main():
         msg = f"{component} connect/init failed: {exc}"
         _log_maybe_trace(logging.ERROR, f"Стартовая ошибка компонента {component}: {msg}", exc=exc, cfg=cfg)
         try:
-            journal.mark_startup_error(
-                msg,
-                component=component,
-                since=since_dt,
-                until=until_dt,
-                host=socket.gethostname(),
-                pid=os.getpid(),
-                extra=extra or {}
-            )
+            _mark_startup_error = getattr(journal, "mark_startup_error", None)
+            if callable(_mark_startup_error):
+                _mark_startup_error(
+                    msg,
+                    component=component,
+                    since=since_dt,
+                    until=until_dt,
+                    host=socket.gethostname(),
+                    pid=os.getpid(),
+                    extra=extra or {}
+                )
         except Exception:
             pass
         raise SystemExit(2)
 
     # ---- КОННЕКТЫ ----
+    phx: Optional[PhoenixClient] = None
+    ch: Optional[CHClient] = None
     try:
-        phx = PhoenixClient(cfg.PQS_URL, fetchmany_size=cfg.PHX_FETCHMANY_SIZE, ts_units=cfg.PHX_TS_UNITS)
+        phx = PhoenixClient(cfg.PQS_URL, fetchmany_size=cfg.PHX_FETCHMANY_SIZE, ts_units='timestamp')  # ts_units зафиксирован: 'timestamp'
     except Exception as e:
         _startup_fail("phoenix", e, extra={"url": cfg.PQS_URL})
+
+    try:
+        _u = urlparse(cfg.PQS_URL)
+        _host = _u.hostname or cfg.PQS_URL
+        _port = f":{_u.port}" if _u.port else ""
+        log.info("Phoenix(PQS) подключён (%s%s)", _host, _port)
+    except Exception:
+        # На случай нестандартного URL хотя бы сообщим, что клиент готов
+        log.info("Phoenix(PQS) клиент инициализирован")
 
     try:
         ch  = CHClient(
@@ -511,6 +565,10 @@ def main():
         log.info("ClickHouse: db=%s, cluster=%s, hosts=%s", cfg.CH_DB, getattr(cfg, "CH_CLUSTER", None), ",".join(cfg.ch_hosts_list()))
     except Exception:
         pass
+
+    # Static type-narrowing for editors/type-checkers: к этому моменту коннекты гарантированно установлены
+    assert phx is not None, "phoenix client not initialized"
+    assert ch is not None, "clickhouse client not initialized"
 
     host = socket.gethostname()
     pid = os.getpid()
@@ -549,8 +607,8 @@ def main():
         )
 
     phx_overlap_min = int(getattr(cfg, "PHX_QUERY_OVERLAP_MINUTES", 0) or 0)
-    overlap_only_first_slice = bool(int(getattr(cfg, "PHX_OVERLAP_ONLY_FIRST_SLICE", 1)))
-    overlap_delta_c = timedelta(minutes=phx_overlap_min) if phx_overlap_min > 0 else timedelta(0)
+    overlap_only_first_slice = True  # фиксированная политика: захлёст только на первом слайсе
+    overlap_delta = timedelta(minutes=phx_overlap_min) if phx_overlap_min > 0 else timedelta(0)
 
     publish_every_slices = int(getattr(cfg, "PUBLISH_EVERY_SLICES", 0) or 0)
     # Всегда делаем финальную публикацию — это «точка согласования».
@@ -562,7 +620,7 @@ def main():
     publish_only_if_new = bool(int(getattr(cfg, "PUBLISH_ONLY_IF_NEW", 1))) and (not manual_mode)
     publish_min_new_rows = int(getattr(cfg, "PUBLISH_MIN_NEW_ROWS", 1))
 
-    def _collect_missing_parts_between(start_dt: datetime, end_dt: datetime) -> Set[int]:
+    def _collect_missing_parts_between(ch: CHClient, start_dt: datetime, end_dt: datetime) -> Set[int]:
         """
         Лёгкий стартовый backfill только для manual-режима:
         возвращает набор партиций (UTC YYYYMMDD) из RAW, у которых в окне [start_dt; end_dt) есть строки.
@@ -584,7 +642,7 @@ def main():
             log.warning("Backfill: не удалось собрать партиции за окно: %s", ex)
             return set()
 
-    def _publish_parts(parts: Set[int], *, force: bool = False) -> bool:
+    def _publish_parts(ch: CHClient, parts: Set[int], *, force: bool = False) -> bool:
         """
         Дедуп/публикация набора партиций.
         Схема: DROP BUF → INSERT BUF (GROUP BY c,t,opd с argMax(..., ingested_at)) → REPLACE PARTITION → DROP BUF.
@@ -607,7 +665,7 @@ def main():
 
         # Отдельная запись в журнале для этапа дедупа/публикации
         try:
-            dedup_journal = ProcessJournal(pg, cfg.JOURNAL_TABLE, f"{process_name}:dedup")
+            dedup_journal = ProcessJournal(cast(Any, pg), cfg.JOURNAL_TABLE, f"{process_name}:dedup")  # Приведение типов для Pylance: PGClient реализует нужные методы на практике
             dedup_journal.ensure()
         except Exception:
             dedup_journal = None
@@ -630,7 +688,9 @@ def main():
                     pass
 
                 # 2) Дедупим в буфер
-                #    ВАЖНО: перечисляем колонки явно (без ingested_at) — для него сработает DEFAULT now('UTC').
+                #    ВАЖНО: перечисляем только «пользовательские» колонки (без ingested_at) —
+                #    для него сработает DEFAULT now('UTC'). Алиасы/материализованные колонки
+                #    (opd_local*, *_local и т.п.) ClickHouse заполнит автоматически.
                 insert_sql = (
                     f"INSERT INTO {ch_table_buf} ({CH_COLUMNS_STR}) "
                     f"SELECT {DEDUP_SELECT_COLS} "
@@ -669,19 +729,20 @@ def main():
 
         return published_any
 
-    def _maybe_publish_after_slice() -> None:
+    def _maybe_publish_after_slice(ch: CHClient) -> None:
         nonlocal slices_since_last_pub
         # Публикуем строго по числу успешных слайсов.
         if publish_every_slices > 0 and slices_since_last_pub >= publish_every_slices:
-            # Диагностика гейтинга: покажем счётчики «новизны» по всем pending-партициям
-            try:
-                _dbg_map = {str(p): int(_new_rows_since_pub_by_part.get(p, 0)) for p in sorted(pending_parts)}
-                log.debug("Гейтинг: pending_parts=%s; new_rows_by_part=%s; threshold=%d; slices=%d/%d",
-                          ",".join(str(p) for p in sorted(pending_parts)) or "-",
-                          json.dumps(_dbg_map, ensure_ascii=False),
-                          publish_min_new_rows, slices_since_last_pub, publish_every_slices)
-            except Exception:
-                pass
+            # Диагностика гейтинга (печатаем только когда реально включён DEBUG)
+            if log.isEnabledFor(logging.DEBUG):
+                try:
+                    _dbg_map = {str(p): int(_new_rows_since_pub_by_part.get(p, 0)) for p in sorted(pending_parts)}
+                    log.debug("Гейтинг: pending_parts=%s; new_rows_by_part=%s; threshold=%d; slices=%d/%d",
+                            ",".join(str(p) for p in sorted(pending_parts)) or "-",
+                            json.dumps(_dbg_map, ensure_ascii=False),
+                            publish_min_new_rows, slices_since_last_pub, publish_every_slices)
+                except Exception:
+                    pass
             # Если требуется «новизна», публикуем только те партиции,
             # по которым в рамках ТЕКУЩЕГО запуска реально есть новые строки.
             parts_to_publish = set(pending_parts)
@@ -689,15 +750,25 @@ def main():
                 parts_to_publish = {p for p in parts_to_publish if _new_rows_since_pub_by_part.get(p, 0) >= publish_min_new_rows}
 
             if parts_to_publish:
-                published = _publish_parts(parts_to_publish, force=not publish_only_if_new)
+                published = _publish_parts(ch, parts_to_publish, force=not publish_only_if_new)
                 if published:
+                    log.info("Промежуточная публикация: %d партиций.", len(parts_to_publish))
                     # Сбрасываем счётчики «новизны» и удаляем опубликованные партиции из pending.
                     for p in parts_to_publish:
                         _new_rows_since_pub_by_part[p] = 0
                         pending_parts.discard(p)
                     slices_since_last_pub = 0
                 else:
-                    log.debug("Промежуточная публикация пропущена: parts_to_publish=%s не прошли гейтинг.", ",".join(str(p) for p in sorted(parts_to_publish)))
+                    log.debug(
+                        "Промежуточная публикация пропущена: parts_to_publish=%s не прошли гейтинг.",
+                        ",".join(str(p) for p in sorted(parts_to_publish)),
+                    )
+            else:
+                # Порог новых строк не достигнут — фиксируем это на уровне INFO
+                log.info(
+                    "Промежуточная публикация отложена гейтингом (порог=%d, слайсы=%d/%d).",
+                    publish_min_new_rows, slices_since_last_pub, publish_every_slices,
+                )
 
     try:
         with journal.exclusive_lock() as got:
@@ -728,7 +799,7 @@ def main():
                 s_q_base = s
                 e_q_base = e
 
-                use_overlap = overlap_delta_c if (is_first_slice or not overlap_only_first_slice) else timedelta(0)
+                use_overlap = overlap_delta if (is_first_slice or not overlap_only_first_slice) else timedelta(0)
                 s_q = s_q_base - use_overlap if use_overlap > timedelta(0) else s_q_base
                 e_q = e_q_base  # без правого лага
                 # ВАЖНО: s_q/e_q — это именно UTC-aware времена бизнес-окна;
@@ -747,27 +818,32 @@ def main():
                              business_tz_name, _biz_offset_min)
                     logged_tz_context = True
 
-                # лог окна
-                if use_overlap > timedelta(0):
-                    log.info(
-                        "Слайс (бизнес): %s → %s | Phoenix: %s → %s | overlap=%d мин",
-                        s.isoformat(), e.isoformat(), s_q.isoformat(), e_q.isoformat(),
-                        int(use_overlap.total_seconds() // 60),
-                    )
-                else:
-                    log.info(
-                        "Слайс (бизнес): %s → %s | Phoenix: %s → %s",
-                        s.isoformat(), e.isoformat(), s_q.isoformat(), e_q.isoformat(),
-                    )
+                # лог окна (в INFO не шумим — подробности только в DEBUG)
+                if log.isEnabledFor(logging.DEBUG):
+                    if use_overlap > timedelta(0):
+                        log.debug(
+                            "Слайс (бизнес): %s → %s | Phoenix: %s → %s | overlap=%d мин",
+                            s.isoformat(), e.isoformat(), s_q.isoformat(), e_q.isoformat(),
+                            int(use_overlap.total_seconds() // 60),
+                        )
+                    else:
+                        log.debug(
+                            "Слайс (бизнес): %s → %s | Phoenix: %s → %s",
+                            s.isoformat(), e.isoformat(), s_q.isoformat(), e_q.isoformat(),
+                        )
 
                 try:
-                    journal.clear_conflicting_planned(s, e)
+                    _clear_planned = getattr(journal, "clear_conflicting_planned", None)
+                    if callable(_clear_planned):
+                        _clear_planned(s, e)
                 except Exception:
                     pass
                 try:
                     journal.mark_planned(s, e)
                 except UniqueViolation:
-                    journal.clear_conflicting_planned(s, e)
+                    _clear_planned = getattr(journal, "clear_conflicting_planned", None)
+                    if callable(_clear_planned):
+                        _clear_planned(s, e)
                     journal.mark_planned(s, e)
 
                 run_id = journal.mark_running(s, e, host=host, pid=pid)
@@ -846,22 +922,24 @@ def main():
                     # ВАЖНО: выполняем гейтинг/промежуточную публикацию ДО mark_done(),
                     # чтобы возможные ошибки корректно зафиксировались как error по текущему слайсу,
                     # а не «после завершения».
-                    _maybe_publish_after_slice()
+                    _maybe_publish_after_slice(ch)
 
                     journal.mark_done(s, e, rows_read=rows_read, rows_written=total_written_ch)
                     total_read += rows_read
 
-                    try:
-                        _pp = ",".join(str(p) for p in sorted(pending_parts)) or "-"
-                        log.info("Слайс завершён: rows_read=%d, rows_written_raw_total=%d, pending_parts=%s",
-                                 rows_read, total_written_ch, _pp)
-                    except Exception:
-                        pass
+                    # Строковое представление набора партиций для лаконичного лога
+                    _pp = ",".join(str(p) for p in sorted(pending_parts)) or "-"
+                    log.info(
+                        "Слайс завершён: %s → %s (PHX: %s → %s); rows_read=%d, rows_written_raw_total=%d, pending_parts=%s",
+                        s.isoformat(), e.isoformat(), s_q.isoformat(), e_q.isoformat(),
+                        rows_read, total_written_ch, _pp,
+                    )
 
                 except KeyboardInterrupt:
                     try:
-                        if hasattr(journal, "mark_cancelled"):
-                            journal.mark_cancelled(s, e, message=_interrupt_message())
+                        _mark_cancelled = getattr(journal, "mark_cancelled", None)
+                        if callable(_mark_cancelled):
+                            _mark_cancelled(s, e, message=_interrupt_message())
                         else:
                             journal.mark_error(s, e, message=_interrupt_message())
                     except Exception:
@@ -879,7 +957,7 @@ def main():
                 # Дополнительно захватим «пропущенные» дни за окно запуска, если это включено.
                 if backfill_missing_enabled:
                     try:
-                        missing_parts = _collect_missing_parts_between(since_dt, until_dt)
+                        missing_parts = _collect_missing_parts_between(ch, since_dt, until_dt)
                         for mp in (missing_parts or []):
                             pending_parts.add(mp)
                     except Exception as e:
@@ -889,7 +967,7 @@ def main():
                     log.info("Финальная публикация: %d партиций.", len(pending_parts))
                     # В финале публикуем без гейтинга — это «точка согласования».
                     _published_now = set(pending_parts)
-                    _publish_parts(_published_now, force=True)
+                    _publish_parts(ch, _published_now, force=True)
                     # Сбрасываем счётчик «новизны» по опубликованным партициям и чистим pending
                     for _p in _published_now:
                         _new_rows_since_pub_by_part[_p] = 0
@@ -902,11 +980,13 @@ def main():
 
     finally:
         try:
-            phx.close()
+            if phx is not None:
+                phx.close()
         except Exception:
             pass
         try:
-            ch.close()
+            if ch is not None:
+                ch.close()
         except Exception:
             pass
         try:
@@ -932,6 +1012,5 @@ if __name__ == "__main__":
         if want_trace:
             _log.exception(_msg)
         else:
-            _log.error(_msg + " (stack suppressed; set ETL_TRACE_EXC=1 или --log-level=DEBUG for traceback)")
+            _log.error(_msg + " (стек скрыт; установите ETL_TRACE_EXC=1 или запустите с --log-level=DEBUG, чтобы напечатать трейсбек)")
         raise SystemExit(1)
-    
