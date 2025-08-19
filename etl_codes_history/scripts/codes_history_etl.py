@@ -81,9 +81,10 @@ from .db.phoenix_client import PhoenixClient
 from .db.pg_client import PGClient, PGConnectionError
 from .db.clickhouse_client import ClickHouseClient as CHClient
 from .journal import ProcessJournal
-from time import perf_counter
+from time import perf_counter, sleep
 from functools import lru_cache
 from urllib.parse import urlparse
+import random
 
 log = logging.getLogger("codes_history_increment")
 
@@ -145,6 +146,17 @@ def _reduce_noise_for_info_mode() -> None:
     except Exception:
         # Не даём диагностике сломать запуск
         pass
+
+def _is_phx_overloaded(exc: BaseException) -> bool:
+    """Возвращает True, если ошибка похожа на перегрузку Phoenix JobManager/очереди задач.
+    Сигнатуры, на которые ориентируемся: RejectedExecutionException / JobManager ... rejected.
+    """
+    try:
+        s = f"{exc}"
+    except Exception:
+        return False
+    s_low = s.lower()
+    return ("rejectedexecutionexception" in s_low) or ("jobmanager" in s and "rejected" in s_low)
 
 # Грейсфул-остановка по сигналам ОС (SIGTERM/SIGINT/...)
 shutdown_event = Event()
@@ -918,50 +930,84 @@ def main():
                     s_q_phx = s_q.replace(tzinfo=None) if s_q.tzinfo else s_q
                     e_q_phx = e_q.replace(tzinfo=None) if e_q.tzinfo else e_q
 
-                    # Phoenix fetch loop
-                    for batch in _iter_phx_batches(phx, cfg, s_q_phx, e_q_phx):
-                        _check_stop()
-                        # Пустой батч возможен при редких глитчах на стороне PQS — не считаем его ошибкой.
-                        if not batch:
-                            nowp = perf_counter()
-                            if nowp >= _next_hb_deadline:
-                                try:
-                                    journal.heartbeat(run_id, progress={"rows_read": rows_read, "rows_written": total_written_ch})
-                                except Exception:
-                                    pass
-                                _next_hb_deadline = nowp + hb_interval_sec
-                            continue
-                        rows_read += len(batch)
-                        # Одним проходом: считаем «новую» дельту по партициям и формируем кортежи для INSERT
-                        for r in batch:
-                            p = _opd_to_part_utc(r.get("opd"))
-                            if p is not None:
-                                _new_rows_since_pub_by_part[p] += 1
-                            ch_rows.append(_row_to_ch_tuple(r))
-                        # Чанковая вставка в CH по порогу, чтобы не раздувать память на больших окнах
-                        if ch_batch > 0 and len(ch_rows) >= ch_batch:
-                            total_written_ch += ch.insert_rows(ch_table_raw_all, ch_rows, CH_COLUMNS)
-                            ch_rows.clear()
-                            # heartbeat по факту записи — фиксируем прогресс
-                            nowp = perf_counter()
-                            if nowp >= _next_hb_deadline:
-                                try:
-                                    journal.heartbeat(run_id, progress={"rows_read": rows_read, "rows_written": total_written_ch})
-                                except Exception:
-                                    pass
-                                _next_hb_deadline = nowp + hb_interval_sec
+                    # Чтение Phoenix с простым экспоненциальным ретраем на перегрузке JobManager
+                    max_attempts = 4  # фиксированно, без конфигурации: держим код простым
+                    attempt = 1
+                    while True:
+                        try:
+                            # Сбрасываем локальные счётчики для попытки
+                            rows_read = 0
+                            ch_rows = []
 
-                    # Финальный флаш оставшегося буфера + heartbeat
-                    if ch_rows:
-                        total_written_ch += ch.insert_rows(ch_table_raw_all, ch_rows, CH_COLUMNS)
-                        ch_rows.clear()
-                        nowp = perf_counter()
-                        if nowp >= _next_hb_deadline:
-                            try:
-                                journal.heartbeat(run_id, progress={"rows_read": rows_read, "rows_written": total_written_ch})
-                            except Exception:
-                                pass
-                            _next_hb_deadline = nowp + hb_interval_sec
+                            # Phoenix fetch loop
+                            for batch in _iter_phx_batches(phx, cfg, s_q_phx, e_q_phx):
+                                _check_stop()
+                                # Пустой батч возможен при редких глитчах на стороне PQS — не считаем его ошибкой.
+                                if not batch:
+                                    nowp = perf_counter()
+                                    if nowp >= _next_hb_deadline:
+                                        try:
+                                            journal.heartbeat(run_id, progress={"rows_read": rows_read, "rows_written": total_written_ch})
+                                        except Exception:
+                                            pass
+                                        _next_hb_deadline = nowp + hb_interval_sec
+                                    continue
+
+                                rows_read += len(batch)
+                                # Одним проходом: считаем «новую» дельту по партициям и формируем кортежи для INSERT
+                                for r in batch:
+                                    p = _opd_to_part_utc(r.get("opd"))
+                                    if p is not None:
+                                        _new_rows_since_pub_by_part[p] += 1
+                                    ch_rows.append(_row_to_ch_tuple(r))
+
+                                # Чанковая вставка в CH по порогу, чтобы не раздувать память на больших окнах
+                                if ch_batch > 0 and len(ch_rows) >= ch_batch:
+                                    total_written_ch += ch.insert_rows(ch_table_raw_all, ch_rows, CH_COLUMNS)
+                                    ch_rows.clear()
+                                    # heartbeat по факту записи — фиксируем прогресс
+                                    nowp = perf_counter()
+                                    if nowp >= _next_hb_deadline:
+                                        try:
+                                            journal.heartbeat(run_id, progress={"rows_read": rows_read, "rows_written": total_written_ch})
+                                        except Exception:
+                                            pass
+                                        _next_hb_deadline = nowp + hb_interval_sec
+
+                            # Финальный флаш оставшегося буфера + heartbeat
+                            if ch_rows:
+                                total_written_ch += ch.insert_rows(ch_table_raw_all, ch_rows, CH_COLUMNS)
+                                ch_rows.clear()
+                                nowp = perf_counter()
+                                if nowp >= _next_hb_deadline:
+                                    try:
+                                        journal.heartbeat(run_id, progress={"rows_read": rows_read, "rows_written": total_written_ch})
+                                    except Exception:
+                                        pass
+                                    _next_hb_deadline = nowp + hb_interval_sec
+
+                            # Успех — выходим из retry-цикла
+                            break
+
+                        except Exception as ex:
+                            # Если это перегрузка PQS/JobManager — делаем мягкий ретрай с экспоненциальной паузой
+                            if _is_phx_overloaded(ex) and attempt < max_attempts:
+                                # NB: если часть батчей уже была вставлена в RAW до ошибки, возможны дубли при повторе слайса.
+                                # Это допустимо: публикация (REPLACE PARTITION) в CLEAN идемпотентна и устранит дубли по argMax.
+                                backoff = (2.0 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.5)
+                                log.warning(
+                                    "Phoenix перегружен (JobManager queue). Повторю попытку %d/%d через %.1f с...",
+                                    attempt + 1, max_attempts, backoff,
+                                )
+                                try:
+                                    journal.heartbeat(run_id, progress={"retry": attempt, "last_error": str(ex)[:300]})
+                                except Exception:
+                                    pass
+                                sleep(backoff)
+                                attempt += 1
+                                continue
+                            # Иначе — отдаём ошибку наверх (будет mark_error на уровне обработчика слайса)
+                            raise
 
                     # накопим партиции текущего слайда — СТРОГО ПО UTC
                     for p in _iter_partitions_by_day_tz(s_q, e_q, "UTC"):
