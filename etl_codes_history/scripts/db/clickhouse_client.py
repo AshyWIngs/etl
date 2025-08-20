@@ -79,7 +79,6 @@ _INSERT_RE = re.compile(
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
 
-
 # Подавляет «портянки» от внутреннего логгера clickhouse-driver при неудачных попытках подключения
 def _configure_driver_logging() -> None:
     """

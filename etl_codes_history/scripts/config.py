@@ -134,7 +134,8 @@ class Settings:
     PQS_URL: str = os.getenv("PQS_URL", "http://127.0.0.1:8765")
     HBASE_MAIN_TABLE: str = os.getenv("HBASE_MAIN_TABLE", "TBL_JTI_TRACE_CIS_HISTORY")
     HBASE_MAIN_TS_COLUMN: str = os.getenv("HBASE_MAIN_TS_COLUMN", "opd")
-    PHX_FETCHMANY_SIZE: int = int(os.getenv("PHX_FETCHMANY_SIZE", "20000"))
+    # Backward compatibility: prefer PHX_FETCHMANY, fall back to old PHX_FETCHMANY_SIZE
+    PHX_FETCHMANY_SIZE: int = int(os.getenv("PHX_FETCHMANY", os.getenv("PHX_FETCHMANY_SIZE", "20000")))
     PHX_QUERY_OVERLAP_MINUTES: int = int(os.getenv("PHX_QUERY_OVERLAP_MINUTES", "5"))
 
     # --- ClickHouse sink ---
@@ -154,6 +155,8 @@ class Settings:
     CH_INSERT_BATCH: int = int(os.getenv("CH_INSERT_BATCH", "10000"))
 
     # --- ETL cadence / gating ---
+    # Окно по умолчанию для автозаполнения --until, когда флаг не указан.
+    RUN_WINDOW_HOURS: int = int(os.getenv("RUN_WINDOW_HOURS", "24"))
     STEP_MIN: int = int(os.getenv("STEP_MIN", "10"))
     PUBLISH_EVERY_SLICES: int = int(os.getenv("PUBLISH_EVERY_SLICES", "0"))
     PUBLISH_ONLY_IF_NEW: int = int(os.getenv("PUBLISH_ONLY_IF_NEW", "1"))
@@ -171,3 +174,79 @@ class Settings:
 
     def main_columns_list(self) -> List[str]:
         return [c.strip() for c in self.HBASE_MAIN_COLUMNS.split(",") if c.strip()]
+    
+# -------------------- Phoenix client config (centralized) --------------------
+# Этот блок даёт единый источник правды для настроек клиента Phoenix.
+# Всё читается из переменных окружения (.env) и доступно из кода через
+# get_phoenix_config(). Здесь также обеспечена обратная совместимость по именам
+# переменных окружения (PHX_FETCHMANY vs PHX_FETCHMANY_SIZE).
+
+from dataclasses import dataclass as _dataclass
+import os as _os
+
+def _env_int(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    """
+    Безопасное чтение целого из окружения с опциональным ограничением снизу/сверху.
+    - Пустые и некорректные значения заменяются на default.
+    - Если указаны границы, значение зажимается в [min_value, max_value].
+    """
+    try:
+        v = int(_os.getenv(name, str(default)) or default)
+    except Exception:
+        v = default
+    if min_value is not None and v < min_value:
+        v = min_value
+    if max_value is not None and v > max_value:
+        v = max_value
+    return v
+
+@_dataclass(frozen=True)
+class PhoenixConfig:
+    # Базовый URL Avatica (Phoenix Query Server)
+    PQS_URL: str
+    # Быстрый TCP-probe (мс) перед подключением (0 — выключено)
+    PHX_TCP_PROBE_TIMEOUT_MS: int
+    # Адаптивное деление временных окон
+    PHX_OVERLOAD_MIN_SPLIT_MIN: int
+    PHX_OVERLOAD_MAX_DEPTH: int
+    PHX_OVERLOAD_RETRY_ATTEMPTS: int
+    PHX_OVERLOAD_RETRY_BASE_MS: int
+    # Управление ORDER BY (True => отключить ORDER BY в запросе)
+    PHX_DISABLE_ORDER_BY: bool
+    # Фиксированный «начальный» размер слайса (минуты), 0 — выключено
+    PHX_INITIAL_SLICE_MIN: int
+    # Размер кадров для cursor.fetchmany()
+    PHX_FETCHMANY: int
+
+def get_phoenix_config() -> PhoenixConfig:
+    """
+    Читает переменные окружения и возвращает иммутабельный конфиг Phoenix.
+
+    Обратная совместимость:
+    - Если задана PHX_FETCHMANY — используем её.
+    - Иначе, если задана устаревшая PHX_FETCHMANY_SIZE — используем её.
+    - В противном случае — дефолт 5000.
+    """
+    pqs_url = (_os.getenv("PQS_URL", "") or "").strip()
+    if not pqs_url:
+        raise ValueError("PQS_URL is required (e.g., http://host:8765)")
+
+    # PHX_FETCHMANY: приоритет новой переменной, затем — старой
+    fetchmany_env = _os.getenv("PHX_FETCHMANY")
+    if fetchmany_env is None:
+        fetchmany = _env_int("PHX_FETCHMANY_SIZE", 5000, min_value=1)
+    else:
+        fetchmany = _env_int("PHX_FETCHMANY", 5000, min_value=1)
+
+    return PhoenixConfig(
+        PQS_URL=pqs_url,
+        PHX_TCP_PROBE_TIMEOUT_MS=_env_int("PHX_TCP_PROBE_TIMEOUT_MS", 0, min_value=0),
+        PHX_OVERLOAD_MIN_SPLIT_MIN=_env_int("PHX_OVERLOAD_MIN_SPLIT_MIN", 2, min_value=1),
+        PHX_OVERLOAD_MAX_DEPTH=_env_int("PHX_OVERLOAD_MAX_DEPTH", 3, min_value=0),
+        PHX_OVERLOAD_RETRY_ATTEMPTS=_env_int("PHX_OVERLOAD_RETRY_ATTEMPTS", 3, min_value=0),
+        PHX_OVERLOAD_RETRY_BASE_MS=_env_int("PHX_OVERLOAD_RETRY_BASE_MS", 700, min_value=0),
+        PHX_DISABLE_ORDER_BY=_as_bool(_os.getenv("PHX_DISABLE_ORDER_BY", "0")),
+        # По умолчанию фиксированный «начальный» срез 5 минут, как договорились.
+        PHX_INITIAL_SLICE_MIN=_env_int("PHX_INITIAL_SLICE_MIN", 5, min_value=0),
+        PHX_FETCHMANY=fetchmany,
+    )

@@ -1,277 +1,401 @@
-# file: scripts/db/phoenix_client.py
 # -*- coding: utf-8 -*-
 """
-PhoenixClient — лёгкая обёртка над `phoenixdb` для чтения инкремента из Apache Phoenix PQS.
+Высокопроизводительный клиент Phoenix (Avatica/PQS) для ETL.
 
-Возможности и поведение:
-- Подключение с авто-выбором протокола: сперва пробуем Avatica protobuf, если библиотека его не поддерживает
-  (TypeError) или подключение падает — корректно откатываемся на JSON. Если оба способа не удались, поднимаем
-  `PhoenixConnectionError` и пишем компактный CRITICAL-лог вида `FATAL: cannot connect to Phoenix PQS ...`.
-- Быстрый fail-fast перед коннектом: опциональный TCP-probe до `host:port` (см. `PHOENIX_TCP_PROBE_TIMEOUT_MS`),
-  чтобы не ждать долгих таймаутов внутри `requests`/`urllib3`.
-- Подавление «портянок» из финализатора `phoenixdb.Connection.__del__`: при GC недоступного PQS библиотека
-  иногда печатает огромные stacktrace. Мы безопасно перехватываем исключения внутри `__del__`, чтобы логи были
-  компактными.
-- Настроенный размер выборки: `cursor.arraysize = fetchmany_size`, чтобы `fetchmany()` реально возвращал кадры
-  нужного масштаба.
-- Прозрачные логи: при каждом запросе логируем SQL, окно `[from; to)`, `ts_units` и размер пакета.
-- Утилиты:
-    * `discover_columns(table)` — быстрый способ получить список колонок по `SELECT * LIMIT 0`;
-    * `fetch_increment(table, ts_col, columns, from_dt, to_dt)` — итератор по блокам словарей, упорядочено по `ts_col`.
+Ключевые цели этого клиента:
+• Минимизировать накладные расходы на чтение больших окон по времени.
+• Дать один «источник правды» для адаптивной нарезки окна и бэк-оффа при перегрузке JobManager.
+• Не тянуть в конфиг лишние опции: работаем через PQS_URL (Avatica) и protobuf по умолчанию.
+• Бережно относиться к Phoenix/PQS: уметь дробить окно и ретраиться без избыточного давления.
 
-Контракты:
-- `from_dt`/`to_dt` должны быть timezone-aware (UTC). Драйвер корректно сериализует UTC в Phoenix.
-- `paramstyle=qmark` — плейсхолдеры `?`.
-- Закрытие: `close()` всегда пытается закрыть курсор, затем соединение; все ошибки при закрытии гасим.
+Что важно для перформанса:
+• Генерируем batches (list[dict]) без лишних преобразований; маппинг колонок — через zip(names, row).
+• Используем cursor.arraysize = fetchmany_size (если драйвер позволяет).
+• Поддерживаем «начальный» размер среза (PHX_INITIAL_SLICE_MIN, по умолчанию 5 минут) с выравниванием по UTC-сетке.
+  Если PHX_INITIAL_SLICE_MIN=0 — адаптивная нарезка отключена, окно читается одним куском.
+• Бэк-офф и рекурсивный сплит только при типовых признаках перегрузки (RejectedExecutionException, JobManager queue rejected).
 
-Исключения:
-- `PhoenixConnectionError` — не удалось установить соединение ни через protobuf, ни через JSON. Это сигнал для
-  внешнего уровня (ETL-скрипта) записать «стартовую» ошибку в журнал и завершиться с ненулевым кодом.
-
-Переменные окружения:
-- `PHOENIX_TCP_PROBE_TIMEOUT_MS` — необязательный таймаут (в мс) TCP-проверки доступности PQS перед коннектом.
-  0 или отсутствие переменной — проверка отключена.
+Зависимости:
+• Требуется пакет `phoenixdb` (Avatica). Сериализация — protobuf (дефолтно, менять не даём — стабильно и быстро).
 """
+
+from __future__ import annotations
+
 import logging
-from typing import Dict, Iterator, List, Any, Optional
-from datetime import datetime
-
-# Динамический импорт phoenixdb: снимаем предупреждение Pylance в IDE,
-# при настоящем запуске пакет всё равно должен быть установлен.
-try:
-    import importlib
-    phoenixdb = importlib.import_module("phoenixdb")  # type: ignore[import-not-found]
-except Exception:
-    phoenixdb = None  # type: ignore[assignment]
-
 import os
+import random
 import socket
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
-# --- Noise suppression for phoenixdb.Connection.__del__ -------------------
-# Некоторые версии `phoenixdb` в __del__ выполняют сетевые вызовы и могут печатать
-# "Exception ignored in: ... Connection.__del__" при недоступном PQS. Чтобы не плодить
-# портянки в логах, аккуратно перехватываем исключения в финализаторе.
 try:
-    import importlib
-    _phx_conn_mod = importlib.import_module("phoenixdb.connection")  # type: ignore[import-not-found]
-    _orig_del = getattr(_phx_conn_mod.Connection, "__del__", None)
-    if callable(_orig_del):
-        def _quiet_del(self):  # type: ignore
-            try:
-                _orig_del(self)  # type: ignore
-            except Exception:
-                # Молча игнорируем ошибки при сборке мусора (PQS недоступен и т.п.)
-                return
-        _phx_conn_mod.Connection.__del__ = _quiet_del  # type: ignore
-except Exception:
-    # Если в будущих версиях API изменится — ничего страшного, оставим поведение по умолчанию.
-    pass
-
-# --- Fast-fail TCP probe ---------------------------------------------------
-def _tcp_probe(pqs_url: str, timeout_ms: int) -> None:
-    """
-    Быстрая проверка доступности TCP-сокета Phoenix PQS перед созданием phoenixdb.Connection.
-    Поднимает PhoenixConnectionError при недоступности.
-    """
-    if timeout_ms <= 0:
-        return
-    u = urlparse(pqs_url)
-    host = u.hostname or "127.0.0.1"
-    port = u.port or 8765
-    try:
-        with socket.create_connection((host, port), timeout=timeout_ms / 1000.0):
-            return
-    except Exception as e:
-        raise PhoenixConnectionError(f"TCP probe failed for {host}:{port} in {timeout_ms} ms: {e}")
+    import phoenixdb  # type: ignore[import-untyped]
+except Exception:  # pragma: no cover - для среды разработки без установленного драйвера
+    phoenixdb = None  # type: ignore[assignment]
 
 log = logging.getLogger("scripts.db.phoenix_client")
 
-class PhoenixConnectionError(Exception):
-    """Ошибка подключения к Phoenix PQS (оба способа подключения провалились)."""
+
+# ------------------------ вспомогательные утилиты ------------------------
+
+# --- Безопасное квотирование идентификаторов Phoenix -------------------------
+def _quote_ident(name: str) -> str:
+    """
+    Phoenix/SQL идентификаторы:
+    - Без кавычек Phoenix поднимает регистр до UPPERCASE.
+    - Если колонки в схеме созданы в кавычках и в нижнем регистре ("opd", "c"),
+      обращение без кавычек приведёт к ошибке Undefined column (ищется OPD/C).
+    - Кавычим только "простые" нижние имена (буквы/цифры/подчёркивание) и только если
+      имя не процитировано заранее. Это не трогает выражения вида COUNT(*), to_char(...), "*".
+    Производительность: это строковые операции при сборке SQL (однократно на запрос) — влияние пренебрежимо мало.
+    """
+    n = (name or "").strip()
+    if not n or n == "*" or (n.startswith('"') and n.endswith('"')):
+        return n
+    is_simple = all(ch.islower() or ch.isdigit() or ch == "_" for ch in n)
+    if is_simple and n[0].isalpha():
+        return f'"{n}"'
+    return n
+
+def _render_columns(columns) -> str:
+    """Строим SELECT-список с безопасным квотированием; None/['*'] → '*'. Сохраняем выражения как есть."""
+    if not columns:
+        return "*"
+    if len(columns) == 1 and columns[0] == "*":
+        return "*"
+    return ", ".join(_quote_ident(c) for c in columns)
+
+def _env_int(name: str, default: int) -> int:
+    """Безопасное чтение целого из ENV (пустые/невалидные → default)."""
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def _is_overload_error(exc: BaseException) -> bool:
+    """Эвристика перегрузки Phoenix JobManager/очереди (распознаём типовые сообщения)."""
+    try:
+        s = f"{exc}".lower()
+    except Exception:
+        return False
+    return ("rejectedexecutionexception" in s) or ("jobmanager" in s and "rejected" in s)
+
+
+def _iter_utc_grid(f: datetime, t: datetime, step_min: int) -> Iterator[Tuple[datetime, datetime]]:
+    """
+    Итератор «сеточных» UTC-срезов [s;e) с шагом step_min минут.
+    Производительность: это лёгкая арифметика по времени и один генератор — влияние на горячий путь чтения отсутствует.
+    """
+    cur = f
+    while cur < t:
+        nxt = PhoenixClient._slice_grid_ceil_utc(cur, step_min)
+        if nxt <= cur:
+            # Защита от «нулевого» шага при совпадении на границе
+            nxt = cur + timedelta(minutes=step_min)
+        if nxt > t:
+            nxt = t
+        yield cur, nxt
+        cur = nxt
+
+
+def _should_split_window(s0: datetime, e0: datetime, min_split_min: int, depth: int, max_depth: int) -> bool:
+    """
+    Чистая эвристика: решаем, нужно ли делить окно (по длительности и ограничению глубины).
+    Вынесено отдельно, чтобы снизить когнитивную сложность основного метода.
+    """
+    span_min = max(0, int((e0 - s0).total_seconds() // 60))
+    return (span_min > min_split_min) and (depth < max_depth)
+
+
+def _compute_backoff_seconds(attempt: int) -> float:
+    """
+    Экспоненциальный бэк-офф с небольшим джиттером.
+    Вынесено отдельно, чтобы не загромождать основной цикл.
+    """
+    return (2.0 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.5)
+
+
+# ------------------------ основной клиент ------------------------
 
 class PhoenixClient:
     """
-    Подключается к Phoenix PQS и позволяет:
-    - получить список колонок (LIMIT 0),
-    - постранично читать инкремент за интервал [from; to).
+    Лёгкий клиент поверх phoenixdb:
+    - ленивое соединение (коннектимcя при первом запросе);
+    - чтение по окну времени (>= from_dt, < to_dt) упорядочено по ts-колонке;
+    - адаптивная нарезка + бэк-офф при перегрузке (fetch_increment_adaptive).
     """
 
-    conn: Optional[Any] = None
-    cur: Optional[Any] = None
-
-    def __init__(self, pqs_url: str, fetchmany_size: int = 5000, ts_units: str = "timestamp"):
+    def __init__(self, url: str, *, fetchmany_size: int = 1000) -> None:
         """
-        Инициализация клиента Phoenix PQS.
-
-        Args:
-            pqs_url: База Avatica (например, http://host:8765).
-            fetchmany_size: Размер кадра для fetchmany().
-            ts_units: Информационный атрибут для логов ('timestamp' | 'millis' | 'seconds').
-
-        Raises:
-            PhoenixConnectionError: если не удалось подключиться ни по protobuf, ни по JSON.
+        :param url: PQS/Avatica URL (напр. http://10.254.3.112:8765)
+        :param fetchmany_size: размер fetchmany для курсора (горячий параметр)
         """
-        # Fail fast: при включённом PHOENIX_TCP_PROBE_TIMEOUT_MS быстро проверяем доступность host:port
+        self._url = str(url)
+        self._fetchmany_size = int(fetchmany_size or 1000)
+        self._conn = None  # ленивый коннект
+
+        # ENV-параметры (строго минимальный набор):
+        # - PHX_TCP_PROBE_TIMEOUT_MS — опциональная TCP-проверка доступности Avatica до HTTP, чтобы быстро отвалиться
+        # - PHX_INITIAL_SLICE_MIN — «начальный» размер среза для адаптивной нарезки (минуты); 0 → полностью отключить
+        # - PHX_OVERLOAD_MAX_ATTEMPTS — число повторов при перегрузке очереди JobManager
+        # - PHX_OVERLOAD_MIN_SPLIT_MIN — нижняя граница размера под-окна (минуты) при рекурсивном сплите
+        # - PHX_OVERLOAD_MAX_DEPTH — максимальная глубина рекурсивного сплита
+        self._tcp_probe_timeout_ms = _env_int("PHX_TCP_PROBE_TIMEOUT_MS", 0)
+
+        # Кэш проекций (имена колонок) — снижает накладные расходы на `description`
+        self._last_projection_key: Optional[Tuple[str, ...]] = None
+        self._last_projection_names: Optional[Tuple[str, ...]] = None
+
+    # ------------------------ жизненный цикл соединения ------------------------
+
+    def close(self) -> None:
         try:
-            probe_ms = int(os.getenv("PHOENIX_TCP_PROBE_TIMEOUT_MS", "0") or "0")
-        except Exception:
-            probe_ms = 0
-        if probe_ms > 0:
-            try:
-                _tcp_probe(pqs_url, probe_ms)
-            except PhoenixConnectionError as probe_err:
-                log.critical("FATAL: %s", probe_err)
-                raise
-            except Exception as probe_err:
-                # Приводим к нашему типу исключения
-                log.critical("FATAL: %s", probe_err)
-                raise PhoenixConnectionError(str(probe_err))
-
-        if phoenixdb is None:
-            msg = "Библиотека 'phoenixdb' не установлена в активном окружении"
-            log.critical("FATAL: %s", msg)
-            raise PhoenixConnectionError(msg)
-
-        serialization_used = "protobuf"
-        try:
-            # Попытка №1: явный protobuf (на новых версиях phoenixdb быстрее JSON)
-            try:
-                conn = phoenixdb.connect(
-                    pqs_url,
-                    autocommit=True,
-                    serialization="protobuf",
-                )
-            except TypeError:
-                # Библиотека не знает параметр `serialization` — пробуем дефолт (JSON)
-                serialization_used = "json"
-                conn = phoenixdb.connect(
-                    pqs_url,
-                    autocommit=True,
-                )
-            except Exception as e:
-                # Протокол protobuf «доступен», но подключение не удалось — откат на JSON
-                log.warning("Phoenix protobuf connect failed (%s) — falling back to JSON.", e)
-                serialization_used = "json"
-                conn = phoenixdb.connect(
-                    pqs_url,
-                    autocommit=True,
-                )
-        except Exception as json_err:
-            # И JSON-подключение не удалось — поднимаем аккуратное исключение с коротким сообщением
-            msg = f"cannot connect to Phoenix PQS {pqs_url}: {json_err}"
-            log.critical("FATAL: %s", msg)
-            raise PhoenixConnectionError(msg) from json_err
-
-        # Присваиваем только после успешного коннекта
-        self.conn = conn
-
-        # Локальная ссылка + assert для узкого типа: подсказка анализатору, что объект не None
-        conn_local = self.conn
-        assert conn_local is not None
-        self.cur = conn_local.cursor()
-        self.fetchmany_size = int(fetchmany_size)
-        self.ts_units = ts_units
-        # Подсказка драйверу о размере кадров, строго по отступам
-        cur_local = self.cur
-        if cur_local is not None:
-            cur_local.arraysize = self.fetchmany_size
-        self._serialization = serialization_used
-        log.info("Phoenix PQS подключен (%s), paramstyle=qmark, serialization=%s", pqs_url, serialization_used)
-
-    def close(self):
-        """
-        Закрываем курсор и соединение, не шумим, если PQS уже недоступен.
-        """
-        try:
-            cur = getattr(self, "cur", None)
-            if cur is not None:
-                try:
-                    cur.close()
-                except Exception:
-                    pass
-        finally:
-            try:
-                conn = getattr(self, "conn", None)
-                if conn is not None:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-            finally:
-                # Чётко обнуляем ссылки — меньше шансов словить шум в __del__
-                self.cur = None
-                self.conn = None
-
-    def __del__(self):
-        try:
-            self.close()
+            if self._conn is not None:
+                self._conn.close()  # type: ignore[call-arg]
         except Exception:
             pass
+        finally:
+            self._conn = None
 
-    def _cur(self):
+    def _tcp_probe(self) -> None:
+        """Опциональная быстрая TCP-проверка доступности Avatica (до HTTP запроса).
+        Управляется PHX_TCP_PROBE_TIMEOUT_MS (мс). 0/пусто — отключено.
         """
-        Возвращает активный курсор; если клиент закрыт — кидает RuntimeError.
-        Нужен для того, чтобы статический анализ понимал, что дальше объект не None.
-        """
-        cur = getattr(self, "cur", None)
-        if cur is None:
-            raise RuntimeError("Клиент Phoenix закрыт: курсор недоступен")
-        return cur
+        timeout_ms = int(self._tcp_probe_timeout_ms or 0)
+        if timeout_ms <= 0:
+            return
+        try:
+            u = urlparse(self._url)
+            host = u.hostname or "localhost"
+            port = u.port or 8765
+            # Неблокирующая короткая попытка — если не открывается, сразу бросаем исключение
+            with socket.create_connection((host, port), timeout=timeout_ms / 1000.0):
+                return
+        except Exception as e:
+            raise ConnectionError(f"TCP probe to {self._url!r} failed in {timeout_ms} ms: {e}")
 
-    def discover_columns(self, table: str) -> List[str]:
-        """
-        SELECT * LIMIT 0 → имена колонок как в описании таблицы.
-        """
-        cur = self._cur()
-        cur.execute(f'SELECT * FROM "{table}" LIMIT 0')
-        return [d[0] for d in (cur.description or [])]
+    def _ensure_conn(self):
+        """Ленивый коннект; сериализация — строго protobuf (стабильнее и быстрее)."""
+        if self._conn is not None:
+            return self._conn
+        if phoenixdb is None:
+            raise RuntimeError("Драйвер 'phoenixdb' не установлен в окружении.")
+        self._tcp_probe()  # быстрый фэйл раньше HTTP, если включено
+        # autocommit=True — мы только читаем; это снижает накладные расходы
+        self._conn = phoenixdb.connect(self._url, autocommit=True, serialization="protobuf")  # type: ignore[call-arg]
+        return self._conn
+
+    # ------------------------ вспомогательное ------------------------
+
+    @staticmethod
+    def _as_naive_utc(dt: datetime) -> datetime:
+        """Phoenix ожидает naive UTC datetime (tzinfo=None). Аккуратно приводим."""
+        if dt.tzinfo is not None:
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+
+    @staticmethod
+    def _slice_grid_ceil_utc(dt: datetime, step_min: int) -> datetime:
+        """Следующая «сеточная» граница (UTC) с шагом step_min минут, не раньше dt."""
+        # dt считаем naive-UTC
+        total_min = dt.hour * 60 + dt.minute
+        ceil_total = ((total_min + step_min - 1) // step_min) * step_min
+        day_in_min = 24 * 60
+        days_add, mins_in_day = divmod(ceil_total, day_in_min)
+        base = datetime(dt.year, dt.month, dt.day, mins_in_day // 60, mins_in_day % 60)
+        return base + timedelta(days=days_add)
+
+    # ------------------------ базовое оконное чтение ------------------------
 
     def fetch_increment(
         self,
         table: str,
         ts_col: str,
-        columns: List[str],
+        columns: Sequence[str],
         from_dt: datetime,
         to_dt: datetime,
-    ) -> Iterator[List[Dict]]:
+    ) -> Iterator[List[Dict[str, Any]]]:
         """
-        Читает блоками (fetchmany_size) интервал [from_dt, to_dt), упорядочено по ts_col.
-        Возвращает список словарей {col: value}.
-        from_dt/to_dt должны быть aware (UTC) — phoenixdb их корректно сериализует.
+        Чтение данных из Phoenix за окно [from_dt; to_dt) одним запросом.
+        Возвращает генератор батчей (list[dict]).
         """
-        cols_quoted = ", ".join(f'"{c}"' for c in columns)
+        if not columns:
+            raise ValueError("columns пуст")
+        if to_dt <= from_dt:
+            return
+        conn = self._ensure_conn()
+        f = self._as_naive_utc(from_dt)
+        t = self._as_naive_utc(to_dt)
+
+        # ВАЖНО: Phoenix по умолчанию поднимает регистр идентификаторов до UPPERCASE.
+        # Чтобы не ловить ERROR 504 (Undefined column) на колонках, созданных в нижнем регистре,
+        # аккуратно квотируем «простые» имена колонок и поле времени.
+        cols_sql = _render_columns(columns)
+        ts_sql = _quote_ident(ts_col)
+
         sql = (
-            f'SELECT {cols_quoted} FROM "{table}" '
-            f'WHERE "{ts_col}" >= ? AND "{ts_col}" < ? '
-            f'ORDER BY "{ts_col}"'
+            f"SELECT {cols_sql} "
+            f"FROM {table} "
+            f"WHERE {ts_sql} >= ? AND {ts_sql} < ? "
+            f"ORDER BY {ts_sql} ASC"
         )
-        log.info(
-            "Phoenix SQL: %s | params: [%s → %s] | ts_units=%s | fetchmany=%d",
-            sql.replace("\n", " "),
-            from_dt.isoformat(), to_dt.isoformat(),
-            self.ts_units, self.fetchmany_size
+
+        cur = conn.cursor()
+        try:
+            try:
+                # Если драйвер поддерживает — уменьшаем число round-trip'ов
+                cur.arraysize = int(self._fetchmany_size)
+            except Exception:
+                pass
+
+            cur.execute(sql, (f, t))
+
+            # Быстрый путь для имён колонок (phoenixdb.cursor.description)
+            key = tuple(columns)
+            if self._last_projection_key == key and self._last_projection_names is not None:
+                names = self._last_projection_names
+            else:
+                desc = getattr(cur, "description", None)
+                names = tuple(d[0] for d in desc) if desc else key
+                self._last_projection_key = key
+                self._last_projection_names = names
+
+            fetch_sz = int(self._fetchmany_size)
+            while True:
+                rows = cur.fetchmany(fetch_sz)
+                if not rows:
+                    break
+                # Микроопт: локальные ссылки
+                _n = names
+                # Прямой zip → dict без лишних проверок
+                batch = [dict(zip(_n, row)) for row in rows]
+                yield batch
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    # ------------------------ хелперы логирования/ретраев ------------------------
+
+    def _log_overload_split(self, s0: datetime, e0: datetime, span_min: int, depth: int, max_depth: int) -> None:
+        """Отдельное логирование сплита окна — выделено для снижения когнитивной сложности."""
+        log.warning(
+            "Phoenix перегружен на окне %s → %s (≈%d мин). Делю окно (глубина %d/%d)...",
+            s0.isoformat(), e0.isoformat(), span_min, depth, max_depth,
         )
-        cur = self._cur()
-        cur.execute(sql, (from_dt, to_dt))
 
-        # Имена колонок в рамках одного запроса неизменны — вычисляем один раз.
-        # Некоторые версии драйвера могут отложенно заполнять description,
-        # поэтому допускаем отложенное вычисление при первой выборке.
-        names: Optional[List[str]] = [d[0] for d in (cur.description or [])] or None
+    def _log_overload_retry(self, next_attempt: int, max_attempts: int, backoff: float) -> None:
+        """Отдельное логирование ретрая — выделено для снижения когнитивной сложности."""
+        log.warning(
+            "Phoenix перегружен (JobManager queue). Повторю попытку %d/%d через %.1f с...",
+            next_attempt, max_attempts, backoff,
+        )
 
-        # Локальные ссылки на builtins/переменные — дешёвая микрооптимизация,
-        # убирает глобальные поиска имён внутри горячего цикла.
-        dict_ = dict
-        zip_ = zip
-        size = self.fetchmany_size
-
+    def _pull_with_retries(
+        self,
+        table: str,
+        ts_col: str,
+        columns: Sequence[str],
+        s0: datetime,
+        e0: datetime,
+        *,
+        min_split_min: int,
+        max_depth: int,
+        max_attempts: int,
+        depth: int = 0,
+    ) -> Iterator[List[Dict[str, Any]]]:
+        """
+        Горячий путь: одна точка входа чтения под-окна [s0;e0).
+        - Пытаемся читать.
+        - На перегрузке: либо делим окно (если ещё можно), либо ждём и повторяем.
+        - Иначе — пробрасываем исключение.
+        Выделено из fetch_increment_adaptive для уменьшения когнитивной сложности верхнего метода.
+        """
+        attempt = 1
         while True:
-            rows = cur.fetchmany(size)
-            if not rows:
-                break
-            if names is None:
-                names = [d[0] for d in (cur.description or [])]
-            n = names  # локальная ссылка для list comprehension ниже
-            out = [dict_(zip_(n, r)) for r in rows]
-            yield out
+            try:
+                yield from self.fetch_increment(table, ts_col, columns, s0, e0)
+                return
+            except Exception as ex:
+                if not _is_overload_error(ex):
+                    # Не признаки перегрузки JobManager — отдать на уровень выше.
+                    raise
+
+                # Перегрузка: если можно — делим окно и читаем рекурсивно.
+                if _should_split_window(s0, e0, min_split_min, depth, max_depth):
+                    span_min = max(0, int((e0 - s0).total_seconds() // 60))
+                    mid = s0 + (e0 - s0) / 2
+                    self._log_overload_split(s0, e0, span_min, depth + 1, max_depth)
+                    yield from self._pull_with_retries(
+                        table, ts_col, columns, s0, mid,
+                        min_split_min=min_split_min, max_depth=max_depth, max_attempts=max_attempts, depth=depth + 1,
+                    )
+                    yield from self._pull_with_retries(
+                        table, ts_col, columns, mid, e0,
+                        min_split_min=min_split_min, max_depth=max_depth, max_attempts=max_attempts, depth=depth + 1,
+                    )
+                    return
+
+                # Иначе — ждём и повторяем, пока есть попытки.
+                if attempt < max_attempts:
+                    backoff = _compute_backoff_seconds(attempt)
+                    self._log_overload_retry(attempt + 1, max_attempts, backoff)
+                    time.sleep(backoff)
+                    attempt += 1
+                    continue
+
+                # Попытки исчерпаны — пробрасываем.
+                raise
+
+    # ------------------------ адаптивная вытяжка ------------------------
+    def fetch_increment_adaptive(
+        self,
+        table: str,
+        ts_col: str,
+        columns: Sequence[str],
+        from_dt: datetime,
+        to_dt: datetime,
+    ) -> Iterator[List[Dict[str, Any]]]:
+        """
+        Единая высокоуровневая вытяжка:
+        • Если PHX_INITIAL_SLICE_MIN > 0 — режем окно на слайсы по UTC-сетке (шаг = PHX_INITIAL_SLICE_MIN).
+          Это стабилизирует нагрузку и лучше прогревает кэши Phoenix.
+        • На каждом слайсе применяем «умный» цикл: попытки с экспоненциальным бэк-оффом и/или рекурсивным сплитом.
+        • Если PHX_INITIAL_SLICE_MIN == 0 — читаем окно одним запросом, но так же с попытками и бэк-оффом.
+        Производительность: основная работа остаётся в fetch_increment; здесь только подготовка параметров
+        и выбор стратегии (нарезка/без нарезки).
+        """
+        if to_dt <= from_dt:
+            return
+
+        # Настройки адаптивности (строго из ENV — не размазываем по config.py).
+        init_min = _env_int("PHX_INITIAL_SLICE_MIN", 5)   # 5 мин по умолчанию (включено)
+        max_attempts = _env_int("PHX_OVERLOAD_MAX_ATTEMPTS", 4)
+        min_split_min = _env_int("PHX_OVERLOAD_MIN_SPLIT_MIN", 2)
+        max_depth = _env_int("PHX_OVERLOAD_MAX_DEPTH", 3)
+
+        # Phoenix принимает naive UTC — приводим аккуратно.
+        f = self._as_naive_utc(from_dt)
+        t = self._as_naive_utc(to_dt)
+
+        if init_min <= 0:
+            # Режим без нарезки: одно окно, но с ретраями/бэк-оффом при перегрузке.
+            yield from self._pull_with_retries(
+                table, ts_col, columns, f, t,
+                min_split_min=min_split_min, max_depth=max_depth, max_attempts=max_attempts, depth=0,
+            )
+            return
+
+        # Режим с нарезкой: ровно по UTC-«сетке» (00:00, 00:05, 00:10, ...).
+        for s, e in _iter_utc_grid(f, t, init_min):
+            yield from self._pull_with_retries(
+                table, ts_col, columns, s, e,
+                min_split_min=min_split_min, max_depth=max_depth, max_attempts=max_attempts, depth=0,
+            )
