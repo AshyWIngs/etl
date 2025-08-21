@@ -79,6 +79,9 @@ _INSERT_RE = re.compile(
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
 
+# Единый «пинг»-запрос к ClickHouse (убираем дублирование строкового литерала "SELECT 1")
+_SQL_PING = "SELECT 1"
+
 # Подавляет «портянки» от внутреннего логгера clickhouse-driver при неудачных попытках подключения
 def _configure_driver_logging() -> None:
     """
@@ -113,6 +116,59 @@ def _configure_driver_logging() -> None:
         pass
 
 class ClickHouseClient:
+    def _probe_single_host(self, host: str, database: str, fqn_names: Sequence[str]) -> Dict[str, bool]:
+        """
+        Пробует подключиться к конкретному хосту и проверить наличие набора таблиц локально.
+        Возвращает карту: FQN → exists(bool). Любые ошибки проб — не фатальны:
+        • при сбое подключения — считаем все таблицы отсутствующими на этом хосте;
+        • при ошибке EXISTS TABLE для конкретной таблицы — помечаем её как False.
+
+        Выделено в отдельный хелпер, чтобы упростить основную функцию `probe_hosts_for_tables`
+        (снижение когнитивной сложности S3776) без влияния на производительность.
+        """
+        temp: Optional[NativeClient] = None
+        host_map: Dict[str, bool] = {}
+        try:
+            temp_cli = NativeClient(
+                host=host,
+                port=self.port,
+                user=self.user,
+                password=self.password,
+                database=database,
+                client_name="etl_codes_history_probe",
+                connect_timeout=self.connect_timeout,
+                send_receive_timeout=self.send_receive_timeout,
+                compression=self.compression,
+                settings=self.settings,
+            )
+            temp = temp_cli
+            # Лёгкая проверка «живости» хоста.
+            temp_cli.execute(_SQL_PING)
+
+            for fqn in fqn_names:
+                try:
+                    val = temp_cli.execute(f"EXISTS TABLE {fqn}")
+                    ok = bool(val and val[0][0])
+                except Exception as e:
+                    log.warning("EXISTS TABLE %s@%s: ошибка: %s", fqn, host, e)
+                    ok = False
+                host_map[fqn] = ok
+
+        except Exception as e:
+            log.warning("Не удалось выполнить probe на хосте %s: %s", host, e)
+            # При недоступности хоста помечаем все таблицы как отсутствующие.
+            for fqn in fqn_names:
+                host_map[fqn] = False
+        finally:
+            try:
+                if temp is not None:
+                    temp.disconnect()
+            except Exception:
+                # best‑effort: сбой при закрытии не должен мешать общей логике.
+                pass
+
+        return host_map
+
     """
     Тонкая обёртка над `clickhouse-driver` с:
       • failover-подключением по списку хостов,
@@ -322,48 +378,15 @@ class ClickHouseClient:
         """
         Обходит все CH_HOSTS и возвращает карту: host → {FQN → exists(bool)}.
         Проверка выполняется ЛОКАЛЬНО на каждом хосте через временный клиент.
+
+        Производительность: структура запросов не меняется, мы лишь вынесли обработку одного хоста
+        в `_probe_single_host`, чтобы сократить вложенность и упростить чтение (S3776).
         """
         database = db or self.db
+        fqn_names = self._fqn_names(database, tables)
         report: Dict[str, Dict[str, bool]] = {}
         for host in self.hosts:
-            temp: Optional[NativeClient] = None
-            host_map: Dict[str, bool] = {}
-            try:
-                temp_cli = NativeClient(
-                    host=host,
-                    port=self.port,
-                    user=self.user,
-                    password=self.password,
-                    database=database,
-                    client_name="etl_codes_history_probe",
-                    connect_timeout=self.connect_timeout,
-                    send_receive_timeout=self.send_receive_timeout,
-                    compression=self.compression,
-                    settings=self.settings,
-                )
-                temp = temp_cli
-                temp_cli.execute("SELECT 1")
-                for t in tables:
-                    fqn = t if "." in t else f"{database}.{t}"
-                    try:
-                        val = temp_cli.execute(f"EXISTS TABLE {fqn}")
-                        ok = bool(val and val[0][0])
-                    except Exception as e:
-                        log.warning("EXISTS TABLE %s@%s: ошибка: %s", fqn, host, e)
-                        ok = False
-                    host_map[fqn] = ok
-            except Exception as e:
-                log.warning("Не удалось выполнить probe на хосте %s: %s", host, e)
-                for t in tables:
-                    fqn = t if "." in t else f"{database}.{t}"
-                    host_map[fqn] = False
-            finally:
-                try:
-                    if temp is not None:
-                        temp.disconnect()
-                except Exception:
-                    pass
-            report[host] = host_map
+            report[host] = self._probe_single_host(host, database, fqn_names)
         return report
 
     def switch_to_host(self, host: str) -> None:
@@ -388,58 +411,107 @@ class ClickHouseClient:
             compression=self.compression,
             settings=self.settings,
         )
-        cli.execute("SELECT 1")
+        cli.execute(_SQL_PING)
         self.client = cli
         self.current_host = host
         log.info("Переключился на ClickHouse %s:%d, db=%s", host, self.port, self.db)
 
-    def ensure_tables(self, tables: Sequence[str], db: Optional[str] = None, cluster: Optional[str] = None, try_switch_host: bool = True) -> None:
+    def _fqn_names(self, database: str, tables: Sequence[str]) -> List[str]:
         """
-        Гарантирует наличие необходимых таблиц.
-        Алгоритм:
-          1) Если задан cluster — проверяем наличие на уровне кластера (clusterAllReplicas).
-             Если всё ок — выходим.
-          2) Иначе/дополнительно — проверяем локально на текущем хосте.
-             Если отсутствуют и try_switch_host=True — пробуем найти хост, где все таблицы есть, и переключаемся.
-             Если таковой не найден — поднимаем RuntimeError с детальным отчётом.
+        Вспомогательно: приводит имена таблиц к FQN ('db.tbl').
+        Чистая функция без побочных эффектов — вынесена ради упрощения чтения и снижения когнитивной сложности.
         """
-        database = db or self.db
-        names = [t if "." in t else f"{database}.{t}" for t in tables]
+        return [t if "." in t else f"{database}.{t}" for t in tables]
 
-        # 1) Кластерная проверка (опционально)
-        if cluster:
-            cluster_map = self.tables_exist_cluster(cluster, database, tables)
-            missing_cluster = [n for n in names if not cluster_map.get(n, False)]
-            if not missing_cluster:
-                return  # на кластере всё видно
+    def _cluster_missing_tables(self, cluster: str, database: str, tables: Sequence[str]) -> List[str]:
+        """
+        Возвращает список FQN‑таблиц, которых не видно на уровне кластера (`clusterAllReplicas`).
+        Безопасно использует `tables_exist_cluster`.
+        """
+        names = self._fqn_names(database, tables)
+        cluster_map = self.tables_exist_cluster(cluster, database, tables)
+        return [n for n in names if not cluster_map.get(n, False)]
 
-        # 2) Локальная проверка на текущем хосте
+    def _local_missing_tables(self, database: str, tables: Sequence[str]) -> List[str]:
+        """
+        Возвращает список FQN‑таблиц, которых нет локально на ТЕКУЩЕМ хосте.
+        """
+        names = self._fqn_names(database, tables)
         local_map = self.tables_exist_local(database, tables)
-        missing_local = [n for n in names if not local_map.get(n, False)]
-        if not missing_local:
-            return
+        return [n for n in names if not local_map.get(n, False)]
 
-        if not try_switch_host:
-            raise RuntimeError(f"Missing tables on host {self.current_host or '?'}: {', '.join(missing_local)}")
-
-        # 3) Попробуем найти подходящий хост
-        probe = self.probe_hosts_for_tables(database, tables)
-        candidates = []
-        for host, tblmap in probe.items():
-            if all(tblmap.get(n, False) for n in names):
-                candidates.append(host)
-
-        if candidates:
-            # Берём первый подходящий хост и переключаемся
-            self.switch_to_host(candidates[0])
-            return
-
-        # 4) Никто не подошёл — собираем сводку и падаем
-        lines = [f"clickhouse ensure_tables failed: ни на одном хосте не найден полный набор таблиц."]
+    def _format_probe_report(self, probe: Dict[str, Dict[str, bool]], names: Sequence[str]) -> str:
+        """
+        Формирует компактный отчёт о наличии таблиц по хостам (для сообщения ошибки).
+        """
+        lines = ["clickhouse ensure_tables failed: ни на одном хосте не найден полный набор таблиц."]
         for host, tblmap in probe.items():
             miss = [n for n in names if not tblmap.get(n, False)]
             lines.append(f"  - {host}: missing={miss if miss else 'OK'}")
-        raise RuntimeError("\n".join(lines))
+        return "\n".join(lines)
+
+    def _cluster_has_all(self, cluster: str, database: str, tables: Sequence[str]) -> bool:
+        """
+        Быстрая булева проверка наличия всех таблиц на уровне кластера.
+        Использует уже готовый `_cluster_missing_tables`.
+        """
+        return not self._cluster_missing_tables(cluster, database, tables)
+
+    def _local_has_all(self, database: str, tables: Sequence[str]) -> bool:
+        """
+        Быстрая булева проверка наличия всех таблиц локально на текущем хосте.
+        Использует `_local_missing_tables`.
+        """
+        return not self._local_missing_tables(database, tables)
+
+    def _switch_to_any_host_with_all(self, database: str, tables: Sequence[str], names: Sequence[str]) -> None:
+        """
+        Ищет среди известных CH-хостов тот, где присутствует полный набор таблиц, и
+        немедленно переключается на него. Если такого хоста нет — формирует подробный
+        отчёт и выбрасывает исключение.
+
+        Производительность: выполняет только лёгкий probe `EXISTS TABLE` на каждом хосте.
+        """
+        probe = self.probe_hosts_for_tables(database, tables)
+        for host, tblmap in probe.items():
+            if all(tblmap.get(n, False) for n in names):
+                self.switch_to_host(host)
+                return
+        # Никто не подошёл — бросаем исключение с развёрнутым отчётом
+        raise RuntimeError(self._format_probe_report(probe, names))
+
+    def ensure_tables(self, tables: Sequence[str], db: Optional[str] = None, cluster: Optional[str] = None, try_switch_host: bool = True) -> None:
+        """
+        Гарантирует наличие необходимых таблиц.
+
+        Алгоритм (линейный и предсказуемый):
+          1) Если указан `cluster` и на уровне кластера всё есть — выходим.
+          2) Если локально на текущем хосте всё есть — выходим.
+          3) Если запрещено переключение — немедленно падаем с перечислением отсутствующих локально.
+          4) Иначе пробуем найти хост, где полный набор есть, и переключиться. Если таких нет —
+             бросаем исключение с подробным отчётом по всем хостам.
+
+        Производительность: все проверки — короткие SELECT/EXISTS в `system.tables`. Вынесение
+        логики в хелперы снижает когнитивную сложность без какого‑либо влияния на скорость.
+        """
+        database = db or self.db
+        names = self._fqn_names(database, tables)
+
+        # (1) Кластерная проверка (если запрошена)
+        if cluster and self._cluster_has_all(cluster, database, tables):
+            return
+
+        # (2) Локальная проверка на текущем хосте
+        if self._local_has_all(database, tables):
+            return
+
+        # (3) Запрещено переключаться на другой хост — сразу фейлим с локальным списком
+        if not try_switch_host:
+            missing_local = self._local_missing_tables(database, tables)
+            raise RuntimeError(f"Missing tables on host {self.current_host or '?'}: {', '.join(missing_local)}")
+
+        # (4) Попытаться найти подходящий хост и переключиться (или бросить подробную ошибку)
+        self._switch_to_any_host_with_all(database, tables, names)
 
     def _connect_any(self) -> None:
         """
@@ -467,7 +539,7 @@ class ClickHouseClient:
                     compression=self.compression,
                     settings=self.settings,
                 )
-                cli.execute("SELECT 1")
+                cli.execute(_SQL_PING)
                 self.client = cli
                 self.current_host = host
                 log.info("Подключен к ClickHouse (native) %s:%d, db=%s", host, self.port, self.db)

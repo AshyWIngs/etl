@@ -75,6 +75,7 @@ except Exception:  # pragma: no cover - editor/type-checker fallback
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple, Iterable, Optional, Set, Callable, cast, TYPE_CHECKING
 from zoneinfo import ZoneInfo
+from dataclasses import dataclass
 
 # Псевдо-декларация для анализатора типов: имя _publish_parts существует ниже.
 # Это устраняет ложные "is not defined" для ссылок внутри вложенных хелперов.
@@ -99,6 +100,82 @@ from functools import lru_cache
 from urllib.parse import urlparse
 
 log = logging.getLogger("codes_history_increment")
+
+# --- Пакет параметров выполнения для снижения количества аргументов (S107) ---
+@dataclass(frozen=True)
+class ExecParams:
+    """Набор неизменяемых параметров выполнения основного цикла.
+    Один объект вместо 18+ параметров снижает шум в сигнатурах и когнитивную
+    сложность, не влияя на производительность (обычный доступ к атрибутам).
+    """
+    journal: "ProcessJournal"
+    cfg: "Settings"
+    ch: "CHClient"
+    phx: "PhoenixClient"
+    pg: "PGClient"
+    process_name: str
+    host: str
+    pid: int
+    since_dt: datetime
+    until_dt: datetime
+    step_min: int
+    business_tz_name: str
+    overlap_delta: timedelta
+    publish_every_slices: int
+    publish_only_if_new: bool
+    publish_min_new_rows: int
+    always_publish_at_end: bool
+    backfill_missing_enabled: bool
+
+
+# --- Компактный помощник промежуточной публикации ---
+def _maybe_intermediate_publish(
+    *,
+    pending_parts: Set[int],
+    new_rows_by_part: Dict[int, int],
+    publish_every_slices: int,
+    slices_since_last_pub: int,
+    publish_only_if_new: bool,
+    publish_min_new_rows: int,
+    ch: "CHClient",
+    cfg: "Settings",
+    pg: "PGClient",
+    process_name: str,
+    after_publish: Callable[[Set[int]], None],
+) -> bool:
+    """Промежуточная публикация, если пришло время (вызывается из горячего пути).
+    Возвращает True, если публикация состоялась. Внутри — минимальная логика и
+    только один вызов `_publish_parts`.
+    """
+    if publish_every_slices <= 0 or slices_since_last_pub < publish_every_slices:
+        return False
+
+    _log_gating_debug(
+        pending_parts=pending_parts,
+        new_rows_by_part=new_rows_by_part,
+        publish_min_new_rows=publish_min_new_rows,
+        slices_since_last_pub=slices_since_last_pub,
+        publish_every_slices=publish_every_slices,
+    )
+
+    parts_to_publish = _select_parts_to_publish(
+        pending_parts=pending_parts,
+        publish_only_if_new=publish_only_if_new,
+        publish_min_new_rows=publish_min_new_rows,
+        new_rows_by_part=new_rows_by_part,
+    )
+    if not parts_to_publish:
+        log.info(
+            "Промежуточная публикация отложена гейтингом (порог=%d, слайсы=%d/%d).",
+            publish_min_new_rows, slices_since_last_pub, publish_every_slices,
+        )
+        return False
+
+    if _publish_parts(ch, cfg, pg, process_name, parts_to_publish):
+        log.info("Промежуточная публикация: %d партиций.", len(parts_to_publish))
+        after_publish(parts_to_publish)
+        return True
+    return False
 
 # Конфигурация времени (ENV/Settings):
 # • BUSINESS_TZ — строка таймзоны (IANA, напр. "Asia/Almaty"). Если пустая → наивные даты считаются UTC.
@@ -225,36 +302,81 @@ INT_FIELDS = {"t","st","ste","elr","pt","et","pg","tt"}
 
 # ------------------------ УТИЛИТЫ ТИПИЗАЦИИ ------------------------
 
-def _to_dt64_obj(v: Any) -> Any:  # NOSONAR - ветвистая, но быстрая нормализация времени (критично для перформанса)
+# --- Быстрые чистые хелперы для нормализации времени (минимум ветвлений) ---
+
+def _as_naive_utc_ms(dt: datetime) -> datetime:
+    """
+    Приводит datetime к naive UTC и обрезает микросекунды до миллисекунд.
+    • Aware → переводим в UTC и снимаем tzinfo (phoenix/clickhouse ждут naive UTC).
+    • Naive → считаем, что это уже UTC (сохранение поведения), только режем микросекунды до мс.
+    """
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    # Обрезаем до миллисекунд (CH DateTime64(3))
+    if dt.microsecond:
+        dt = dt.replace(microsecond=(dt.microsecond // 1000) * 1000)
+    return dt
+
+def _from_epoch_any_seconds_or_ms(value: float) -> datetime:
+    """
+    Быстрый парсер числового таймстемпа:
+    • Принимает секунды или миллисекунды (эвристика: > 10_000_000_000 → делим на 1000).
+    • Возвращает naive UTC c точностью до миллисекунд.
+    """
+    ts = float(value)
+    if ts > 10_000_000_000:
+        ts = ts / 1000.0
+    return _as_naive_utc_ms(datetime.fromtimestamp(ts, tz=timezone.utc))
+
+def _from_string_datetime(s: str) -> Optional[datetime]:
+    """
+    Быстрый парсер строкового значения времени.
+    Порядок:
+    1) Пустая строка → None.
+    2) Только цифры → epoch (sec/ms).
+    3) Суффикс 'Z' → меняем на '+00:00' для fromisoformat.
+    4) Пробуем ISO 8601 через datetime.fromisoformat.
+    Ошибка парсинга → None (жёстких исключений не кидаем по скорости/устойчивости).
+    """
+    s = s.strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return _from_epoch_any_seconds_or_ms(float(s))
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return _as_naive_utc_ms(datetime.fromisoformat(s))
+    except Exception:
+        return None
+
+def _to_dt64_obj(v: Any) -> Any:
+    """
+    Универсальный быстрый нормализатор времени для ClickHouse DateTime64(3):
+    • None/"" → None
+    • datetime → naive UTC (с обрезкой до миллисекунд)
+    • int/float → epoch (sec или ms), naive UTC
+    • str:
+      – только цифры → epoch (sec/ms)
+      – ISO (в т.ч. с 'Z') → парсим через fromisoformat
+    Возвращает naive UTC datetime или None. Предпочитаем ранние выходы и «плоские»
+    ветвления ради снижения когнитивной сложности и ускорения горячего пути.
+    """
+    # 1) Самые частые «пустые» значения
     if v is None or v == "":
         return None
-    dt: Optional[datetime] = None
+
+    # 2) Уже datetime
     if isinstance(v, datetime):
-        dt = v
-    elif isinstance(v, (int, float)):
-        ts = float(v)
-        if ts > 10_000_000_000:
-            ts = ts / 1000.0
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
-    else:
-        s = str(v).strip()
-        if not s:
-            return None
-        if s.isdigit():
-            ts = int(s)
-            if ts > 10_000_000_000:
-                ts = ts / 1000.0
-            dt = datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
-        else:
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            try:
-                dt = datetime.fromisoformat(s)
-            except Exception:
-                return None
-    if dt.tzinfo is not None:
-        dt = dt.replace(tzinfo=None)
-    return dt.replace(microsecond=(dt.microsecond // 1000) * 1000)
+        return _as_naive_utc_ms(v)
+
+    # 3) Число (секунды/миллисекунды epoch)
+    if isinstance(v, (int, float)):
+        return _from_epoch_any_seconds_or_ms(float(v))
+
+    # 4) Прочие типы → приводим к строке ровно один раз
+    dt = _from_string_datetime(str(v))
+    return dt
 
 def _as_int(v: Any) -> Any:
     if v is None or v == "":
@@ -264,55 +386,42 @@ def _as_int(v: Any) -> Any:
     except Exception:
         return None
 
-def _parse_ch_storage(v: Any) -> List[str]:  # NOSONAR - нарочно без regex и с ранними возвратами ради скорости
+
+# --- Helpers for CH storage field parsing ---
+def _seq_to_str_list(seq: Iterable[Any]) -> List[str]:
+    """Быстрая нормализация произвольной последовательности в список непустых строк (без JSON/regex)."""
+    res: List[str] = []
+    append = res.append
+    for x in seq:
+        if x is None:
+            continue
+        xs = str(x).strip()
+        if xs:
+            append(xs)
+    return res
+
+def _parse_json_list_fast(s: str) -> Optional[List[str]]:
     """
-    Быстрый парсер для поля-хранилища (массив строк в CH):
-    • Горячий путь: уже list/tuple → лёгкая нормализация без JSON.
-    • Пустые/«псевдопустые» значения → пустой список.
-    • Строки вида '[...]' пробуем разобрать как JSON-список (узкий кейс).
-    • Остальные строки разбиваем по простым разделителям без regex (быстрее).
+    Узкий быстрый путь: если строка выглядит как JSON-список вида "[...]" — пробуем распарсить.
+    При любой ошибке возвращаем None (чтобы упасть в простой split).
     """
-    # 1) Пустые/«псевдопустые» — сразу выход
-    if v in (None, "", "{}", "[]"):
-        return []
+    if not (s.startswith("[") and s.endswith("]")):
+        return None
+    try:
+        parsed = json.loads(s)
+    except Exception:
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return _seq_to_str_list(parsed)
 
-    # 2) Уже массив — самый дешёвый путь
-    if isinstance(v, (list, tuple)):
-        res: List[str] = []
-        append = res.append
-        for x in v:
-            if x is None:
-                continue
-            xs = str(x).strip()
-            if xs:
-                append(xs)
-        return res
-
-    # 3) Приведём к строке один раз
-    s = str(v).strip()
-    if not s:
-        return []
-
-    # 4) Узкий быстрый путь: JSON-список вида "[...]" (без лишних попыток)
-    if s.startswith("[") and s.endswith("]"):
-        try:
-            parsed = json.loads(s)
-            if isinstance(parsed, list):
-                res: List[str] = []
-                append = res.append
-                for x in parsed:
-                    if x is None:
-                        continue
-                    xs = str(x).strip()
-                    if xs:
-                        append(xs)
-                return res
-        except Exception:
-            # Падаем в простой сплит ниже
-            pass
-
-    # 5) Универсальный быстрый сплит по распространённым разделителям (без regex)
-    #    Нормализуем разделители к запятой, убираем крайние скобки.
+def _split_storage_field_simple(s: str) -> List[str]:
+    """
+    Универсальный быстрый сплит по распространённым разделителям (без regex) для строкового поля-хранилища.
+    • Убираем крайние скобки []{}().
+    • Нормализуем разделители к запятой.
+    • Режем по запятой и тримим пробелы.
+    """
     raw = s.strip("[]{}()")
     if not raw:
         return []
@@ -325,6 +434,37 @@ def _parse_ch_storage(v: Any) -> List[str]:  # NOSONAR - нарочно без r
         if p:
             append(p)
     return res
+
+def _parse_ch_storage(v: Any) -> List[str]:
+    """
+    Быстрый парсер для поля-хранилища (массив строк в CH).
+    Стратегия (минимум ветвлений в «горячем» пути):
+    1) Пустые/«псевдопустые» → [].
+    2) Уже list/tuple → быстрая нормализация без JSON.
+    3) Строка:
+       3.1) Если похожа на JSON-список — пытаемся распарсить.
+       3.2) Иначе — простой сплит по распространённым разделителям.
+    """
+    # 1) Пустые/«псевдопустые» — сразу выход
+    if v in (None, "", "{}", "[]"):
+        return []
+
+    # 2) Уже массив — самый дешёвый путь
+    if isinstance(v, (list, tuple)):
+        return _seq_to_str_list(v)
+
+    # 3) Приводим к строке один раз
+    s = str(v).strip()
+    if not s:
+        return []
+
+    # 3.1) Узкий быстрый путь: JSON-список вида "[...]"
+    parsed = _parse_json_list_fast(s)
+    if parsed is not None:
+        return parsed
+
+    # 3.2) Простой быстрый сплит
+    return _split_storage_field_simple(s)
 
 def _row_to_ch_tuple(r: Dict[str, Any]) -> tuple:
     """Горячий путь: конвертация записи источника в кортеж для INSERT VALUES."""
@@ -757,35 +897,114 @@ def _finalize_publication(
     else:
         log.info("Финальная публикация: нечего публиковать.")
 
-def main():  # NOSONAR - оркестратор ETL высокого уровня; дальнейшее разбиение ухудшит связность и телеметрию
-    parser = argparse.ArgumentParser(description="Codes History Incremental (Phoenix→ClickHouse)")
-    # Флаги сведены к минимуму для простоты эксплуатации:
-    #  - --since/--until — бизнес-окно загрузки;
-    #  - --manual-start — пометить запуск как ручной (для журнала);
-    #  - --log-level — уровень логирования (по умолчанию INFO).
-    parser.add_argument("--since", required=False, help="ISO. Наивные значения трактуются в BUSINESS_TZ (если задана), иначе в UTC. Пр: 2025-08-08T00:00:00")
-    parser.add_argument("--until", required=False, help="ISO. Наивные значения трактуются в BUSINESS_TZ (если задана), иначе в UTC. Если не указан — используется since + RUN_WINDOW_HOURS (по умолчанию 24 ч). Пр: 2025-08-09T00:00:00")
-    parser.add_argument("--manual-start", action="store_true", help="Если указан, журнал ведётся под именем 'manual_<PROCESS_NAME>' (ручной запуск).")
-    parser.add_argument("--log-level", "--log", dest="log_level", default="INFO", help="Уровень логирования (alias: --log)")
-    args = parser.parse_args()
+def _compute_phx_slice_and_log(
+    s: datetime,
+    e: datetime,
+    is_first_slice: bool,
+    overlap_delta: timedelta,
+    business_tz_name: str,
+    logged_tz_context: bool,
+) -> Tuple[datetime, datetime, bool]:
+    """
+    Вычисляет реальные границы окна для Phoenix (с учётом возможного «захлёста» на первом слайсе)
+    и печатает разовый контекст TZ + подробный DEBUG-лог по окну.
+    Возвращает (s_q, e_q, logged_tz_context).
+    """
+    # Захлёст (только на первом слайсе, если включён)
+    use_overlap = overlap_delta if (is_first_slice and overlap_delta > timedelta(0)) else timedelta(0)
+    s_q = s - use_overlap if use_overlap > timedelta(0) else s
+    e_q = e  # правую границу не сдвигаем
 
-    setup_logging(args.log_level)
-    _reduce_noise_for_info_mode()
-    cfg = Settings()
-    _install_signal_handlers()
+    # Разовый лог TZ-контекста
+    if not logged_tz_context:
+        try:
+            _s_aware = s if s.tzinfo else s.replace(tzinfo=timezone.utc)
+            _biz_offset_min = int(((_s_aware.astimezone(_get_tz(business_tz_name))).utcoffset() or timedelta(0)).total_seconds() // 60)
+        except Exception:
+            _biz_offset_min = 0
+        log.info("TZ context: business_tz=%s, business_offset=%+d мин; partitions=UTC",
+                 business_tz_name, _biz_offset_min)
+        logged_tz_context = True
 
-    process_name = ("manual_" + str(getattr(cfg, "PROCESS_NAME", ""))) if args.manual_start else cfg.PROCESS_NAME
-    # Manual mode: отключаем гейтинг публикации и включаем бэкфилл «пропущенных» дней (за окно запуска)
-    manual_mode = bool(args.manual_start)
+    # Подробности окна — только в DEBUG
+    if log.isEnabledFor(logging.DEBUG):
+        if use_overlap > timedelta(0):
+            log.debug(
+                "Слайс (бизнес): %s → %s | Phoenix: %s → %s | overlap=%d мин",
+                s.isoformat(), e.isoformat(), s_q.isoformat(), e_q.isoformat(),
+                int(use_overlap.total_seconds() // 60),
+            )
+        else:
+            log.debug(
+                "Слайс (бизнес): %s → %s | Phoenix: %s → %s",
+                s.isoformat(), e.isoformat(), s_q.isoformat(), e_q.isoformat(),
+            )
+    return s_q, e_q, logged_tz_context
 
-    if manual_mode:
-        # В ручном режиме включаем backfill пропущенных дней (только в финале запуска).
-        # Гейтинг публикации отключается ниже через publish_only_if_new = ... and (not manual_mode).
-        backfill_missing_enabled = True
-    else:
-        backfill_missing_enabled = False
+
+def _plan_run_with_heartbeat(
+    journal: "ProcessJournal",
+    s: datetime,
+    e: datetime,
+    host: str,
+    pid: int,
+    hb_interval_sec: int,
+    total_written_ch: int,
+) -> Tuple[int, Callable[[int, int], None]]:
+    """
+    Планирует слайс (с санацией конфликтующих planned), переводит в running и
+    возвращает (run_id, maybe_hb).
+    `maybe_hb(rows_read, total_written_ch)` — замыкание с троттлингом по времени.
+    """
+    # Санация «планов», затем mark_planned с защитой от гонки (UniqueViolation)
     try:
-        pg: Any = PGClient(cfg.PG_DSN)  # type: ignore[assignment] - наш PGClient совместим по факту; протокол покрывается cast(Any, pg) ниже
+        _clear_planned = getattr(journal, "clear_conflicting_planned", None)
+        if callable(_clear_planned):
+            _clear_planned(s, e)
+    except Exception:
+        pass
+    try:
+        journal.mark_planned(s, e)
+    except UniqueViolation:
+        _clear_planned = getattr(journal, "clear_conflicting_planned", None)
+        if callable(_clear_planned):
+            _clear_planned(s, e)
+        journal.mark_planned(s, e)
+
+    run_id = journal.mark_running(s, e, host=host, pid=pid)
+
+    # Жёсткая нижняя граница, чтобы не «топить» БД
+    if hb_interval_sec < 5:
+        hb_interval_sec = 5
+    _next_deadline = perf_counter() + hb_interval_sec
+
+    # Стартовый heartbeat (best effort)
+    try:
+        journal.heartbeat(run_id, progress={"rows_read": 0, "rows_written": total_written_ch})
+    except Exception:
+        pass
+
+    def maybe_hb(rows_read: int, total_written: int) -> None:
+        nonlocal _next_deadline
+        nowp = perf_counter()
+        if nowp >= _next_deadline:
+            try:
+                journal.heartbeat(run_id, progress={"rows_read": rows_read, "rows_written": total_written})
+            except Exception:
+                pass
+            _next_deadline = nowp + hb_interval_sec
+
+    return run_id, maybe_hb
+
+
+def _connect_pg_and_journal(cfg: "Settings", process_name: str) -> Tuple["PGClient", "ProcessJournal"]:
+    """
+    Подключение к Postgres и инициализация журнала запусков.
+    Быстрый фаст‑фейл при ошибке, с печатью подробностей (при DEBUG/ETL_TRACE_EXC=1).
+    Возвращает кортеж (pg, journal).
+    """
+    try:
+        pg = PGClient(cfg.PG_DSN)
     except PGConnectionError as e:
         _log_maybe_trace(logging.CRITICAL, f"FATAL: postgres connect/init failed: {e}", exc=e, cfg=cfg)
         raise SystemExit(2)
@@ -793,68 +1012,86 @@ def main():  # NOSONAR - оркестратор ETL высокого уровн�
         _log_maybe_trace(logging.CRITICAL, f"FATAL: unexpected error during postgres init: {e.__class__.__name__}: {e}", exc=e, cfg=cfg)
         raise SystemExit(2)
 
-    journal = ProcessJournal(cast(Any, pg), cfg.JOURNAL_TABLE, process_name)  # type: ignore[arg-type]  # Приведение типов для Pylance: наш PGClient совместим по факту
+    journal = ProcessJournal(cast(Any, pg), cfg.JOURNAL_TABLE, process_name)  # type: ignore[arg-type]
     journal.ensure()
-
     # Безопасно создаём/обновляем строку состояния процесса (если поддерживается журналом).
     try:
         if hasattr(journal, "_state_upsert"):
-            journal._state_upsert(status='idle', healthy=None, extra={})
+            journal._state_upsert(status="idle", healthy=None, extra={})
     except Exception:
         # Не препятствуем запуску, если bootstrap состояния не удался
         pass
+    return pg, journal
 
-    # ---- БИЗНЕС-ИНТЕРВАЛ ЗАПУСКА ----
-    since_dt, until_dt, used_watermark, auto_until, _auto_window_hours, business_tz_name, _ = \
-        _build_time_window(cfg, args, journal)
 
-    step_min = int(getattr(cfg, "STEP_MIN", 60))
-
-    if used_watermark:
-        log.info("since не указан: использую watermark из журнала (inc_process_state).")
-    if auto_until:
-        log.info("until не указан: использую since + %d ч (RUN_WINDOW_HOURS).", _auto_window_hours)
-
-    # Вспомогательная функция стартовой ошибки
-    def _startup_fail(component: str, exc: Exception, extra: Optional[Dict[str, Any]] = None) -> None:
-        msg = f"{component} connect/init failed: {exc}"
-        _log_maybe_trace(logging.ERROR, f"Стартовая ошибка компонента {component}: {msg}", exc=exc, cfg=cfg)
-        try:
-            _mark_startup_error = getattr(journal, "mark_startup_error", None)
-            if callable(_mark_startup_error):
-                _mark_startup_error(
-                    msg,
-                    component=component,
-                    since=since_dt,
-                    until=until_dt,
-                    host=socket.gethostname(),
-                    pid=os.getpid(),
-                    extra=extra or {}
-                )
-        except Exception:
-            pass
-        raise SystemExit(2)
-
-    # ---- КОННЕКТЫ ----
-    phx: Optional[PhoenixClient] = None
-    ch: Optional[CHClient] = None
-    # Клиент Phoenix: protobuf и timestamp уже зафиксированы по умолчанию в самом клиенте
+def _startup_fail_with_journal(
+    journal: "ProcessJournal",
+    since_dt: datetime,
+    until_dt: datetime,
+    cfg: "Settings",
+    component: str,
+    exc: Exception,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Единый обработчик стартовых ошибок компонентов (PG/CH/Phoenix).
+    Пишет подробный лог + фиксирует ошибку в журнале, после чего аварийно завершает процесс.
+    """
+    msg = f"{component} connect/init failed: {exc}"
+    _log_maybe_trace(logging.ERROR, f"Стартовая ошибка компонента {component}: {msg}", exc=exc, cfg=cfg)
     try:
-        phx = PhoenixClient(cfg.PQS_URL, fetchmany_size=cfg.PHX_FETCHMANY_SIZE)
-    except Exception as e:
-        _startup_fail("phoenix", e, extra={"url": cfg.PQS_URL})
+        _mark_startup_error = getattr(journal, "mark_startup_error", None)
+        if callable(_mark_startup_error):
+            _mark_startup_error(
+                msg,
+                component=component,
+                since=since_dt,
+                until=until_dt,
+                host=socket.gethostname(),
+                pid=os.getpid(),
+                extra=extra or {},
+            )
+    except Exception:
+        # Журнал — best effort, не даём вторичной ошибке перекрыть исходную
+        pass
+    raise SystemExit(2)
 
+
+def _connect_phx_client(
+    cfg: "Settings",
+    on_fail: Callable[[str, Exception, Optional[Dict[str, Any]]], None],
+) -> "PhoenixClient":
+    """
+    Подключение к Phoenix(PQS). Все «дорогие» параметры (fetchmany_size и пр.)
+    берём из конфига, TCP‑пробу не трогаем (сохраняем переменную PHX_TCP_PROBE_TIMEOUT_MS).
+    """
+    try:
+        client = PhoenixClient(cfg.PQS_URL, fetchmany_size=cfg.PHX_FETCHMANY_SIZE)
+    except Exception as e:
+        # ВАЖНО: передаём extra позиционно, т.к. on_fail типизирован как Callable[[str, Exception, Optional[Dict[str, Any]]], None]
+        # и Pylance ожидает ровно позиционные аргументы (если передать extra=..., получим "Expected 1 more positional argument").
+        on_fail("phoenix", e, {"url": cfg.PQS_URL})
+        raise  # недостижимо
+    # Короткий информативный лог хоста/порта
     try:
         _u = urlparse(cfg.PQS_URL)
         _host = _u.hostname or cfg.PQS_URL
         _port = f":{_u.port}" if _u.port else ""
         log.info("Phoenix(PQS) подключён (%s%s)", _host, _port)
     except Exception:
-        # На случай нестандартного URL хотя бы сообщим, что клиент готов
         log.info("Phoenix(PQS) клиент инициализирован")
+    return client
 
+
+def _connect_ch_client(
+    cfg: "Settings",
+    on_fail: Callable[[str, Exception, Optional[Dict[str, Any]]], None],
+) -> "CHClient":
+    """
+    Подключение к ClickHouse (native, компрессия включена). В случае ошибки — единый обработчик.
+    """
     try:
-        ch  = CHClient(
+        ch = CHClient(
             hosts=cfg.ch_hosts_list(),
             port=cfg.CH_PORT,
             database=cfg.CH_DB,
@@ -863,55 +1100,38 @@ def main():  # NOSONAR - оркестратор ETL высокого уровн�
             compression=True,
         )
     except Exception as e:
-        _startup_fail("clickhouse", e, extra={"hosts": cfg.ch_hosts_list(), "db": cfg.CH_DB})
+        # ВАЖНО: extra только позиционно — см. комментарий про Callable и проверку Pylance.
+        on_fail("clickhouse", e, {"hosts": cfg.ch_hosts_list(), "db": cfg.CH_DB})
+        raise  # недостижимо
     try:
         log.info("ClickHouse: db=%s, cluster=%s, hosts=%s", cfg.CH_DB, getattr(cfg, "CH_CLUSTER", None), ",".join(cfg.ch_hosts_list()))
     except Exception:
         pass
+    return ch
 
-    # Static type-narrowing for editors/type-checkers: к этому моменту коннекты гарантированно установлены
-    assert phx is not None, "phoenix client not initialized"
-    assert ch is not None, "clickhouse client not initialized"
 
-    host = socket.gethostname()
-    pid = os.getpid()
-
-    # Счётчики/аккумуляторы текущего запуска
-    total_read = 0
-    total_written_ch = 0
-    pending_parts: Set[int] = set()
-    slices_since_last_pub = 0
-    _new_rows_since_pub_by_part: Dict[int, int] = defaultdict(int)
-
-    ch_table_raw_all   = cfg.CH_RAW_TABLE
-    ch_table_clean     = cfg.CH_CLEAN_TABLE
-    ch_table_buf       = cfg.CH_DEDUP_BUF_TABLE
-    def _should_trigger_publish_local() -> bool:
-        """Мини-хелпер: решает, пора ли публиковать (минимизируем условия в горячей функции)."""
-        return publish_every_slices > 0 and slices_since_last_pub >= publish_every_slices
-
-    def _after_publish_update_state(published: Set[int]) -> None:
-        """Сбрасывает счётчики «новизны» и очищает pending_parts после успешной публикации."""
-        nonlocal slices_since_last_pub
-        for p in published:
-            _new_rows_since_pub_by_part[p] = 0
-            pending_parts.discard(p)
-        slices_since_last_pub = 0
-    ch_batch = int(cfg.CH_INSERT_BATCH)
-
-    required_tables = [t for t in (ch_table_raw_all, ch_table_clean, getattr(cfg, "CH_CLEAN_ALL_TABLE", None), ch_table_buf) if t]
+def _ensure_ch_tables_or_fail(
+    ch: "CHClient",
+    cfg: "Settings",
+    required_tables: List[str],
+    on_fail: Callable[[str, Exception, Optional[Dict[str, Any]]], None],
+) -> None:
+    """
+    Ранний контроль наличия критичных таблиц ClickHouse — быстрый «фатальный» выход при проблеме.
+    """
     try:
         ch.ensure_tables(
             required_tables,
             db=cfg.CH_DB,
             cluster=getattr(cfg, "CH_CLUSTER", None),
-            try_switch_host=True
+            try_switch_host=True,
         )
     except Exception as ex:
-        _startup_fail(
+        # ВАЖНО: extra передаём позиционно — иначе Pylance ругается на недостаток позиционных аргументов
+        on_fail(
             "clickhouse",
             ex,
-            extra={
+            {
                 "stage": "ensure_tables",
                 "db": cfg.CH_DB,
                 "hosts": cfg.ch_hosts_list(),
@@ -919,264 +1139,395 @@ def main():  # NOSONAR - оркестратор ETL высокого уровн�
             },
         )
 
-    phx_overlap_min = int(getattr(cfg, "PHX_QUERY_OVERLAP_MINUTES", 0) or 0)
-    overlap_only_first_slice = True  # фиксированная политика: захлёст только на первом слайсе
-    overlap_delta = timedelta(minutes=phx_overlap_min) if phx_overlap_min > 0 else timedelta(0)
 
+def _prepare_publish_flags(cfg: "Settings", manual_mode: bool) -> Tuple[int, bool, bool, int]:
+    """
+    Нормализация флагов публикации:
+    • publish_every_slices — каждые N слайсов делаем публикацию (0 → никогда в середине).
+    • always_publish_at_end — финальная публикация всегда включена (точка согласования).
+    • publish_only_if_new — гейтинг по «новизне» (в manual-режиме выключен).
+    • publish_min_new_rows — порог «новых» строк на партицию.
+    """
     publish_every_slices = int(getattr(cfg, "PUBLISH_EVERY_SLICES", 0) or 0)
-    # Всегда делаем финальную публикацию — это «точка согласования».
-    # Конфиг ALWAYS_PUBLISH_AT_END больше не читаем: поведение зафиксировано для предсказуемости.
-    always_publish_at_end = True
-
-    # Управление публикацией:
-    # В обычном режиме допускаем гейтинг по «новизне»; в manual-режиме он отключён.
+    always_publish_at_end = True  # фиксируем ожидание: в конце всегда публикуем
     publish_only_if_new = bool(int(getattr(cfg, "PUBLISH_ONLY_IF_NEW", 1))) and (not manual_mode)
     publish_min_new_rows = int(getattr(cfg, "PUBLISH_MIN_NEW_ROWS", 1))
+    return publish_every_slices, always_publish_at_end, publish_only_if_new, publish_min_new_rows
 
-    def _collect_missing_parts_between(ch: CHClient, start_dt: datetime, end_dt: datetime) -> Set[int]:
-        """
-        Лёгкий стартовый backfill только для manual-режима:
-        возвращает набор партиций (UTC YYYYMMDD) из RAW, у которых в окне [start_dt; end_dt) есть строки.
-        Выполняем один агрегирующий запрос по whole-window, чтобы не делать N маленьких запросов.
-        Если что-то пойдёт не так — возвращаем пустое множество (не фейлим весь запуск).
-        """
-        return _collect_raw_parts_between(ch, ch_table_raw_all, start_dt, end_dt)
 
-    def _publish_selected_parts(parts: Set[int]) -> bool:
-        """Обёртка над _publish_parts с лаконичным логированием; возвращает факт публикации.
-        Выделено в отдельный хелпер для снижения когнитивной сложности `_maybe_publish_after_slice`.
-        Нагрузка минимальна: вызывается не чаще, чем раз на порог публикации.
-        """
-        if not parts:
-            # Порог новых строк не достигнут — фиксируем это на уровне INFO и выходим
-            log.info(
-                "Промежуточная публикация отложена гейтингом (порог=%d, слайсы=%d/%d).",
-                publish_min_new_rows, slices_since_last_pub, publish_every_slices,
+# --- Вспомогательные хелперы для конфигов и параметров ETL ---
+def _required_ch_tables(cfg: "Settings") -> List[str]:
+    """
+    Компактный список обязательных таблиц ClickHouse.
+    Вынос в отдельный хелпер снижает когнитивную сложность места вызова
+    и делает состав таблиц очевиднее.
+    """
+    return [
+        t for t in (
+            cfg.CH_RAW_TABLE,
+            cfg.CH_CLEAN_TABLE,
+            getattr(cfg, "CH_CLEAN_ALL_TABLE", None),
+            cfg.CH_DEDUP_BUF_TABLE,
+        ) if t
+    ]
+
+
+def _resolve_phx_overlap(cfg: "Settings") -> timedelta:
+    """
+    Нормализация «захлёста» окна запроса в Phoenix.
+    Возвращает timedelta(minutes=PHX_QUERY_OVERLAP_MINUTES) либо 0.
+    Вынесено для снижения количества ветвлений в _run_etl_impl.
+    """
+    try:
+        m = int(getattr(cfg, "PHX_QUERY_OVERLAP_MINUTES", 0) or 0)
+    except Exception:
+        m = 0
+    return timedelta(minutes=m) if m > 0 else timedelta(0)
+
+
+def _resolve_step_min(cfg: "Settings") -> int:
+    """
+    Нормализация шага слайсера (в минутах). Вынос в хелпер убирает условность
+    из _run_etl_impl и делает поведение явным.
+    """
+    try:
+        step = int(getattr(cfg, "STEP_MIN", 60))
+    except Exception:
+        step = 60
+    return step
+
+
+
+# --- Мелкие чистые хелперы для снижения когнитивной сложности «горячей» функции ---
+
+def _phx_naive_bounds(s_q: datetime, e_q: datetime) -> Tuple[datetime, datetime]:
+    """Переводит aware-границы запроса к Phoenix в naive UTC (phoenixdb этого требует)."""
+    s_q_phx = s_q.replace(tzinfo=None) if s_q.tzinfo else s_q
+    e_q_phx = e_q.replace(tzinfo=None) if e_q.tzinfo else e_q
+    return s_q_phx, e_q_phx
+
+
+def _resolve_phx_table_and_cols(cfg: "Settings") -> Tuple[str, str, List[str]]:
+    """Быстрый и явный резолв таблицы/TS-колонки/набора столбцов для Phoenix.
+    В отдельной функции, чтобы не добавлять ветвления в _process_one_slice.
+    """
+    table = getattr(cfg, "HBASE_MAIN_TABLE", None)
+    ts_col = getattr(cfg, "HBASE_MAIN_TS_COLUMN", None)
+    if not table or not ts_col:
+        raise TypeError("HBASE_MAIN_TABLE/HBASE_MAIN_TS_COLUMN не заданы в конфиге")
+    cols: List[str] = [str(c) for c in CH_COLUMNS]
+    return cast(str, table), cast(str, ts_col), cols
+
+
+def _flush_ch_buffer(
+    *,
+    ch_table_raw_all: str,
+    ch_rows_local: List[tuple],
+    insert_rows: Callable[[str, List[tuple], Tuple[str, ...]], int],
+    maybe_hb: Callable[[int, int], None],
+    rows_read_snapshot: int,
+) -> int:
+    """Финальный/пороговый сброс буфера в ClickHouse. Возвращает число записанных строк.
+    Вынесено в отдельный хелпер ради читаемости и -1 к когнитивной сложности.
+    """
+    if not ch_rows_local:
+        return 0
+    written = insert_rows(ch_table_raw_all, ch_rows_local, CH_COLUMNS)
+    ch_rows_local.clear()
+    # Heartbeat после фактической записи — best effort
+    maybe_hb(rows_read_snapshot, written)
+    return written
+
+
+def _proc_phx_batch(
+    batch: Iterable[Dict[str, Any]],
+    *,
+    ch_batch: int,
+    ch_rows_local: List[tuple],
+    row_to_tuple: Callable[[Dict[str, Any]], tuple],
+    opd_to_part: Callable[[Any], Optional[int]],
+    new_rows_since_pub_by_part: Dict[int, int],
+    insert_rows: Callable[[str, List[tuple], Tuple[str, ...]], int],
+    ch_table_raw_all: str,
+    maybe_hb: Callable[[int, int], None],
+    rows_read_snapshot: int,
+) -> int:
+    """Обработка одного batсh из Phoenix: подготовка кортежей → пороговые INSERT'ы в CH.
+    Возвращает, сколько строк записано в CH в рамках обработки конкретного batch.
+    Выделено отдельно, чтобы убрать вложенные ветвления из _process_one_slice.
+    """
+    written_now = 0
+    append_row = ch_rows_local.append
+    for r in batch:
+        p = opd_to_part(r.get("opd"))
+        if p is not None:
+            new_rows_since_pub_by_part[p] += 1
+        append_row(row_to_tuple(r))
+        # Пороговая отправка в ClickHouse — минимальные проверки в «горячем пути»
+        if ch_batch > 0 and len(ch_rows_local) >= ch_batch:
+            written_now += insert_rows(ch_table_raw_all, ch_rows_local, CH_COLUMNS)
+            ch_rows_local.clear()
+            maybe_hb(rows_read_snapshot, written_now)
+    return written_now
+
+
+# --- Вынос «горячей» логики одного слайса в отдельный быстрый хелпер ---
+# Цель: снизить когнитивную сложность _execute_with_lock, не трогая поведение.
+# Здесь нет журналирования статусов (кроме heartbeat) и публикации —
+# только чтение из Phoenix → нормализация → batch INSERT в RAW + сбор партиций.
+
+def _process_one_slice(
+    *,
+    cfg: "Settings",
+    phx: "PhoenixClient",
+    ch_table_raw_all: str,
+    ch_batch: int,
+    s_q: datetime,
+    e_q: datetime,
+    row_to_tuple: Callable[[Dict[str, Any]], tuple],
+    opd_to_part: Callable[[Any], Optional[int]],
+    insert_rows: Callable[[str, List[tuple], Tuple[str, ...]], int],
+    maybe_hb: Callable[[int, int], None],
+    new_rows_since_pub_by_part: Dict[int, int],
+    pending_parts: Set[int],
+) -> Tuple[int, int]:
+    """
+    Обрабатывает один слайс окна без побочных эффектов журналирования и публикации.
+    Возвращает: (rows_read, rows_written_now).
+
+    Скорость/стабильность:
+    • Убраны неиспользуемые параметры — минус аллокации и предупреждения анализаторов.
+    • Вспомогательные хелперы (_phx_naive_bounds/_resolve_phx_table_and_cols/_proc_phx_batch/_flush_ch_buffer)
+      выносят ветвления и уменьшают когнитивную сложность без влияния на «горячий путь».
+    """
+    # 1) Границы запроса для Phoenix в naive UTC (phoenixdb этого требует)
+    s_q_phx, e_q_phx = _phx_naive_bounds(s_q, e_q)
+
+    # 2) Параметры таблицы источника
+    table, ts_col, cols = _resolve_phx_table_and_cols(cfg)
+
+    rows_read = 0
+    written_now = 0
+    ch_rows_local: List[tuple] = []
+
+    # 3) Чтение данных из Phoenix с адаптивной вытяжкой
+    for batch in phx.fetch_increment_adaptive(table, ts_col, cols, s_q_phx, e_q_phx):
+        # NB: избегаем лишних ветвлений — простая проверка размера
+        batch_len = len(batch) if batch else 0
+        if batch_len:
+            rows_read += batch_len
+            written_now += _proc_phx_batch(
+                batch,
+                ch_batch=ch_batch,
+                ch_rows_local=ch_rows_local,
+                row_to_tuple=row_to_tuple,
+                opd_to_part=opd_to_part,
+                new_rows_since_pub_by_part=new_rows_since_pub_by_part,
+                insert_rows=insert_rows,
+                ch_table_raw_all=ch_table_raw_all,
+                maybe_hb=maybe_hb,
+                rows_read_snapshot=rows_read,
             )
-            return False
+        # Heartbeat по времени/объёму — независимо от пустых батчей
+        maybe_hb(rows_read, written_now)
 
-        ok = _publish_parts(ch, cfg, pg, process_name, parts)
-        if ok:
-            log.info("Промежуточная публикация: %d партиций.", len(parts))
-        else:
-            log.debug(
-                "Промежуточная публикация пропущена: parts_to_publish=%s не прошли гейтинг.",
-                ",".join(str(p) for p in sorted(parts)),
-            )
-        return ok
+    # 4) Финальный доброс в CH (если что-то осталось в буфере)
+    written_now += _flush_ch_buffer(
+        ch_table_raw_all=ch_table_raw_all,
+        ch_rows_local=ch_rows_local,
+        insert_rows=insert_rows,
+        maybe_hb=maybe_hb,
+        rows_read_snapshot=rows_read,
+    )
 
-    def _maybe_publish_after_slice() -> None:
-        # Быстрый ранний выход: нет порога — нет публикации
-        if not _should_trigger_publish_local():
-            return
+    # 5) Партиции UTC, затронутые слайсом (используем уже готовый быстрый генератор)
+    for p in _iter_partitions_by_day_tz(s_q, e_q, "UTC"):
+        pending_parts.add(p)
 
-        # Отладочная печать состояния гейтинга (в DEBUG)
-        _log_gating_debug(
+    return rows_read, written_now
+
+def _run_one_slice_and_maybe_publish(
+    params: ExecParams,
+    s: datetime,
+    e: datetime,
+    *,
+    ch_table_raw_all: str,
+    ch_batch: int,
+    logged_tz_context: bool,
+    is_first_slice: bool,
+    slices_since_last_pub: int,
+    total_written_ch: int,
+    pending_parts: Set[int],
+    new_rows_since_pub_by_part: Dict[int, int],
+    after_publish: Callable[[Set[int]], None],
+) -> Tuple[int, int, bool, bool, int, int]:
+    """
+    Выполняет полный цикл обработки одного слайса: планирование в журнале, чтение Phoenix,
+    batch‑вставки в RAW, промежуточная публикация и финальный mark_done.
+    Возвращает:
+        rows_read, written_now, is_first_slice, logged_tz_context, slices_since_last_pub, total_written_ch
+    """
+    # 1) Окно Phoenix + разовый лог TZ-контекста
+    s_q, e_q, logged_tz_context = _compute_phx_slice_and_log(
+        s,
+        e,
+        is_first_slice,
+        params.overlap_delta,
+        params.business_tz_name,
+        logged_tz_context,
+    )
+
+    # 2) Планирование слайса + heartbeat с троттлингом
+    hb_interval_sec = int(getattr(params.cfg, "JOURNAL_HEARTBEAT_MIN_INTERVAL_SEC", 300) or 300)
+    run_id, maybe_hb = _plan_run_with_heartbeat(
+        params.journal,
+        s,
+        e,
+        params.host,
+        params.pid,
+        hb_interval_sec,
+        total_written_ch,
+    )
+
+    # 3) Основная работа: чтение Phoenix → нормализация → INSERT в CH
+    try:
+        rows_read, written_now = _process_one_slice(
+            cfg=params.cfg,
+            phx=params.phx,
+            ch_table_raw_all=ch_table_raw_all,
+            ch_batch=ch_batch,
+            s_q=s_q,
+            e_q=e_q,
+            row_to_tuple=_row_to_ch_tuple,
+            opd_to_part=_opd_to_part_utc,
+            insert_rows=params.ch.insert_rows,
+            maybe_hb=maybe_hb,
+            new_rows_since_pub_by_part=new_rows_since_pub_by_part,
             pending_parts=pending_parts,
-            new_rows_by_part=_new_rows_since_pub_by_part,
-            publish_min_new_rows=publish_min_new_rows,
+        )
+        total_written_ch = total_written_ch + written_now
+        slices_since_last_pub += 1
+        is_first_slice = False
+
+        # 4) Промежуточная публикация ДО mark_done()
+        _maybe_intermediate_publish(
+            pending_parts=pending_parts,
+            new_rows_by_part=new_rows_since_pub_by_part,
+            publish_every_slices=params.publish_every_slices,
             slices_since_last_pub=slices_since_last_pub,
-            publish_every_slices=publish_every_slices,
+            publish_only_if_new=params.publish_only_if_new,
+            publish_min_new_rows=params.publish_min_new_rows,
+            ch=params.ch,
+            cfg=params.cfg,
+            pg=params.pg,
+            process_name=params.process_name,
+            after_publish=after_publish,
         )
 
-        # Определяем набор партиций к публикации согласно гейтинг-политике
-        parts_to_publish = _select_parts_to_publish(
-            pending_parts=pending_parts,
-            publish_only_if_new=publish_only_if_new,
-            publish_min_new_rows=publish_min_new_rows,
-            new_rows_by_part=_new_rows_since_pub_by_part,
+        # 5) Закрываем слайс в журнале и печатаем компактный итог
+        params.journal.mark_done(s, e, rows_read=rows_read, rows_written=total_written_ch)
+        _pp = ",".join(str(p) for p in sorted(pending_parts)) or "-"
+        log.info(
+            "Слайс завершён: %s → %s (PHX: %s → %s); rows_read=%d, rows_written_raw_total=%d, pending_parts=%s",
+            s.isoformat(),
+            e.isoformat(),
+            s_q.isoformat(),
+            e_q.isoformat(),
+            rows_read,
+            total_written_ch,
+            _pp,
         )
+        return rows_read, written_now, is_first_slice, logged_tz_context, slices_since_last_pub, total_written_ch
 
-        # Публикуем (если есть что), и при успехе обновляем состояние счётчиков
-        if _publish_selected_parts(parts_to_publish):
-            _after_publish_update_state(parts_to_publish)
+    except KeyboardInterrupt:
+        try:
+            _mark_cancelled = getattr(params.journal, "mark_cancelled", None)
+            if callable(_mark_cancelled):
+                _mark_cancelled(s, e, message=_interrupt_message())
+            else:
+                params.journal.mark_error(s, e, message=_interrupt_message())
+        except Exception:
+            pass
+        raise
+    except Exception as ex:
+        # NB: фиксируем прогресс и ошибку; пробрасываем исключение наверх — поведение не меняется.
+        params.journal.heartbeat(run_id, progress={"error": str(ex)})
+        params.journal.mark_error(s, e, message=str(ex))
+        raise
+
+def _execute_with_lock(params: ExecParams) -> Tuple[int, int]:
+    """
+    Основной сценарий выполнения под advisory‑lock из журнала.
+    Возвращает (total_read, total_written_ch).
+    ВНИМАНИЕ: параметры сгруппированы в ExecParams для снижения S107; внутри
+    активно используются локальные ссылки на поля params для скорости.
+    """
+    # Локальные ссылки (ускоряют доступ в горячем пути)
+    journal = params.journal
+    cfg = params.cfg
+    ch = params.ch
+    pg = params.pg
+    process_name = params.process_name
+    since_dt = params.since_dt
+    until_dt = params.until_dt
+    step_min = params.step_min
+    always_publish_at_end = params.always_publish_at_end
+    backfill_missing_enabled = params.backfill_missing_enabled
+
+    total_read = 0
+    total_written_ch = 0
+    pending_parts: Set[int] = set()
+    slices_since_last_pub = 0
+    new_rows_since_pub_by_part: Dict[int, int] = defaultdict(int)
+
+    ch_table_raw_all = cfg.CH_RAW_TABLE
+    ch_batch = int(cfg.CH_INSERT_BATCH)
+
+    def _after_publish_update_state(published: Set[int]) -> None:
+        nonlocal slices_since_last_pub
+        for p in published:
+            new_rows_since_pub_by_part[p] = 0
+            pending_parts.discard(p)
+        slices_since_last_pub = 0
 
     try:
         with journal.exclusive_lock() as got:
             if not got:
                 log.warning("Другой инстанс '%s' уже выполняется — выходим.", process_name)
-                return
+                return total_read, total_written_ch
 
-            # === Санация "зависших" запусков ===========================================
-            # ВАЖНО: это НЕ ретенция данных (её делает journal партициями), а логическая
-            # санация актуального состояния: переводим "planned" старше N минут в "skipped",
-            # "running" без heartbeat старше M минут — в "error". Это позволяет новому
-            # запуску безболезненно продолжить работу, даже если предыдущий умер.
-            # TTL здесь лишь для статусов, а не для физической очистки строк.
+            # Санация «зависших» запусков
             journal.sanitize_stale(
                 planned_ttl_minutes=60,
                 running_heartbeat_timeout_minutes=45,
                 running_hard_ttl_hours=12,
             )
 
+            # Лёгкий стартовый бэкфилл недопубликованных партиций (REPLACE идемпотентен)
             _perform_startup_backfill(ch=ch, cfg=cfg, until_dt=until_dt, process_name=process_name, pg=pg)
 
             logged_tz_context = False
             is_first_slice = True
-            # === Чтение из Phoenix и запись в RAW ======================================
-            # Каждый слайс: planned → running → чтение Phoenix батчами → INSERT VALUES в RAW
-            # → heartbeat прогресса → накопление pending_parts (UTC-дни) → mark_done →
-            # условная промежуточная публикация по порогу слайсов.
+
             for s, e in iter_slices(since_dt, until_dt, step_min):
                 _check_stop()
-                s_q_base = s
-                e_q_base = e
+                rows_read, _, is_first_slice, logged_tz_context, slices_since_last_pub, total_written_ch = _run_one_slice_and_maybe_publish(
+                    params,
+                    s,
+                    e,
+                    ch_table_raw_all=ch_table_raw_all,
+                    ch_batch=ch_batch,
+                    logged_tz_context=logged_tz_context,
+                    is_first_slice=is_first_slice,
+                    slices_since_last_pub=slices_since_last_pub,
+                    total_written_ch=total_written_ch,
+                    pending_parts=pending_parts,
+                    new_rows_since_pub_by_part=new_rows_since_pub_by_part,
+                    after_publish=_after_publish_update_state,
+                )
+                total_read += rows_read
 
-                use_overlap = overlap_delta if (is_first_slice or not overlap_only_first_slice) else timedelta(0)
-                s_q = s_q_base - use_overlap if use_overlap > timedelta(0) else s_q_base
-                e_q = e_q_base  # без правого лага
-                # ВАЖНО: s_q/e_q — это именно UTC-aware времена бизнес-окна;
-                # Phoenix ниже получает naive UTC (tzinfo=None) для параметров запроса.
-
-                # небольшой контекст TZ для логов (информативно; партиции — всегда UTC)
-                try:
-                    _s_aware = s if s.tzinfo else s.replace(tzinfo=timezone.utc)
-                    _biz_offset_min = int(((_s_aware.astimezone(_get_tz(business_tz_name))).utcoffset() or timedelta(0)).total_seconds() // 60)
-                except Exception:
-                    _biz_offset_min = 0
-
-                # Однократный лог TZ context
-                if not logged_tz_context:
-                    log.info("TZ context: business_tz=%s, business_offset=%+d мин; partitions=UTC",
-                             business_tz_name, _biz_offset_min)
-                    logged_tz_context = True
-
-                # лог окна (в INFO не шумим — подробности только в DEBUG)
-                if log.isEnabledFor(logging.DEBUG):
-                    if use_overlap > timedelta(0):
-                        log.debug(
-                            "Слайс (бизнес): %s → %s | Phoenix: %s → %s | overlap=%d мин",
-                            s.isoformat(), e.isoformat(), s_q.isoformat(), e_q.isoformat(),
-                            int(use_overlap.total_seconds() // 60),
-                        )
-                    else:
-                        log.debug(
-                            "Слайс (бизнес): %s → %s | Phoenix: %s → %s",
-                            s.isoformat(), e.isoformat(), s_q.isoformat(), e_q.isoformat(),
-                        )
-
-                try:
-                    _clear_planned = getattr(journal, "clear_conflicting_planned", None)
-                    if callable(_clear_planned):
-                        _clear_planned(s, e)
-                except Exception:
-                    pass
-                try:
-                    journal.mark_planned(s, e)
-                except UniqueViolation:
-                    _clear_planned = getattr(journal, "clear_conflicting_planned", None)
-                    if callable(_clear_planned):
-                        _clear_planned(s, e)
-                    journal.mark_planned(s, e)
-
-                run_id = journal.mark_running(s, e, host=host, pid=pid)
-                # --- Heartbeat троттлинг для надёжности долгих слайсов ---
-                # Обновляем состояние процесса не чаще, чем раз в JOURNAL_HEARTBEAT_MIN_INTERVAL_SEC,
-                # чтобы не «топить» Postgres и при этом показывать живой прогресс.
-                hb_interval_sec = int(getattr(cfg, "JOURNAL_HEARTBEAT_MIN_INTERVAL_SEC", 300) or 300)
-                if hb_interval_sec < 5:  # хард-сейфти на случай слишком малого значения
-                    hb_interval_sec = 5
-                _next_hb_deadline = perf_counter() + hb_interval_sec
-                # Стартовый heartbeat (необязательно, но полезно для наблюдения)
-                try:
-                    journal.heartbeat(run_id, progress={"rows_read": 0, "rows_written": total_written_ch})
-                except Exception:
-                    # heartbeat — best effort, падать из‑за него не нужно
-                    pass
-
-                rows_read = 0
-                # Локальный хелпер, чтобы не дублировать heartbeat в нескольких местах горячего цикла
-                def _maybe_hb() -> None:
-                    nonlocal _next_hb_deadline
-                    nowp = perf_counter()
-                    if nowp >= _next_hb_deadline:
-                        try:
-                            journal.heartbeat(run_id, progress={"rows_read": rows_read, "rows_written": total_written_ch})
-                        except Exception:
-                            pass
-                        _next_hb_deadline = nowp + hb_interval_sec
-
-                try:
-                    s_q_phx = s_q.replace(tzinfo=None) if s_q.tzinfo else s_q
-                    e_q_phx = e_q.replace(tzinfo=None) if e_q.tzinfo else e_q
-
-                    # Читаем слайс через адаптивную вытяжку клиента Phoenix (единый «источник правды»).
-                    # Клиент сам выполняет бэк-офф/сплит при перегрузке JobManager и режет окно по сетке UTC
-                    # (шаг задаётся PHX_INITIAL_SLICE_MIN; 0 — без нарезки). Это исключает дублирование логики здесь.
-                    table = getattr(cfg, "HBASE_MAIN_TABLE", None)
-                    ts_col = getattr(cfg, "HBASE_MAIN_TS_COLUMN", None)
-                    if not table or not ts_col:
-                        raise TypeError("HBASE_MAIN_TABLE/HBASE_MAIN_TS_COLUMN не заданы в конфиге")
-                    cols = [str(c) for c in CH_COLUMNS]
-
-                    # Микрооптимизации: локальные ссылки — ускоряет горячий цикл
-                    row_to_tuple = _row_to_ch_tuple
-                    opd_to_part = _opd_to_part_utc
-                    insert_rows = ch.insert_rows
-
-                    ch_rows_local: List[tuple] = []
-                    append_row = ch_rows_local.append
-
-                    for batch in phx.fetch_increment_adaptive(table, ts_col, cols, s_q_phx, e_q_phx):
-                        if not batch:
-                            _maybe_hb()
-                            continue
-                        rows_read += len(batch)
-                        for r in batch:
-                            p = opd_to_part(r.get("opd"))
-                            if p is not None:
-                                _new_rows_since_pub_by_part[p] += 1
-                            append_row(row_to_tuple(r))
-                        if ch_batch > 0 and len(ch_rows_local) >= ch_batch:
-                            total_written_ch += insert_rows(ch_table_raw_all, ch_rows_local, CH_COLUMNS)
-                            ch_rows_local.clear()
-                            _maybe_hb()
-
-                    # Финальный доброс оставшихся строк в CH (если буфер не пуст)
-                    if ch_rows_local:
-                        total_written_ch += insert_rows(ch_table_raw_all, ch_rows_local, CH_COLUMNS)
-                        ch_rows_local.clear()
-                        _maybe_hb()
-
-                    # Накопим партиции текущего слайда — СТРОГО ПО UTC (даже если BUSINESS_TZ иная)
-                    for p in _iter_partitions_by_day_tz(s_q, e_q, "UTC"):
-                        pending_parts.add(p)
-                    slices_since_last_pub += 1
-                    is_first_slice = False
-
-                    # ВАЖНО: выполняем гейтинг/промежуточную публикацию ДО mark_done(),
-                    # чтобы возможные ошибки корректно зафиксировались как error по текущему слайсу,
-                    # а не «после завершения».
-                    _maybe_publish_after_slice()
-
-                    journal.mark_done(s, e, rows_read=rows_read, rows_written=total_written_ch)
-                    total_read += rows_read
-
-                    # Строковое представление набора партиций для лаконичного лога
-                    _pp = ",".join(str(p) for p in sorted(pending_parts)) or "-"
-                    log.info(
-                        "Слайс завершён: %s → %s (PHX: %s → %s); rows_read=%d, rows_written_raw_total=%d, pending_parts=%s",
-                        s.isoformat(), e.isoformat(), s_q.isoformat(), e_q.isoformat(),
-                        rows_read, total_written_ch, _pp,
-                    )
-
-                except KeyboardInterrupt:
-                    try:
-                        _mark_cancelled = getattr(journal, "mark_cancelled", None)
-                        if callable(_mark_cancelled):
-                            _mark_cancelled(s, e, message=_interrupt_message())
-                        else:
-                            journal.mark_error(s, e, message=_interrupt_message())
-                    except Exception:
-                        pass
-                    raise
-                except Exception as ex:
-                    # NB: удалён мусорный артефакт `` и выровнена индентация
-                    journal.heartbeat(run_id, progress={"error": str(ex)})
-                    journal.mark_error(s, e, message=str(ex))
-                    raise
-
-            # === Финальная публикация и опциональный бэкфилл ============================
+            # Финальная публикация (и опциональный добор пропущенных партиций)
             if always_publish_at_end:
                 _finalize_publication(
                     ch=ch,
@@ -1187,28 +1538,228 @@ def main():  # NOSONAR - оркестратор ETL высокого уровн�
                     since_dt=since_dt,
                     until_dt=until_dt,
                     backfill_missing_enabled=backfill_missing_enabled,
-                    collect_missing_parts_between=_collect_missing_parts_between,
-                    new_rows_since_pub_by_part=_new_rows_since_pub_by_part,
+                    collect_missing_parts_between=lambda ch_, sdt, edt: _collect_raw_parts_between(ch_, cfg.CH_RAW_TABLE, sdt, edt),
+                    new_rows_since_pub_by_part=new_rows_since_pub_by_part,
                 )
+    finally:
+        # NB: Пустой finally необходим для корректной формы try-блока.
+        # Все реальные ошибки обрабатываются внутри цикла слайсов (per-slice) и выше
+        # по стеку (_run_etl_impl/main). Здесь мы не перехватываем исключения,
+        # чтобы не скрывать причины сбоев; пустой finally не влияет на производительность.
+        pass
+    return total_read, total_written_ch
 
+
+def _log_window_hints(used_watermark: bool, auto_until: bool, auto_window_hours: int) -> None:
+    """
+    Компактный помощник для печати подсказок по окну запуска.
+    Выносит мелкие ветвления из _run_etl_impl, чтобы снизить когнитивную сложность
+    без влияния на производительность.
+    """
+    try:
+        if used_watermark:
+            log.info("since не указан: использую watermark из журнала (inc_process_state).")
+        if auto_until:
+            log.info("until не указан: использую since + %d ч (RUN_WINDOW_HOURS).", int(auto_window_hours))
+    except Exception:
+        # Логирование — best effort
+        pass
+
+
+def _close_quietly(*resources: object) -> None:
+    """
+    Закрывает переданные объекты, если у них есть метод `close()`.
+    Любые исключения при закрытии подавляются — это финальный этап, не критичный для результата.
+    Вынесено из _run_etl_impl для снижения когнитивной сложности (меньше try-блоков).
+    """
+    for r in resources:
+        if r is None:
+            continue
+        try:
+            close = getattr(r, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            # Ничего: на этапе завершения мы не должны «ронять» процесс
+            pass
+
+#
+# --- Мелкие хелперы для снижения когнитивной сложности _run_etl_impl ---
+
+def _resolve_process_name(cfg: "Settings", manual: bool) -> str:
+    """
+    Возвращает имя процесса для журнала с учётом режима.
+    Вынос в отдельный хелпер убирает условную логику из _run_etl_impl
+    (минус к S3776), накладных расходов нет.
+    """
+    base = str(getattr(cfg, "PROCESS_NAME", ""))
+    return ("manual_" + base) if manual else base
+
+
+def _make_startup_fail_handler(
+    journal: "ProcessJournal",
+    since_dt: datetime,
+    until_dt: datetime,
+    cfg: "Settings",
+):
+    """
+    Фабрика колбэка для единообразной обработки стартовых ошибок компонентов.
+    Отдельная функция вместо вложенной `def` в _run_etl_impl снижает когнитивную
+    сложность основной функции (Sonar S3776) и делает код читабельнее.
+    Возвращает замыкание `on_fail(component, exc, extra)`.
+    """
+    def _on_fail(component: str, exc: Exception, extra: Optional[Dict[str, Any]] = None) -> None:
+        _startup_fail_with_journal(journal, since_dt, until_dt, cfg, component, exc, extra)
+    return _on_fail
+
+def _bootstrap_pg_and_window(
+    cfg: "Settings",
+    args: argparse.Namespace,
+    process_name: str,
+) -> Tuple[
+    "PGClient",
+    "ProcessJournal",
+    datetime,
+    datetime,
+    bool,
+    bool,
+    int,
+    str,
+    Callable[[str, Exception, Optional[Dict[str, Any]]], None],
+]:
+    """
+    Компактный бутстрап: подключение к Postgres+журналу и сбор окна запуска.
+    Вынос в отдельный хелпер уменьшает ветвистость `_run_etl_impl` (снижаем S3776)
+    без влияния на производительность: здесь только создание объектов и простая логика.
+    Возвращает кортеж: (pg, journal, since, until, used_watermark, auto_until,
+    auto_window_hours, business_tz_name, on_startup_fail).
+    """
+    pg, journal = _connect_pg_and_journal(cfg, process_name)
+    since_dt, until_dt, used_watermark, auto_until, auto_window_hours, business_tz_name, _ = _build_time_window(cfg, args, journal)
+    on_startup_fail = _make_startup_fail_handler(journal, since_dt, until_dt, cfg)
+    return (
+        pg,
+        journal,
+        since_dt,
+        until_dt,
+        used_watermark,
+        auto_until,
+        auto_window_hours,
+        business_tz_name,
+        on_startup_fail,
+    )
+
+
+def _init_backends_and_check(
+    cfg: "Settings",
+    on_startup_fail: Callable[[str, Exception, Optional[Dict[str, Any]]], None],
+) -> Tuple["PhoenixClient", "CHClient"]:
+    """
+    Инициализация Phoenix и ClickHouse + ранняя проверка таблиц.
+    Вынос в отдельный хелпер даёт -2 к когнитивной сложности `_run_etl_impl`,
+    при этом путь остаётся «горячим» и предельно прямолинейным.
+    """
+    phx = _connect_phx_client(cfg, on_startup_fail)
+    ch = _connect_ch_client(cfg, on_startup_fail)
+    required_tables = _required_ch_tables(cfg)
+    _ensure_ch_tables_or_fail(ch, cfg, required_tables, on_startup_fail)
+    return phx, ch
+
+# --- Новый вынесенный heavy ETL-процесс ---
+def _run_etl_impl(args: argparse.Namespace) -> None:
+    """
+    Реализация ETL-оркестрации вынесена из `_run_etl` для снижения когнитивной сложности (Sonar S3776).
+    """
+    setup_logging(args.log_level)
+    _reduce_noise_for_info_mode()
+    cfg = Settings()
+    _install_signal_handlers()
+
+    manual_mode = bool(args.manual_start)
+    process_name = _resolve_process_name(cfg, manual_mode)
+    # Бэкфилл пропущенных партиций включаем только в ручном режиме
+    backfill_missing_enabled = manual_mode
+
+    phx: Optional[PhoenixClient] = None
+    ch: Optional[CHClient] = None
+    pg: Optional[PGClient] = None
+    try:
+        # PG + журнал + окно запуска + единый обработчик стартовых ошибок
+        (
+            pg,
+            journal,
+            since_dt,
+            until_dt,
+            used_watermark,
+            auto_until,
+            auto_window_hours,
+            business_tz_name,
+            on_startup_fail,
+        ) = _bootstrap_pg_and_window(cfg, args, process_name)
+        _log_window_hints(used_watermark, auto_until, auto_window_hours)
+
+        # Подключения к Phoenix/CH и ранняя проверка критичных таблиц
+        phx, ch = _init_backends_and_check(cfg, on_startup_fail)
+
+        # Политика публикации
+        publish_every_slices, always_publish_at_end, publish_only_if_new, publish_min_new_rows = _prepare_publish_flags(cfg, manual_mode)
+
+        # Параметры Phoenix-окна (захлёст только на первом слайсе)
+        overlap_delta = _resolve_phx_overlap(cfg)
+
+        host = socket.gethostname()
+        pid = os.getpid()
+        step_min = _resolve_step_min(cfg)
+
+        # Основной сценарий под lock журнала
+        params = ExecParams(
+            journal=journal,
+            cfg=cfg,
+            ch=ch,
+            phx=phx,
+            pg=pg,
+            process_name=process_name,
+            host=host,
+            pid=pid,
+            since_dt=since_dt,
+            until_dt=until_dt,
+            step_min=step_min,
+            business_tz_name=business_tz_name,
+            overlap_delta=overlap_delta,
+            publish_every_slices=publish_every_slices,
+            publish_only_if_new=publish_only_if_new,
+            publish_min_new_rows=publish_min_new_rows,
+            always_publish_at_end=always_publish_at_end,
+            backfill_missing_enabled=backfill_missing_enabled,
+        )
+        total_read, total_written_ch = _execute_with_lock(params)
 
         log.info("Готово. Прочитано: %d | в CH записано: %d", total_read, total_written_ch)
 
     finally:
-        try:
-            if phx is not None:
-                phx.close()
-        except Exception:
-            pass
-        try:
-            if ch is not None:
-                ch.close()
-        except Exception:
-            pass
-        try:
-            pg.close()
-        except Exception:
-            pass
+        _close_quietly(phx, ch, pg)
+
+def _run_etl(args: argparse.Namespace) -> None:
+    """Тонкая оболочка: делегирует выполнение в `_run_etl_impl` и сразу выходит."""
+    _run_etl_impl(args)
+
+def main():
+    """
+    Тонкая оболочка: только парсинг аргументов и делегирование в `_run_etl`.
+    Это снижает когнитивную сложность `main()` (S3776) без влияния на «горячие» участки.
+    """
+    parser = argparse.ArgumentParser(description="Codes History Incremental (Phoenix→ClickHouse)")
+    # Флаги сведены к минимуму для простоты эксплуатации:
+    #  - --since/--until — бизнес-окно загрузки;
+    #  - --manual-start — пометить запуск как ручной (для журнала);
+    #  - --log-level — уровень логирования (по умолчанию INFO).
+    parser.add_argument("--since", required=False, help="ISO. Наивные значения трактуются в BUSINESS_TZ (если задана), иначе в UTC. Пр: 2025-08-08T00:00:00")
+    parser.add_argument("--until", required=False, help="ISO. Наивные значения трактуются в BUSINESS_TZ (если задана), иначе в UTC. Если не указан — используется since + RUN_WINDOW_HOURS (по умолчанию 24 ч). Пр: 2025-08-09T00:00:00")
+    parser.add_argument("--manual-start", action="store_true", help="Если указан, журнал ведётся под именем 'manual_<PROCESS_NAME>' (ручной запуск).")
+    parser.add_argument("--log-level", "--log", dest="log_level", default="INFO", help="Уровень логирования (alias: --log)")
+
+    args = parser.parse_args()
+    _run_etl(args)
 
 if __name__ == "__main__":
     try:

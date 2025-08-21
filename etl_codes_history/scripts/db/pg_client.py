@@ -41,6 +41,9 @@ except Exception:  # pragma: no cover - в рантайме почти всег�
 
 log = logging.getLogger("scripts.db.pg_client")
 
+# Единая строка для критических сообщений — убираем дублирование литерала (Sonar S1192)
+_LOG_FATAL = "FATAL: %s"
+
 
 class PGConnectionError(Exception):
     """Выбрасывается при первичном фейле подключения к PostgreSQL."""
@@ -119,7 +122,7 @@ class PGClient:
             try:
                 _tcp_probe(host, port, probe_ms)
             except PGConnectionError as e:
-                log.critical("FATAL: %s", e)
+                log.critical(_LOG_FATAL, e)
                 # Даём наружу как уже «управляемую» ошибку — её словит верхний уровень
                 raise
 
@@ -141,14 +144,14 @@ class PGClient:
                 f"cannot connect to PostgreSQL (host={host} port={port} db={dbname or '?'}): "
                 f"{e.__class__.__name__}: {e}"
             )
-            log.critical("FATAL: %s", msg)
+            log.critical(_LOG_FATAL, msg)
             raise PGConnectionError(msg) from e
         except Exception as e:  # на всякий случай схлопываем все неожиданные типы
             msg = (
                 f"cannot connect to PostgreSQL (host={host} port={port} db={dbname or '?'}): "
                 f"{e.__class__.__name__}: {e}"
             )
-            log.critical("FATAL: %s", msg)
+            log.critical(_LOG_FATAL, msg)
             raise PGConnectionError(msg) from e
 
     # psycopg3 сам адаптирует dict/list через psycopg.types.json.Json при передаче,

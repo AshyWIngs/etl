@@ -28,6 +28,7 @@ import socket
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 try:
@@ -113,12 +114,36 @@ def _should_split_window(s0: datetime, e0: datetime, min_split_min: int, depth: 
     return (span_min > min_split_min) and (depth < max_depth)
 
 
+
 def _compute_backoff_seconds(attempt: int) -> float:
     """
     Экспоненциальный бэк-офф с небольшим джиттером.
     Вынесено отдельно, чтобы не загромождать основной цикл.
     """
     return (2.0 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.5)
+
+
+# --- Адаптивные параметры из ENV через dataclass ---
+@dataclass(frozen=True)
+class _AdaptiveParams:
+    """Набор параметров адаптивной вытяжки из ENV.
+    Выделено в dataclass, чтобы упростить код вызова и снизить когнитивную сложность.
+    """
+    init_min: int        # PHX_INITIAL_SLICE_MIN
+    max_attempts: int    # PHX_OVERLOAD_MAX_ATTEMPTS
+    min_split_min: int   # PHX_OVERLOAD_MIN_SPLIT_MIN
+    max_depth: int       # PHX_OVERLOAD_MAX_DEPTH
+
+def _load_adaptive_params_from_env() -> _AdaptiveParams:
+    """Читает ENV и возвращает параметры адаптивной вытяжки с безопасными дефолтами.
+    Вынесено отдельно — это упрощает основной метод и облегчает тестирование.
+    """
+    return _AdaptiveParams(
+        init_min=_env_int("PHX_INITIAL_SLICE_MIN", 5),        # 5 мин по умолчанию (включено)
+        max_attempts=_env_int("PHX_OVERLOAD_MAX_ATTEMPTS", 4),
+        min_split_min=_env_int("PHX_OVERLOAD_MIN_SPLIT_MIN", 2),
+        max_depth=_env_int("PHX_OVERLOAD_MAX_DEPTH", 3),
+    )
 
 
 # ------------------------ основной клиент ------------------------
@@ -355,6 +380,19 @@ class PhoenixClient:
                 raise
 
     # ------------------------ адаптивная вытяжка ------------------------
+
+    def _iter_slices_or_whole(self, f: datetime, t: datetime, init_min: int) -> Iterator[Tuple[datetime, datetime]]:
+        """Единая точка выбора: либо одно окно целиком, либо сеточные слайсы.
+        Нужна, чтобы убрать ветвление из fetch_increment_adaptive и снизить когнитивную сложность.
+        Производительность: генератор очень лёгкий, на горячий путь не влияет.
+        """
+        if init_min <= 0:
+            # Без нарезки — одно окно целиком
+            yield f, t
+            return
+        # С нарезкой — ровно по UTC-сетке (00:00, 00:05, 00:10, ...)
+        yield from _iter_utc_grid(f, t, init_min)
+
     def fetch_increment_adaptive(
         self,
         table: str,
@@ -364,38 +402,29 @@ class PhoenixClient:
         to_dt: datetime,
     ) -> Iterator[List[Dict[str, Any]]]:
         """
-        Единая высокоуровневая вытяжка:
-        • Если PHX_INITIAL_SLICE_MIN > 0 — режем окно на слайсы по UTC-сетке (шаг = PHX_INITIAL_SLICE_MIN).
-          Это стабилизирует нагрузку и лучше прогревает кэши Phoenix.
-        • На каждом слайсе применяем «умный» цикл: попытки с экспоненциальным бэк-оффом и/или рекурсивным сплитом.
-        • Если PHX_INITIAL_SLICE_MIN == 0 — читаем окно одним запросом, но так же с попытками и бэк-оффом.
-        Производительность: основная работа остаётся в fetch_increment; здесь только подготовка параметров
-        и выбор стратегии (нарезка/без нарезки).
+        Единая высокоуровневая вытяжка окна [from_dt; to_dt):
+        • Читает параметры адаптивности из ENV один раз (dataclass `_AdaptiveParams`).
+        • Аккуратно приводит границы к naive UTC (как требует Phoenix).
+        • Итеративно проходит либо одно сплошное окно, либо UTC-слайсы (если включена нарезка),
+          а на каждом отрезке применяет _pull_with_retries (бэк-офф/рекурсивный сплит при перегрузке).
+        Производительность: вся тяжёлая работа в fetch_increment; здесь только дешёвая координация.
         """
         if to_dt <= from_dt:
             return
 
-        # Настройки адаптивности (строго из ENV — не размазываем по config.py).
-        init_min = _env_int("PHX_INITIAL_SLICE_MIN", 5)   # 5 мин по умолчанию (включено)
-        max_attempts = _env_int("PHX_OVERLOAD_MAX_ATTEMPTS", 4)
-        min_split_min = _env_int("PHX_OVERLOAD_MIN_SPLIT_MIN", 2)
-        max_depth = _env_int("PHX_OVERLOAD_MAX_DEPTH", 3)
+        # Параметры адаптивной логики (строго из ENV, централизованно):
+        params = _load_adaptive_params_from_env()
 
-        # Phoenix принимает naive UTC — приводим аккуратно.
+        # Phoenix принимает naive UTC — приводим аккуратно и один раз.
         f = self._as_naive_utc(from_dt)
         t = self._as_naive_utc(to_dt)
 
-        if init_min <= 0:
-            # Режим без нарезки: одно окно, но с ретраями/бэк-оффом при перегрузке.
-            yield from self._pull_with_retries(
-                table, ts_col, columns, f, t,
-                min_split_min=min_split_min, max_depth=max_depth, max_attempts=max_attempts, depth=0,
-            )
-            return
-
-        # Режим с нарезкой: ровно по UTC-«сетке» (00:00, 00:05, 00:10, ...).
-        for s, e in _iter_utc_grid(f, t, init_min):
+        # Единый цикл поверх «одного окна» или «сеточных» срезов.
+        for s, e in self._iter_slices_or_whole(f, t, params.init_min):
             yield from self._pull_with_retries(
                 table, ts_col, columns, s, e,
-                min_split_min=min_split_min, max_depth=max_depth, max_attempts=max_attempts, depth=0,
+                min_split_min=params.min_split_min,
+                max_depth=params.max_depth,
+                max_attempts=params.max_attempts,
+                depth=0,
             )
