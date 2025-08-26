@@ -90,7 +90,12 @@ if TYPE_CHECKING:
 
 from .logging_setup import setup_logging
 from .config import Settings
-from .slicer import iter_slices
+try:
+    # Предпочитаем «сеточный» слайсер для стабильных границ — лучше кэш/планы на источнике
+    from .slicer import iter_slices_grid as _iter_slices_impl  # type: ignore[attr-defined]
+except Exception:
+    # Fallback на старый слайсер, если новой функции нет в этой версии
+    from .slicer import iter_slices as _iter_slices_impl
 from .db.phoenix_client import PhoenixClient
 from .db.pg_client import PGClient, PGConnectionError
 from .db.clickhouse_client import ClickHouseClient as CHClient
@@ -1496,7 +1501,7 @@ def _execute_with_lock(params: ExecParams) -> Tuple[int, int]:
             logged_tz_context = False
             is_first_slice = True
 
-            for s, e in iter_slices(since_dt, until_dt, step_min):
+            for s, e in _iter_slices_impl(since_dt, until_dt, step_min):
                 _check_stop()
                 rows_read, _, is_first_slice, logged_tz_context, slices_since_last_pub, total_written_ch = _run_one_slice_and_maybe_publish(
                     params,
