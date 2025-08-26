@@ -53,7 +53,6 @@ import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from clickhouse_driver import Client as NativeClient  # type: ignore[reportMissingImports]
-import re
 from clickhouse_driver import errors as ch_errors  # type: ignore[reportMissingImports]
 
 
@@ -68,19 +67,104 @@ def _quote_literal(value: str) -> str:
 
 log = logging.getLogger("scripts.db.clickhouse_client")
 
-# Регулярка для безопасной проверки «это INSERT?» с учётом пробелов и комментариев.
-# Нужна из‑за известной особенности clickhouse-driver: если оставить соединение
-# в режиме "force insert" (после большой вставки), то следующий не‑INSERT запрос
-# может быть ошибочно обработан как вставка. Мы явно проверяем начало текста запроса
-# и для не‑INSERT запросов сбрасываем внутренние флаги (см. _clear_force_insert()).
+# Проверку «это INSERT?» выполняем ручным линейным сканером в `_is_insert` (см. ниже):
+# это исключает риски S5852 (catastrophic backtracking) и снижает сложность (S5843),
+# а также убирает зависимость от модуля `re` в этой части.
 
-_INSERT_RE = re.compile(
-    r"^\s*(?:--.*?$|\s|/\*.*?\*/)*INSERT\b",
-    re.IGNORECASE | re.DOTALL | re.MULTILINE,
-)
 
 # Единый «пинг»-запрос к ClickHouse (убираем дублирование строкового литерала "SELECT 1")
 _SQL_PING = "SELECT 1"
+
+# --- Module-level helpers for fast SQL scanning (no regex, O(n)) ---
+
+# --- Linear scanners for whitespace/comments (small helpers to reduce cognitive complexity) ---
+
+def _skip_whitespace(s: str, i: int, n: int) -> int:
+    """
+    Быстро пропускает последовательность пробельных символов (space, tab, CR, LF).
+    Линейная сложность O(k), где k — длина конкретного пробельного блока.
+    """
+    while i < n and s[i] in " \t\r\n":
+        i += 1
+    return i
+
+
+def _skip_line_comment(s: str, i: int, n: int) -> int:
+    """
+    Пропускает комментарий формата `-- ...\n`.
+    Предполагается, что на входе s[i:i+2] == '--'. Возвращает индекс символа
+    после перевода строки (или n, если строка закончилась).
+    """
+    i += 2  # пропустить "--"
+    while i < n and s[i] != "\n":
+        i += 1
+    if i < n:  # съедаем перевод строки, если он есть
+        i += 1
+    return i
+
+
+def _skip_block_comment(s: str, i: int, n: int) -> int:
+    """
+    Пропускает комментарий формата `/* ... */`.
+    Предполагается, что на входе s[i:i+2] == '/*'. Если закрывающего '*/' нет —
+    возвращаем n (конец строки). Линейная сложность O(k).
+    """
+    i += 2  # пропустить "/*"
+    # Ищем закрывающую последовательность '*/' без регэкспов и бэктрекинга
+    while i + 1 < n and not (s[i] == "*" and s[i + 1] == "/"):
+        i += 1
+    if i + 1 < n:
+        i += 2  # съедаем '*/'
+    else:
+        i = n
+    return i
+
+
+def _skip_ws_and_comments(s: str, i: int = 0) -> int:
+    """
+    Линейно пропускает ведущие пробелы и комментарии (-- ...\n и /* ... */),
+    возвращая индекс первого «значимого» символа либо len(s), если ничего нет.
+    Вынесение в маленькие хелперы снижает когнитивную сложность (S3776),
+    сохраняя прежнюю асимптотику и предсказуемость выполнения (O(n)).
+    """
+    n = len(s)
+    while i < n:
+        i0 = i
+        # 1) пробелы
+        i = _skip_whitespace(s, i, n)
+        if i + 1 < n:
+            ch = s[i]
+            nxt = s[i + 1]
+            # 2) комментарий строки: -- ...\n
+            if ch == "-" and nxt == "-":
+                i = _skip_line_comment(s, i, n)
+                continue
+            # 3) блочный комментарий: /* ... */
+            if ch == "/" and nxt == "*":
+                i = _skip_block_comment(s, i, n)
+                continue
+        # Ничего не сдвинули — выходим
+        if i == i0:
+            break
+    return i
+
+
+def _match_word_ci(s: str, i: int, word: str) -> bool:
+    """
+    Сравнивает подстроку s[i:i+len(word)] с `word` без учёта регистра и
+    требует границу слова после совпадения (не [A-Za-z0-9_]).
+    """
+    m = len(word)
+    n = len(s)
+    end = i + m
+    if end > n:
+        return False
+    if s[i:end].lower() != word:
+        return False
+    if end == n:
+        return True
+    nxt = s[end]
+    return not (nxt.isalnum() or nxt == "_")
 
 # Подавляет «портянки» от внутреннего логгера clickhouse-driver при неудачных попытках подключения
 def _configure_driver_logging() -> None:
@@ -245,10 +329,16 @@ class ClickHouseClient:
 
     def _is_insert(self, sql: str) -> bool:
         """
-        Возвращает True, если запрос начинается с ключевого слова INSERT
-        (игнорируя ведущие пробелы и строки комментариев '--' и '/* ... */').
+        Быстрая проверка «это INSERT?»:
+        • пропускаем ведущие пробелы и комментарии (-- …, /* … */) линейным проходом;
+        • далее сверяем первое слово с 'insert' без учёта регистра и требуем границу слова.
+        Реализация вынесена в модульные хелперы для снижения когнитивной сложности (S3776).
         """
-        return bool(_INSERT_RE.match(sql or ""))
+        s = sql or ""
+        if len(s) < 6:
+            return False
+        i = _skip_ws_and_comments(s, 0)
+        return _match_word_ci(s, i, "insert")
 
     def _clear_force_insert(self) -> None:
         """
@@ -524,7 +614,9 @@ class ClickHouseClient:
         """
         last_err: Optional[Exception] = None
         hosts = self.hosts[:]
-        random.shuffle(hosts)
+        # Безопасный тасовщик: SystemRandom использует os.urandom (CSPRNG).
+        # Здесь криптостойкость не критична, но так удовлетворяем S2245 и поведение остаётся тем же.
+        random.SystemRandom().shuffle(hosts)
         for host in hosts:
             try:
                 cli = NativeClient(

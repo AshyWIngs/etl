@@ -22,6 +22,8 @@ PostgreSQL client (psycopg3) с управляемыми ошибками и «�
   CRITICAL scripts.db.pg_client FATAL: cannot connect to PostgreSQL (host=..., port=..., db=...): OperationalError: connection timeout expired
 А верхний уровень (если ловит PGConnectionError) покажет короткое сообщение
 вместо полного traceback.
+- Добавлен хелпер `connect_safely(...)` — единая «вежливая» точка входа для CLI:
+  логирует короткое FATAL без traceback и возвращает None или завершает процесс (по флагу).
 """
 
 from __future__ import annotations
@@ -41,13 +43,14 @@ except Exception:  # pragma: no cover - в рантайме почти всег�
 
 log = logging.getLogger("scripts.db.pg_client")
 
+# Явно экспортируем публичный API модуля
+__all__ = ("PGClient", "PGConnectionError", "connect_safely")
+
 # Единая строка для критических сообщений — убираем дублирование литерала (Sonar S1192)
 _LOG_FATAL = "FATAL: %s"
 
-
 class PGConnectionError(Exception):
     """Выбрасывается при первичном фейле подключения к PostgreSQL."""
-
 
 def _dsn_info(dsn: str) -> Tuple[str, Optional[int], Optional[str]]:
     """Достаём host, port, dbname из DSN максимально надёжно.
@@ -92,7 +95,6 @@ def _tcp_probe(host: str, port: int, timeout_ms: int) -> None:
             f"TCP probe failed for {host}:{port} in {timeout_ms} ms: {e}"
         )
 
-
 class PGClient:
     """
     Тонкая обёртка над psycopg3:
@@ -122,8 +124,9 @@ class PGClient:
             try:
                 _tcp_probe(host, port, probe_ms)
             except PGConnectionError as e:
-                log.critical(_LOG_FATAL, e)
-                # Даём наружу как уже «управляемую» ошибку — её словит верхний уровень
+                # Не логируем на уровне CRITICAL здесь, чтобы не плодить дубли FATAL.
+                # Поднимем управляемую ошибку выше — там решат, что делать (лог, retry, exit).
+                log.debug("TCP probe failed: %s", e)
                 raise
 
         # 2) Основной connect с ловлей OperationalError и формированием читаемого текста
@@ -200,8 +203,32 @@ class PGClient:
             self.cur = None
             self.conn = None
 
-    def __del__(self):  # на случай GC/аварийного пути
-        try:
-            self.close()
-        except Exception:
-            pass
+def connect_safely(
+    dsn: str,
+    *,
+    autocommit: bool = True,
+    exit_on_fail: bool = False,
+    logger: Optional[logging.Logger] = None,
+) -> Optional["PGClient"]:
+    """
+    Удобная «вежливая» обёртка вокруг `PGClient` для CLI/cron.
+
+    Поведение:
+    - Успех → возвращает экземпляр `PGClient`.
+    - Неуспех (любая `PGConnectionError`) → печатает КОРОТКОЕ FATAL-сообщение без traceback
+      и возвращает `None`. Если `exit_on_fail=True` — завершает процесс с кодом 2 (без стека).
+
+    Это концентрирует «красивую» реакцию на ошибку в одном месте (сфера ответственности клиента),
+    а бизнес-слой может просто вызвать `connect_safely(...)` и не городить try/except повсюду.
+    Производительность не страдает: накладные расходы минимальны.
+    """
+    lg = logger or log
+    try:
+        return PGClient(dsn, autocommit=autocommit)
+    except PGConnectionError as e:
+        # Единый лаконичный FATAL: без стека, но с сутью проблемы
+        lg.critical(_LOG_FATAL, f"postgres connect/init failed: {e}")
+        if exit_on_fail:
+            import sys
+            sys.exit(2)
+        return None

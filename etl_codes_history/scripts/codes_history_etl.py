@@ -638,29 +638,6 @@ def _parse_cli_dt(value: Optional[str], mode: str, business_tz_name: str) -> Opt
         dt = dt.astimezone(timezone.utc)
     return dt
 
-# ------------------------ PHOENIX FETCH (STRICT) ------------------------
-
-def _iter_phx_batches(phx: PhoenixClient, cfg: Settings, from_utc: datetime, to_utc: datetime):
-    """
-    Простая совместимая обёртка под нашу реализацию PhoenixClient.fetch_increment:
-    fetch_increment(table: str, ts_col: str, columns: List[str], from_dt: datetime, to_dt: datetime)
-
-    ВАЖНО: PQS/phoenixdb ожидает naive UTC datetime, поэтому tzinfo удаляем.
-    """
-    table = getattr(cfg, "HBASE_MAIN_TABLE", None)
-    ts_col = getattr(cfg, "HBASE_MAIN_TS_COLUMN", None)
-    if not table or not ts_col:
-        raise TypeError("HBASE_MAIN_TABLE/HBASE_MAIN_TS_COLUMN не заданы в конфиге")
-
-    cols: List[str] = [str(c) for c in CH_COLUMNS]
-
-    # Приводим к naive UTC (tzinfo=None)
-    f_naive = from_utc.replace(tzinfo=None) if from_utc.tzinfo is not None else from_utc
-    t_naive = to_utc.replace(tzinfo=None)   if to_utc.tzinfo   is not None else to_utc
-
-    for batch in phx.fetch_increment(table, ts_col, cols, f_naive, t_naive):
-        yield batch
-
 # ------------------------ ОСНОВНОЙ СЦЕНАРИЙ ------------------------
 
 # --- Top-level helper for dedup/publish parts ---
@@ -1006,10 +983,20 @@ def _connect_pg_and_journal(cfg: "Settings", process_name: str) -> Tuple["PGClie
     try:
         pg = PGClient(cfg.PG_DSN)
     except PGConnectionError as e:
-        _log_maybe_trace(logging.CRITICAL, f"FATAL: postgres connect/init failed: {e}", exc=e, cfg=cfg)
+        _log_maybe_trace(
+            logging.CRITICAL,
+            f"FATAL: postgres connect/init failed: {e} — возможно PostgreSQL недоступен или указан некорректный DSN",
+            exc=e,
+            cfg=cfg,
+        )
         raise SystemExit(2)
     except Exception as e:
-        _log_maybe_trace(logging.CRITICAL, f"FATAL: unexpected error during postgres init: {e.__class__.__name__}: {e}", exc=e, cfg=cfg)
+        _log_maybe_trace(
+            logging.CRITICAL,
+            f"FATAL: unexpected error during postgres init: {e.__class__.__name__}: {e} — проверьте переменные окружения и сетевую доступность",
+            exc=e,
+            cfg=cfg,
+        )
         raise SystemExit(2)
 
     journal = ProcessJournal(cast(Any, pg), cfg.JOURNAL_TABLE, process_name)  # type: ignore[arg-type]
@@ -1764,13 +1751,22 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except SystemExit:
-        raise
     except KeyboardInterrupt:
         _log = logging.getLogger("codes_history_increment")
         msg = "Остановлено пользователем (Ctrl+C)." if (_shutdown_reason in ("", "SIGINT")) else f"Остановлено сигналом {_shutdown_reason}."
         _log.warning("%s Выход с кодом 130.", msg)
         raise SystemExit(130)
+    except PGConnectionError as pgerr:
+        # Специальная «тихая» обработка отказа Postgres на самом верхнем уровне.
+        # Если где‑то в стеке PGConnectionError всё же «прорвётся» наружу (например,
+        # из сторонней обвязки или старого кода), мы не покажем сырые traceback’и,
+        # а завершим процесс предсказуемо с кодом 2 и понятным сообщением.
+        _log = logging.getLogger("codes_history_increment")
+        _log.critical(
+            "FATAL: postgres connect/init failed: %s — возможно PostgreSQL недоступен или указан некорректный DSN",
+            pgerr,
+        )
+        raise SystemExit(2)
     except Exception as unhandled:
         # На этом этапе cfg может быть ещё не создан — ориентируемся на ENV/уровень логгера
         want_trace = _want_trace(None)
@@ -1781,3 +1777,4 @@ if __name__ == "__main__":
         else:
             _log.error(_msg + " (стек скрыт; установите ETL_TRACE_EXC=1 или запустите с --log-level=DEBUG, чтобы напечатать трейсбек)")
         raise SystemExit(1)
+    
