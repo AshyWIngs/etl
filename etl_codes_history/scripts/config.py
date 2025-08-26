@@ -160,7 +160,7 @@ class Settings:
     # --- Phoenix source ---
     PQS_URL: str = os.getenv("PQS_URL", "http://127.0.0.1:8765")
     HBASE_MAIN_TABLE: str = os.getenv("HBASE_MAIN_TABLE", "TBL_JTI_TRACE_CIS_HISTORY")
-    HBASE_MAIN_TS_COLUMN: str = os.getenv("HBASE_MAIN_TS_COLUMN", "opd")
+    HBASE_MAIN_TS_COLUMN: str = os.getenv("HBASE_MAIN_TS_COLUMN", "tm")
     # Единственный источник правды по размеру кадров; совпадает с PhoenixConfig (дефолт 20000).
     PHX_FETCHMANY_SIZE: int = _env_int("PHX_FETCHMANY", _env_int("PHX_FETCHMANY_SIZE", 20000, min_value=1), min_value=1)
     PHX_QUERY_OVERLAP_MINUTES: int = _env_int("PHX_QUERY_OVERLAP_MINUTES", 5, min_value=0)
