@@ -85,6 +85,7 @@ Thumbs.db
 
 # === Maven / сборка ===
 **/target/
+**/META-INF/
 pom.xml.versionsBackup
 dependency-reduced-pom.xml
 release.properties
