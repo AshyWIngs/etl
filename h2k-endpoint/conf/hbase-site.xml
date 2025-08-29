@@ -1,0 +1,237 @@
+<configuration>
+  <!--
+    ГЛОБАЛЬНО: включаем репликацию HBase. Без логина/пароля — у нас вся инфраструктура без аутентификации.
+    true — репликация включена; false — отключена.
+  -->
+  <property>
+    <name>hbase.replication</name>
+    <value>true</value>
+  </property>
+
+  <!--
+    Адреса Kafka-брокеров (bootstrap). Формат host:port, список через запятую.
+    Внимание: авторизация не используется, поэтому никаких SASL/SSL ключей не задаём.
+    Рекомендация: минимум 3 брокера для отказоустойчивости и пропускной.
+  -->
+  <property>
+    <name>h2k.kafka.bootstrap.servers</name>
+    <value>10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092</value>
+  </property>
+
+  <!--
+    Шаблон имени Kafka‑топика. Поддерживаемые плейсхолдеры:
+      ${table}     — namespace_qualifier
+      ${namespace} — namespace HBase
+      ${qualifier} — имя таблицы без namespace
+    По умолчанию используем ${table}. Можно переопределить под правила нейминга.
+  -->
+  <property>
+    <name>h2k.topic.pattern</name>
+    <value>${table}</value>
+  </property>
+
+  <!--
+    Семейство колонок (CF), по которому берём значения. Строка в UTF‑8 (как в WAL).
+    Если таблица хранит бизнес‑данные в другом CF — укажите его.
+  -->
+  <property>
+    <name>h2k.cf</name>
+    <value>0</value>
+  </property>
+
+  <!--
+    Признак SALT в rowkey Phoenix. Если rowkey начинается с соль‑байта/байтов, то:
+      h2k.salted=true и h2k.salt.bytes — количество байтов соли.
+    Если SALT не используется — оставляем false.
+  -->
+  <property>
+    <name>h2k.salted</name>
+    <value>false</value>
+  </property>
+
+  <!-- Количество байтов SALT (активно только при h2k.salted=true). Обычно 1. -->
+  <property>
+    <name>h2k.salt.bytes</name>
+    <value>1</value>
+  </property>
+
+  <!--
+    ===== Профиль "максимальная скорость" для Kafka Producer =====
+    Мы сознательно допускаем дубликаты (ловим их на стороне потребителя/клика),
+    чтобы получить высокий TPS. Ниже перечислены ключи, их текущие значения,
+    а также альтернативы и когда их выбирать.
+  -->
+
+  <!--
+    Подтверждения от Kafka:
+      1   — самый быстрый, подтверждает лидер (рекомендовано для макс. скорости)
+      all — надёжнее, медленнее (нужно при строгой доставке)
+  -->
+  <property>
+    <name>h2k.producer.acks</name>
+    <value>1</value>
+  </property>
+
+  <!--
+    Идемпотентность Producer:
+      false — максимальная скорость, возможны дубликаты при ретраях
+      true  — гарантии, но ограничивает параллелизм и снижает TPS
+  -->
+  <property>
+    <name>h2k.producer.enable.idempotence</name>
+    <value>false</value>
+  </property>
+
+  <!--
+    Максимум параллельных запросов в одном соединении:
+      5 — хорошее соотношение скорость/порядок; при acks=1 можно повышать до 7
+      1 — нужен при enable.idempotence=true для сохранения порядка
+  -->
+  <property>
+    <name>h2k.producer.max.in.flight</name>
+    <value>5</value>
+  </property>
+
+  <!--
+    Linger (мс): время ожидания перед отправкой батча для набора побольше.
+      100 — выше группировка и компрессия, немного растёт задержка
+      0..10 — минимальная задержка, ниже эффективность батчинга
+  -->
+  <property>
+    <name>h2k.producer.linger.ms</name>
+    <value>100</value>
+  </property>
+
+  <!--
+    Размер батча Producer (байт):
+      524288 (512КБ) — хороший размер для JSON событий среднего объёма
+      1048576 (1МБ)  — если события крупные и сеть/брокеры справляются
+      65536  (64КБ)  — более консервативно, меньше задержка
+  -->
+  <property>
+    <name>h2k.producer.batch.size</name>
+    <value>524288</value>
+  </property>
+
+  <!--
+    Буфер в памяти Producer (байт) для накопления записей:
+      268435456 (256МБ) — запас для burst‑нагрузок
+      536870912 (512МБ) — если RAM позволяет и нагрузка очень высокая
+  -->
+  <property>
+    <name>h2k.producer.buffer.memory</name>
+    <value>268435456</value>
+  </property>
+
+  <!--
+    Максимальный размер одного запроса к брокеру (байт) — влияет на крупные сообщения.
+      2097152 (2МБ) — безопасный запас для больших JSON
+      1048576 (1МБ) — значение по умолчанию в Kafka 2.3.x
+    Важно: broker должен допускать not too small max.request.size / message.max.bytes.
+  -->
+  <property>
+    <name>h2k.producer.max.request.size</name>
+    <value>2097152</value>
+  </property>
+
+  <!-- Быстрый кодек с хорошей компрессией: lz4 (самый быстрый), snappy (чуть медленнее, широко совместим). -->
+  <property>
+    <name>h2k.producer.compression.type</name>
+    <value>lz4</value>
+  </property>
+
+  <!--
+    Таймаут на уровне запроса и общий таймаут доставки:
+      request.timeout.ms — таймаут отдельного RPC к брокеру
+      delivery.timeout.ms — общий дедлайн записи (включая ретраи)
+    Для высокой скорости делаем их умеренными, чтобы быстрее выявлять проблемы.
+  -->
+  <property>
+    <name>h2k.producer.request.timeout.ms</name>
+    <value>30000</value>
+  </property>
+  <property>
+    <name>h2k.producer.delivery.timeout.ms</name>
+    <value>90000</value>
+  </property>
+
+  <!--
+    Количество ретраев при временных ошибках:
+      10 — быстрый профиль (не тратим слишком много времени на повторы)
+      0  — совсем без ретраев (ещё быстрее, но риск потерь выше при сбоях)
+  -->
+  <property>
+    <name>h2k.producer.retries</name>
+    <value>10</value>
+  </property>
+
+  <!-- Осмысленный client.id для метрик в Kafka (имя продьюсера). -->
+  <property>
+    <name>h2k.producer.client.id</name>
+    <value>h2k-repl</value>
+  </property>
+
+  <!--
+    Управление ожиданием подтверждений в самом репликаторе:
+      await.every       — через сколько отправленных сообщений дожидаемся фьюч
+      await.timeout.ms  — общий таймаут ожидания «пачки»
+    БÓльшие значения — выше throughput и память, меньше — ниже задержка и память.
+  -->
+  <property>
+    <name>h2k.producer.await.every</name>
+    <value>500</value>
+  </property>
+  <property>
+    <name>h2k.producer.await.timeout.ms</name>
+    <value>180000</value>
+  </property>
+
+  <!--
+    JSON‑сериализация null‑полей:
+      false — не писать лишние поля (меньше трафик/CPU)
+      true  — включать null‑поля в JSON (удобнее потребителю)
+  -->
+  <property>
+    <name>h2k.json.serialize.nulls</name>
+    <value>false</value>
+  </property>
+
+  <!--
+    Режим декодирования значений:
+      simple        — отдаём Base64/строки без схемы (минимальные накладные)
+      json-phoenix  — используем schema.json для типового декодирования Phoenix
+  -->
+  <property>
+    <name>h2k.decode.mode</name>
+    <value>json-phoenix</value>
+  </property>
+
+  <!-- Путь к файлу схемы (schema.json) для режима json-phoenix. -->
+  <property>
+    <name>h2k.schema.path</name>
+    <value>/etc/h2k/schema.json</value>
+  </property>
+
+  <!--
+    ===== Рекомендации по инфраструктуре (не параметры приложения) =====
+    - Для таблиц с сотнями миллионов строк/сутки создавайте Kafka‑топики с достаточным
+      числом партиций (ориентир: не менее 6–12, лучше 24+ при высоком TPS), чтобы
+      клиенты‑потребители могли читать параллельно.
+    - На брокерах увеличьте message.max.bytes/replica.fetch.max.bytes, если ваши сообщения крупные.
+    - На RegionServer проверьте настройки очередей репликации HBase (batch‑размеры) — параметры
+      зависят от вашей версии HBase 1.4.x.
+  -->
+</configuration>
+
+<!--
+  Пример секции безопасности (СЕЙЧАС НЕ ИСПОЛЬЗУЕТСЯ, у нас без авторизации).
+  Оставляем здесь как справку на будущее — при необходимости раскомментируйте и заполните.
+
+  <property><name>h2k.producer.security.protocol</name><value>SASL_SSL</value></property>
+  <property><name>h2k.producer.sasl.mechanism</name><value>SCRAM-SHA-512</value></property>
+  <property>
+    <name>h2k.producer.sasl.jaas.config</name>
+    <value>org.apache.kafka.common.security.scram.ScramLoginModule required username="user" password="pass";</value>
+  </property>
+  <property><name>h2k.producer.ssl.endpoint.identification.algorithm</name><value></value></property>
+-->

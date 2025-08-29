@@ -1,0 +1,95 @@
+# --- Подготовка таблицы (включаем репликацию для CF '0') ---
+disable 'TBL_JTI_TRACE_CIS_HISTORY'
+alter  'TBL_JTI_TRACE_CIS_HISTORY', { NAME => '0', REPLICATION_SCOPE => 1 }
+enable 'TBL_JTI_TRACE_CIS_HISTORY'
+
+# --- Добавление peer с надёжным профилем Kafka-продьюсера ---
+#  acks=all, enable.idempotence=true, max.in.flight=1  — максимально безопасная доставка
+#  остальные параметры можно менять под вашу нагрузку
+add_peer 'h2k_reliable',
+  "10.254.3.111,10.254.3.112,10.254.3.113:2181:/hbase",
+  {
+    'replication_endpoint_impl' => 'kz.qazmarka.h2k.endpoint.KafkaReplicationEndpoint',
+    'configuration' => {
+      # Обязательные базовые ключи
+      'h2k.kafka.bootstrap.servers'   => '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
+      'h2k.producer.client.id'          => 'h2k-repl-reliable',   # человекочитаемый id продьюсера
+      'h2k.topic.pattern'             => '${table}',   # шаблон имени топика: ${table}|${namespace}|${qualifier}
+      'h2k.cf'                        => '0',          # целевая CF в HBase
+      'h2k.salted'                    => 'false',      # если rowkey посолён — поставить true
+      'h2k.salt.bytes'                => '1',          # длина соли, если salted=true
+
+      # Режим декодирования payload
+      'h2k.decode.mode'               => 'json-phoenix', # 'simple' или 'json-phoenix'
+      'h2k.schema.path'               => '/etc/h2k/schema.json', # путь к schema.json
+      'h2k.json.serialize.nulls'      => 'false',
+
+      # Ожидание подтверждений отправок (меняйте под ваш SLA)
+      'h2k.producer.await.every'      => '500',        # ждать ack каждые N сообщений
+      'h2k.producer.await.timeout.ms' => '300000',     # общий таймаут ожидания acks
+
+      # --- Надёжный профиль Kafka Producer ---
+      'h2k.producer.enable.idempotence'           => 'true',
+      'h2k.producer.acks'                         => 'all',
+      'h2k.producer.max.in.flight'                => '1',        # гарантирует порядок при ретраях
+      'h2k.producer.retries'                      => '2147483647',
+      'h2k.producer.delivery.timeout.ms'          => '300000',
+
+      # Опциональные тюнинги под высокую нагрузку (раскомментируйте при необходимости)
+      # 'h2k.producer.request.timeout.ms'         => '120000',
+      # 'h2k.producer.buffer.memory'              => '134217728', # 128 MiB
+
+      # Батчинг/сжатие: можно подстроить под пропускную способность/CPU
+      'h2k.producer.linger.ms'                    => '50',
+      'h2k.producer.batch.size'                   => '65536',
+      'h2k.producer.compression.type'             => 'snappy'
+
+      # При необходимости можно добавить любые нативные ключи Kafka через префикс h2k.producer.*
+      # Например:
+      # 'h2k.producer.request.timeout.ms'         => '60000',
+      # 'h2k.producer.buffer.memory'              => '67108864'
+    }
+  }
+
+# --- Быстрые подсказки по тюнингу (reliable) ---
+# Пики задержек / таймауты acks=all:
+#   - Увеличьте h2k.producer.delivery.timeout.ms (например, до 600000) и
+#     h2k.producer.request.timeout.ms (например, до 120000).
+#   - Оставьте h2k.producer.retries=2147483647 и max.in.flight=1 — это сохраняет порядок при ретраях.
+#   - При перегрузке сети/брокеров увеличьте h2k.producer.linger.ms (75–150 мс) и batch.size (131072–262144),
+#     чтобы уменьшить число запросов за счёт более крупных батчей.
+#
+# Ошибки брокера (NOT_ENOUGH_REPLICAS, REQUEST_TIMED_OUT, NOT_LEADER_FOR_PARTITION):
+#   - Проверьте соответствие replication.factor и min.insync.replicas в Kafka-топике.
+#   - Если ISR мал, временно снизьте min.insync.replicas или восстановите реплики/ISR.
+#   - При постоянных таймаутах проверьте сетевую задержку, GC брокеров, disk I/O и контроллер.
+#
+# Переполнения буфера клиента (BufferExhaustedException, высокая bufferpool-wait-ratio):
+#   - Увеличьте h2k.producer.buffer.memory (например, до 268435456–536870912 байт, 256–512 MiB).
+#   - Либо уменьшите скорость формирования записей: снизьте linger.ms и/или batch.size.
+#
+# Слишком большие сообщения:
+#   - Поднимите h2k.producer.max.request.size (продьюсер) и на брокере: message.max.bytes,
+#     replica.fetch.max.bytes (и у потребителей: fetch.message.max.bytes), соблюдая соотношение.
+#
+# Порядок доставки и идемпотентность:
+#   - Не повышайте h2k.producer.max.in.flight &gt; 1 — порядок может нарушиться при ретраях.
+#   - enable.idempotence=true обязателен для «надёжного» профиля; не отключайте его.
+#
+# Производительность без потери надёжности:
+#   - Рассмотрите h2k.producer.compression.type=lz4 (если CPU позволяет) — меньше байт по сети.
+#   - Масштабируйте параллелизм за счёт количества регион‑серверов/репликационных воркеров,
+#     а не увеличением max.in.flight.
+#
+# Наблюдаемость:
+#   - Включите JMX и следите за метриками продьюсера: record-send-rate, request-latency-avg/p99,
+#     outgoing-byte-rate, bufferpool-wait-ratio, batch-size-avg/max, records-per-request-avg.
+#   - При инцидентах временно повысить лог‑уровень для org.apache.kafka.clients.producer до DEBUG.
+
+# --- Проверка/отладка ---
+list_peers
+status 'replication'
+show_peer_config 'h2k_reliable'  # если доступна в вашей сборке HBase
+
+# --- Удаление peer (если потребуется) ---
+# remove_peer 'h2k_reliable'

@@ -1,0 +1,108 @@
+# ВКЛЮЧАЕМ РЕПЛИКАЦИЮ ДЛЯ НУЖНОЙ CF (колонко‑семейство '0') В ТАБЛИЦЕ
+disable 'TBL_JTI_TRACE_CIS_HISTORY'
+alter  'TBL_JTI_TRACE_CIS_HISTORY', {NAME =&gt; '0', REPLICATION_SCOPE =&gt; 1}
+enable 'TBL_JTI_TRACE_CIS_HISTORY'
+
+# ДОБАВЛЯЕМ PEER С КАСТОМНЫМ ENDPOINT (наш класс) И ВСЕМИ НУЖНЫМИ КОНФИГАМИ
+# Примечание: cluster_key обязателен синтаксически для HBase 1.4, нашим Endpoint не используется.
+# Используйте координаты ZooKeeper вашего HBase: 10.254.3.111,10.254.3.112,10.254.3.113:2181:/hbase
+add_peer 'h2k_fast',
+  "10.254.3.111,10.254.3.112,10.254.3.113:2181:/hbase",
+  {
+    'replication_endpoint_impl' =&gt; 'kz.qazmarka.h2k.endpoint.KafkaReplicationEndpoint',
+    'configuration' =&gt; {
+      # ======== ОБЯЗАТЕЛЬНО ========
+      # Bootstrap Kafka (без аутентификации)
+      'h2k.kafka.bootstrap.servers' =&gt; '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
+
+      # ======== ОБЩИЕ НАСТРОЙКИ ЭНДПОИНТА ========
+      # Имя топика по шаблону; доступны ${table}, ${namespace}, ${qualifier}
+      'h2k.topic.pattern'           =&gt; '${table}',
+
+      # Какое CF реплицируем (имя/байтовое имя семейства колонок)
+      'h2k.cf'                      =&gt; '0',
+
+      # Если rowkey посолен — включите и задайте длину соли (в байтах)
+      'h2k.salted'                  =&gt; 'false',
+      'h2k.salt.bytes'              =&gt; '1',
+
+      # Режим декодирования значений: simple | json-phoenix
+      'h2k.decode.mode'             =&gt; 'json-phoenix',
+      # Путь к JSON‑схеме колонок (см. README)
+      'h2k.schema.path'             =&gt; '/etc/h2k/schema.json',
+
+      # Сериализовать ли null‑поля в JSON (экономия трафика = false)
+      'h2k.json.serialize.nulls'    =&gt; 'false',
+
+      # Сколько отправок ждать, прежде чем вызвать get() на фьючерсах (баланс задержки/пропускной способности)
+      'h2k.producer.await.every'    =&gt; '500',
+      # Глобальный таймаут ожидания подтверждений, мс
+      'h2k.producer.await.timeout.ms' =&gt; '180000',
+
+      # ======== НАСТРОЙКИ KAFKA PRODUCER (максимальная скорость, дубли ловим на потребителе) ========
+      'h2k.producer.acks'                 =&gt; '1',
+      'h2k.producer.enable.idempotence'   =&gt; 'false',
+      'h2k.producer.max.in.flight'        =&gt; '5',
+
+      # Группировка и сжатие
+      'h2k.producer.linger.ms'            =&gt; '100',
+      'h2k.producer.batch.size'           =&gt; '524288',   # 512 КБ
+      'h2k.producer.compression.type'     =&gt; 'lz4',      # самый быстрый; можно snappy
+
+      # Буферы и размеры
+      'h2k.producer.buffer.memory'        =&gt; '268435456', # 256 МБ
+      'h2k.producer.max.request.size'     =&gt; '2097152',   # 2 МБ
+
+      # Таймауты/ретраи
+      'h2k.producer.request.timeout.ms'   =&gt; '30000',
+      'h2k.producer.delivery.timeout.ms'  =&gt; '90000',
+      'h2k.producer.retries'              =&gt; '10',
+      'h2k.producer.client.id'            =&gt; 'h2k-repl-fast'
+    }
+  }
+
+# ПРОВЕРЯЕМ
+list_peers
+# В 1.4 может быть доступна команда:
+show_peer_config 'h2k_fast'
+
+# ПОЛЕЗНОЕ
+# Статус репликации:
+status 'replication'
+# Удаление пира:
+# remove_peer 'h2k_fast'
+
+# ОТЛАДКА
+# Посмотреть конфигурацию пира (убедиться, что все ключи применились):
+show_peer_config 'h2k_fast'
+# Проверить статус репликации на мастере:
+status 'replication'
+# Полезные подсказки по логам RegionServer (команды — запускать в shell OS, не в HBase shell):
+# tail -f $HBASE_LOG_DIR/hbase-regionserver-*.log | egrep 'KafkaReplicationEndpoint|replicate\(\)'
+# Примеры сообщений:
+# INFO  KafkaReplicationEndpoint - Инициализация: topicPattern=${table}, cf=0, salted=false, saltBytes=1
+# INFO  KafkaReplicationEndpoint - Режим декодирования: json-phoenix (schema=/etc/h2k/schema.json)
+# WARN  KafkaReplicationEndpoint - replicate() timed out while waiting on Kafka futures
+# ERROR KafkaReplicationEndpoint - replicate() Kafka producer error
+# Рекомендации при таймаутах: увеличьте h2k.producer.await.timeout.ms или уменьшите h2k.producer.await.every.
+
+# БЫСТРЫЕ ПОДСКАЗКИ ПО ТЮНИНГУ
+# Пики задержек (скачки latency):
+# - Уменьшите 'h2k.producer.linger.ms' (например, 5–20) — меньше ожидание набора батча, быстрее отправка.
+# - Уменьшите 'h2k.producer.batch.size' (например, 131072–262144) — более мелкие батчи уменьшают задержку.
+# - Уменьшите 'h2k.producer.await.every' (например, 100–200) — чаще дожидаемся подтверждений, сглаживаем пики.
+# - Проверьте GC/CPU сервера; при высоком CPU попробуйте 'h2k.producer.compression.type' => 'snappy'.
+
+# Ошибки брокера (NOT_LEADER_FOR_PARTITION, TIMEOUT, NETWORK_EXCEPTION):
+# - Увеличьте 'h2k.producer.retries' (например, 20–100) и 'h2k.producer.request.timeout.ms' (30000–120000).
+# - Если важен порядок сообщений, временно поставьте 'h2k.producer.max.in.flight' => '1' (меньше пропускная способность).
+# - При больших сообщениях на брокере проверьте 'message.max.bytes' и 'replica.fetch.max.bytes'.
+
+# Переполнение буфера клиента (BufferExhausted / max.block.ms):
+# - Повышайте 'h2k.producer.buffer.memory' (например, до 536870912–1073741824) и/или уменьшайте 'h2k.producer.batch.size'.
+# - Снижайте 'h2k.producer.linger.ms' и 'h2k.producer.await.every' — быстрее освобождаем буферы.
+# - При необходимости увеличьте 'h2k.producer.max.block.ms' (например, 120000–300000), чтобы не падать при временной нагрузке.
+
+# Слишком крупные записи:
+# - Повышайте 'h2k.producer.max.request.size' (например, 4194304–8388608) и на брокере 'message.max.bytes'/'replica.fetch.max.bytes'.
+# - При постоянных переразмерах подумайте о переразбиении по топикам/партициям через 'h2k.topic.pattern'.

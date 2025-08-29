@@ -82,3 +82,11 @@ Thumbs.db
 # --- pyenv / direnv ---
 **/.python-version
 **/.direnv/
+
+# === Maven / сборка ===
+**/target/
+pom.xml.versionsBackup
+dependency-reduced-pom.xml
+release.properties
+pom.xml.releaseBackup
+pom.xml.tag

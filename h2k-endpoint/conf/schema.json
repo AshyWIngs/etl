@@ -1,0 +1,45 @@
+{
+  "TBL_JTI_TRACE_CIS_HISTORY": {
+    "columns": {
+      "c": "VARCHAR",
+      "t": "UNSIGNED_TINYINT",
+      "opd": "TIMESTAMP",
+      "id": "VARCHAR",
+      "did": "VARCHAR",
+      "rid": "VARCHAR",
+      "rinn": "VARCHAR",
+      "rn": "VARCHAR",
+      "sid": "VARCHAR",
+      "sinn": "VARCHAR",
+      "sn": "VARCHAR",
+      "gt": "VARCHAR",
+      "prid": "VARCHAR",
+      "st": "UNSIGNED_TINYINT",
+      "ste": "UNSIGNED_TINYINT",
+      "elr": "UNSIGNED_TINYINT",
+      "emd": "TIMESTAMP",
+      "apd": "TIMESTAMP",
+      "p": "VARCHAR",
+      "pt": "UNSIGNED_TINYINT",
+      "o": "VARCHAR",
+      "pn": "VARCHAR",
+      "b": "VARCHAR",
+      "tt": "BIGINT",
+      "tm": "TIMESTAMP",
+      "ch": "VARCHAR ARRAY",
+      "j": "VARCHAR",
+      "pg": "UNSIGNED_SMALLINT",
+      "et": "UNSIGNED_TINYINT",
+      "exd": "TIMESTAMP",
+      "pvad": "VARCHAR",
+      "ag": "VARCHAR"
+    }
+  },
+  "ANOTHER_TABLE": {
+    "columns": {
+      "col_a": "VARCHAR",
+      "col_b": "INTEGER",
+      "created_at": "TIMESTAMP"
+    }
+  }
+}

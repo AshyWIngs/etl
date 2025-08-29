@@ -1,0 +1,79 @@
+# --- Подготовка таблицы (включаем репликацию для CF '0') ---
+disable 'TBL_JTI_TRACE_CIS_HISTORY'
+alter  'TBL_JTI_TRACE_CIS_HISTORY', { NAME => '0', REPLICATION_SCOPE => 1 }
+enable 'TBL_JTI_TRACE_CIS_HISTORY'
+
+# --- Добавление peer со сбалансированным профилем ---
+#  acks=all, idempotence=true, max.in.flight=3 — компромисс скорость/надёжность.
+#  Чуть больший linger и batch.size для лучшей утилизации сети/CPU.
+add_peer 'h2k_balanced',
+  "10.254.3.111,10.254.3.112,10.254.3.113:2181:/hbase",
+  {
+    'replication_endpoint_impl' => 'kz.qazmarka.h2k.endpoint.KafkaReplicationEndpoint',
+    'configuration' => {
+      # Обязательные базовые ключи
+      'h2k.kafka.bootstrap.servers'   => '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
+      'h2k.producer.client.id'         => 'h2k-repl-balanced',
+      'h2k.topic.pattern'             => '${table}',   # ${table}|${namespace}|${qualifier}
+      'h2k.cf'                        => '0',
+      'h2k.salted'                    => 'false',
+      'h2k.salt.bytes'                => '1',
+
+      # Режим декодирования
+      'h2k.decode.mode'               => 'json-phoenix',          # 'simple' или 'json-phoenix'
+      'h2k.schema.path'               => '/etc/h2k/schema.json',
+      'h2k.json.serialize.nulls'      => 'false',
+
+      # Параметры ожидания подтверждений (регулируйте под SLA)
+      'h2k.producer.await.every'      => '1000',       # ждать ack каждые N сообщений
+      'h2k.producer.await.timeout.ms' => '300000',
+
+      # --- Сбалансированный профиль Kafka Producer ---
+      'h2k.producer.enable.idempotence'           => 'true',
+      'h2k.producer.acks'                         => 'all',
+      'h2k.producer.max.in.flight'                => '3',        # 2..5 допустимо; >1 может нарушать порядок при ретраях
+      'h2k.producer.retries'                      => '2147483647',
+      'h2k.producer.delivery.timeout.ms'          => '300000',
+
+      # Батчинг/сжатие: выше throughput, умеренная задержка
+      'h2k.producer.linger.ms'                    => '100',      # 50..200
+      'h2k.producer.batch.size'                   => '131072',   # 128 KiB
+      'h2k.producer.compression.type'             => 'lz4'       # или 'snappy' если CPU ограничен
+
+      # Любые нативные ключи Kafka можно добавить через префикс h2k.producer.*
+      # Например:
+      # 'h2k.producer.request.timeout.ms'         => '60000',
+      # 'h2k.producer.buffer.memory'              => '134217728'
+    }
+  }
+
+# --- Проверка/отладка ---
+list_peers
+show_peer_config 'h2k_balanced'
+status 'replication'
+# remove_peer 'h2k_balanced'  # для удаления при необходимости
+
+# --- Быстрые подсказки по тюнингу (balanced) ---
+# Пики задержек:
+#  - Увеличьте 'h2k.producer.linger.ms' (до 150–200) и/или 'h2k.producer.batch.size' (до 262144) для лучшей утилизации сети/CPU.
+#  - Переключите 'h2k.producer.compression.type' на 'lz4' (макс. throughput) или 'snappy' (экономия CPU).
+#
+# Ошибки брокера (NOT_LEADER_FOR_PARTITION / UNKNOWN_TOPIC_OR_PARTITION / TIMEOUT):
+#  - Проверьте, что топик создан и распределён по брокерам; выровняйте лидеров разделов.
+#  - При флапах лидеров временно снизьте 'h2k.producer.max.in.flight' до '1' (строгий порядок) и поднимите 'h2k.producer.retries'.
+#  - Увеличьте 'h2k.producer.request.timeout.ms' (например, 120000) и/или 'h2k.producer.delivery.timeout.ms' (например, 300000).
+#
+# Переполнение буфера клиента (RecordAccumulator full):
+#  - Поднимите 'h2k.producer.buffer.memory' (например, 268435456 = 256 MiB) либо уменьшите 'h2k.producer.batch.size' и/или 'h2k.producer.linger.ms'.
+#  - Увеличьте частоту ожиданий ACK: уменьшите 'h2k.producer.await.every' (например, до 500), чтобы разгружать пул фьючерсов.
+#
+# Слишком большие сообщения:
+#  - Увеличьте 'h2k.producer.max.request.size' (например, 10485760 = 10 MiB) и на брокерах 'message.max.bytes'/'replica.fetch.max.bytes'.
+#  - При необходимости используйте более агрессивное сжатие (lz4) или уменьшайте размер отдельных колонок в источнике.
+#
+# Порядок доставки:
+#  - В этом профиле 'max.in.flight=3' -> возможна перестановка при ретраях. Для строгого порядка установите 'max.in.flight=1'.
+#
+# Наблюдаемость:
+#  - Включите DEBUG для 'kz.qazmarka.h2k.endpoint' при первичном пуске.
+#  - По JMX снимайте метрики продьюсера (p95/p99 latency, batch-size-avg, records-per-request-avg) — это поможет выбирать значения linger/batch.size.
