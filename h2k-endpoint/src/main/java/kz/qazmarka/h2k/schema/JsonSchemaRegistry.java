@@ -59,6 +59,9 @@ import com.google.gson.reflect.TypeToken;
 public final class JsonSchemaRegistry implements SchemaRegistry {
 
     private static final Logger LOG = LoggerFactory.getLogger(JsonSchemaRegistry.class);
+    /** Ключ JSON-секции с определениями колонок. */
+    private static final String KEY_COLUMNS = "columns";
+
     private static final String DUP_TBL_LOG =
         "Обнаружен дубликат таблицы '{}' (ключ '{}') в файле схемы '{}' — существующее определение будет перезаписано";
 
@@ -174,7 +177,7 @@ public final class JsonSchemaRegistry implements SchemaRegistry {
         }
         // Приблизительная вместимость: по 1 записи на таблицу, но с учётом алиасов.
         int expected = Math.max(8, root.size() * 4);
-        int cap = (int) (expected / 0.75f) + 1;
+        int cap = (expected * 4 / 3) + 1; // эквивалент 1/0.75 без float
         Map<String, Map<String, String>> result = new HashMap<>(cap);
 
         for (Map.Entry<String, Map<String, Map<String, String>>> e : root.entrySet()) {
@@ -212,6 +215,30 @@ public final class JsonSchemaRegistry implements SchemaRegistry {
         }
     }
 
+    /** Возвращает короткое имя таблицы (часть после ':'), либо null если отсутствует. */
+    private static String getShortName(String table) {
+        int idx = table.indexOf(':');
+        if (idx >= 0 && idx + 1 < table.length()) {
+            String sn = table.substring(idx + 1);
+            return sn.isEmpty() ? null : sn;
+        }
+        return null;
+    }
+
+    /** Добавляет исходное имя и его UPPER/lower-варианты как алиасы. */
+    private void addAliasVariants(Set<String> seen,
+                                  Map<String, Map<String, String>> result,
+                                  String name,
+                                  Map<String, String> normalizedCols,
+                                  String table) {
+        if (name == null || name.isEmpty()) return;
+        final String up  = name.toUpperCase(Locale.ROOT);
+        final String low = name.toLowerCase(Locale.ROOT);
+        addDistinctAlias(seen, result, name, normalizedCols, table);
+        if (!up.equals(name))  addDistinctAlias(seen, result, up,  normalizedCols, table);
+        if (!low.equals(name) && !low.equals(up)) addDistinctAlias(seen, result, low, normalizedCols, table);
+    }
+
     /**
      * Публикует карту колонок под несколькими алиасами имени таблицы:
      * исходное/UPPER/lower и, при наличии, «короткое» имя после двоеточия.
@@ -220,25 +247,14 @@ public final class JsonSchemaRegistry implements SchemaRegistry {
     private void putTableAliases(Map<String, Map<String, String>> result,
                                  String table,
                                  Map<String, String> normalizedCols) {
-        final String orig = table;
-        final String up   = table.toUpperCase(Locale.ROOT);
-        final String low  = table.toLowerCase(Locale.ROOT);
-
-        // Уменьшаем когнитивную сложность: используем набор уже добавленных алиасов
+        // Используем набор уже добавленных алиасов, чтобы не повторяться и упростить логику
         Set<String> seen = new HashSet<>(6);
-        addDistinctAlias(seen, result, orig, normalizedCols, table);
-        addDistinctAlias(seen, result, up,   normalizedCols, table);
-        addDistinctAlias(seen, result, low,  normalizedCols, table);
-
-        // Алиасы для короткого имени (часть после ':')
-        final int idx = table.indexOf(':');
-        if (idx >= 0 && idx + 1 < table.length()) {
-            final String shortName = table.substring(idx + 1);
-            if (shortName != null && !shortName.isEmpty()) {
-                addDistinctAlias(seen, result, shortName, normalizedCols, table);
-                addDistinctAlias(seen, result, shortName.toUpperCase(Locale.ROOT), normalizedCols, table);
-                addDistinctAlias(seen, result, shortName.toLowerCase(Locale.ROOT), normalizedCols, table);
-            }
+        // Полное имя: orig/UPPER/lower
+        addAliasVariants(seen, result, table, normalizedCols, table);
+        // Короткое имя (после двоеточия), если есть
+        String shortName = getShortName(table);
+        if (shortName != null) {
+            addAliasVariants(seen, result, shortName, normalizedCols, table);
         }
     }
 
@@ -248,7 +264,7 @@ public final class JsonSchemaRegistry implements SchemaRegistry {
             LOG.warn("Для таблицы '{}' отсутствует раздел в файле схемы '{}'", table, sourcePath);
             return Collections.emptyMap();
         }
-        Map<String, String> cols = sect.get("columns");
+        Map<String, String> cols = sect.get(KEY_COLUMNS);
         if (cols == null || cols.isEmpty()) {
             LOG.warn("Для таблицы '{}' отсутствует раздел 'columns' в файле схемы '{}'", table, sourcePath);
             return Collections.emptyMap();
@@ -263,7 +279,7 @@ public final class JsonSchemaRegistry implements SchemaRegistry {
      */
     private Map<String, String> normalizeColumns(Map<String, String> cols, String table) {
         int expected = Math.max(8, cols.size() * 3);
-        int cap = (int) (expected / 0.75f) + 1;
+        int cap = (expected * 4 / 3) + 1; // эквивалент 1/0.75 без float
         Map<String, String> normalized = new HashMap<>(cap);
 
         for (Map.Entry<String, String> e : cols.entrySet()) {
@@ -329,6 +345,20 @@ public final class JsonSchemaRegistry implements SchemaRegistry {
         }
     }
 
+    /** Возвращает карту колонок для указанной таблицы, учитывая короткое имя после ':'. */
+    private Map<String, String> resolveColumnsForTable(TableName t) {
+        Map<String, Map<String, String>> local = schemaRef.get();
+        String raw = t.getNameAsString();
+        Map<String, String> found = local.get(raw);
+        if (found == null) {
+            int idx = raw.indexOf(':');
+            if (idx >= 0 && idx + 1 < raw.length()) {
+                found = local.get(raw.substring(idx + 1));
+            }
+        }
+        return (found != null) ? found : Collections.emptyMap();
+    }
+
     /**
      * Возвращает тип колонки (как канонизированную строку PHOENIX_TYPE_NAME)
      * по имени таблицы и имени квалайфера.
@@ -344,20 +374,24 @@ public final class JsonSchemaRegistry implements SchemaRegistry {
     public String columnType(TableName table, String qualifier) {
         if (qualifier == null || table == null) return null;
 
-        final Map<String, String> cols = tableCache.computeIfAbsent(table, t -> {
-            Map<String, Map<String, String>> local = schemaRef.get();
-            String raw = t.getNameAsString();
-            Map<String, String> found = local.get(raw);
-            if (found == null) {
-                int idx = raw.indexOf(':');
-                if (idx >= 0 && idx + 1 < raw.length()) {
-                    found = local.get(raw.substring(idx + 1));
-                }
-            }
-            return (found != null) ? found : Collections.emptyMap();
-        });
+        final Map<String, String> cols = tableCache.computeIfAbsent(table, this::resolveColumnsForTable);
 
         if (cols.isEmpty()) return null;
         return cols.get(qualifier);
+    }
+
+    /**
+     * Краткая диагностика: размеры схемы и кэша. Используйте в DEBUG-логах.
+     */
+    @Override
+    public String toString() {
+        Map<String, Map<String, String>> schema = schemaRef.get();
+        return new StringBuilder(96)
+                .append("JsonSchemaRegistry{")
+                .append("tables=").append(schema.size())
+                .append(", cache=").append(tableCache.size())
+                .append(", source='").append(sourcePath).append('\'')
+                .append('}')
+                .toString();
     }
 }

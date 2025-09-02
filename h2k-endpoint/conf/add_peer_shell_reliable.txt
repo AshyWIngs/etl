@@ -13,7 +13,7 @@ add_peer 'h2k_reliable',
     'configuration' => {
       # Обязательные базовые ключи
       'h2k.kafka.bootstrap.servers'   => '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
-      'h2k.producer.client.id'          => 'h2k-repl-reliable',   # человекочитаемый id продьюсера
+      # client.id не задаём — KafkaReplicationEndpoint сгенерирует уникальный per-host (hostname/UUID) при старте
       'h2k.topic.pattern'             => '${table}',   # шаблон имени топика: ${table}|${namespace}|${qualifier}
       'h2k.cf'                        => '0',          # целевая CF в HBase
       'h2k.salted'                    => 'false',      # если rowkey посолён — поставить true
@@ -27,6 +27,9 @@ add_peer 'h2k_reliable',
       # Ожидание подтверждений отправок (меняйте под ваш SLA)
       'h2k.producer.await.every'      => '500',        # ждать ack каждые N сообщений
       'h2k.producer.await.timeout.ms' => '300000',     # общий таймаут ожидания acks
+      # Диагностика BatchSender (читается при старте; на горячий путь не влияет)
+      'h2k.producer.batch.counters.enabled'   => 'false',
+      'h2k.producer.batch.debug.on.failure'   => 'false',
 
       # --- Надёжный профиль Kafka Producer ---
       'h2k.producer.enable.idempotence'           => 'true',

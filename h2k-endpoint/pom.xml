@@ -14,6 +14,8 @@
     <phoenix.version>4.14.2-HBase-1.4</phoenix.version>
     <kafka.version>2.3.1</kafka.version>
     <slf4j.version>1.7.36</slf4j.version>
+    <!-- Версия lz4-java, требуется в runtime для compression.type=lz4 -->
+    <lz4.version>1.6.0</lz4.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
   </properties>
   <dependencyManagement>
@@ -87,6 +89,12 @@
         <groupId>org.xerial.snappy</groupId>
         <artifactId>snappy-java</artifactId>
         <version>1.0.5</version>
+      </dependency>
+      <!-- LZ4: быстрый алгоритм компрессии; нужен на рантайме для Kafka compression.type=lz4 -->
+      <dependency>
+        <groupId>org.lz4</groupId>
+        <artifactId>lz4-java</artifactId>
+        <version>${lz4.version}</version>
       </dependency>
       <dependency>
         <groupId>io.netty</groupId>
@@ -196,11 +204,22 @@
       </exclusions>
     </dependency>
 
-    <!-- Kafka-клиент и Gson: тоже provided, чтобы JAR был тонким; банки кладём в $HBASE_HOME/lib -->
+    <!-- Kafka-клиент, LZ4 и Gson: тоже provided, чтобы JAR был тонким.
+         ВАЖНО: на рантайме на всех RS должны лежать:
+           - kafka-clients-${kafka.version}.jar
+           - lz4-java-${lz4.version}.jar (для compression.type=lz4)
+           - gson (совместимая версия; желательно ≥ 2.8)
+         Обычно их кладут в $HBASE_HOME/lib. -->
     <dependency>
       <groupId>org.apache.kafka</groupId>
       <artifactId>kafka-clients</artifactId>
       <version>${kafka.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <!-- Явно фиксируем наличие LZ4 на compile-time, но не тащим в JAR -->
+    <dependency>
+      <groupId>org.lz4</groupId>
+      <artifactId>lz4-java</artifactId>
       <scope>provided</scope>
     </dependency>
     <dependency>
@@ -231,7 +250,7 @@
               <rules>
                 <requireJavaVersion>
                   <version>[1.8,1.9)</version>
-                  <message>Build must run on JDK 8 because HBase 1.4.x / Hadoop 2.x / Phoenix 4.14 require it.</message>
+                  <message>Сборка должна выполняться на JDK 8 (HBase 1.4.x / Hadoop 2.x / Phoenix 4.14 этого требуют).</message>
                 </requireJavaVersion>
                 <requireMavenVersion>
                   <version>[3.6.0,)</version>

@@ -16,10 +16,16 @@ import org.apache.hadoop.hbase.TableName;
  * - Реализация обязана учитывать правила регистра Phoenix:
  *   некавыченные идентификаторы — UPPERCASE; кавычные — регистр сохраняется.
  *   Для удобства в вызывающем коде есть default-метод columnTypeRelaxed(...).
+ * - Параметры table и qualifier не должны быть null при вызове методов с default-реализацией.
+ * - При передаче null параметров в default-методы будет выброшен NullPointerException.
  *
  * Потокобезопасность:
  * - Реализации должны быть потокобезопасными или неизменяемыми,
  *   т.к. вызываются из параллельных потоков RegionServer.
+ * Ограничения и предварительные условия:
+ * - В default-методах этого интерфейса параметры table/qualifier/defaultType
+ *   не допускают null — при нарушении будет выброшен NullPointerException
+ *   с понятным сообщением (fail-fast; упрощает диагностику).
  */
 @FunctionalInterface
 public interface SchemaRegistry {
@@ -43,8 +49,12 @@ public interface SchemaRegistry {
      * @param qualifier   имя колонки
      * @param defaultType тип по умолчанию (например, "VARCHAR")
      * @return тип из реестра либо defaultType, если тип не найден или реестр пуст
+     * Примечание: параметры table/qualifier/defaultType не допускают null (fail-fast).
      */
     default String columnTypeOrDefault(TableName table, String qualifier, String defaultType) {
+        java.util.Objects.requireNonNull(table, "table");
+        java.util.Objects.requireNonNull(qualifier, "qualifier");
+        java.util.Objects.requireNonNull(defaultType, "defaultType");
         String t = columnType(table, qualifier);
         return (t != null) ? t : defaultType;
         }
@@ -62,6 +72,9 @@ public interface SchemaRegistry {
      * @return строковое имя phoenix-типа или null
      */
     default String columnTypeRelaxed(TableName table, String qualifier) {
+        java.util.Objects.requireNonNull(table, "table");
+        java.util.Objects.requireNonNull(qualifier, "qualifier");
+
         String t = columnType(table, qualifier);
         if (t != null) return t;
 
@@ -76,6 +89,28 @@ public interface SchemaRegistry {
             t = columnType(table, lower);
         }
         return t;
+    }
+
+    /**
+     * Проверка наличия колонки в реестре с релаксированной нормализацией регистра.
+     * Эквивалентна columnTypeRelaxed(...) != null.
+     */
+    default boolean hasColumnRelaxed(TableName table, String qualifier) {
+        return columnTypeRelaxed(table, qualifier) != null;
+    }
+
+    /**
+     * Возвращает тип с релаксированной нормализацией регистра (exact → UPPER → lower)
+     * либо значение по умолчанию, если тип не найден.
+     *
+     * Примечание: параметры table/qualifier/defaultType не допускают null (fail-fast).
+     */
+    default String columnTypeOrDefaultRelaxed(TableName table, String qualifier, String defaultType) {
+        java.util.Objects.requireNonNull(table, "table");
+        java.util.Objects.requireNonNull(qualifier, "qualifier");
+        java.util.Objects.requireNonNull(defaultType, "defaultType");
+        String t = columnTypeRelaxed(table, qualifier);
+        return (t != null) ? t : defaultType;
     }
 
     /**

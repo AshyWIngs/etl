@@ -25,6 +25,9 @@ import org.apache.hadoop.hbase.TableName;
  * При непарсируемом значении допустимо вернуть null либо
  * бросить непроверяемое исключение с кратким контекстом (таблица, колонка,
  * длина/префикс значения) для облегчения диагностики.
+ *
+ * Нулевые аллокации. Для горячих путей используйте перегрузку с byte[]-срезами; стандартная перегрузка создаёт строку qualifier и копию value.
+ * Совместимость. Дефолтная реализация всегда делает копию value (изолирует от внешних модификаций), чтобы сохранить прежнюю семантику.
  */
 @FunctionalInterface
 public interface Decoder {
@@ -58,11 +61,37 @@ public interface Decoder {
     default Object decode(TableName table,
                           byte[] qual, int qOff, int qLen,
                           byte[] value, int vOff, int vLen) {
-        final String qualifier =
-                (qual == null ? null : new String(qual, qOff, qLen, StandardCharsets.UTF_8));
-        final byte[] valCopy =
-                (value == null ? null : Arrays.copyOfRange(value, vOff, vOff + vLen));
+        final String qualifier;
+        if (qual == null) {
+            qualifier = null;
+        } else if (qOff == 0 && qLen == qual.length) {
+            // Быстрый путь: используем весь массив
+            qualifier = new String(qual, StandardCharsets.UTF_8);
+        } else {
+            qualifier = new String(qual, qOff, qLen, StandardCharsets.UTF_8);
+        }
+        final byte[] valCopy;
+        if (value == null) {
+            valCopy = null;
+        } else if (vOff == 0 && vLen == value.length) {
+            // Быстрый путь: копируем весь массив целиком
+            valCopy = Arrays.copyOf(value, vLen);
+        } else {
+            // Обычный путь: копия указанного среза
+            valCopy = Arrays.copyOfRange(value, vOff, vOff + vLen);
+        }
         return decode(table, qualifier, valCopy);
+    }
+
+    /**
+     * Удобная перегрузка с целыми массивами qualifier/value.
+     * Делегирует на быструю перегрузку с оффсетами и сохраняет семантику копирования value по умолчанию.
+     * Для нулевых аллокаций реализации могут переопределить быструю перегрузку и/или эту.
+     */
+    default Object decode(TableName table, byte[] qual, byte[] value) {
+        int qLen = (qual == null ? 0 : qual.length);
+        int vLen = (value == null ? 0 : value.length);
+        return decode(table, qual, 0, qLen, value, 0, vLen);
     }
 
     /**
@@ -88,6 +117,9 @@ public interface Decoder {
      * избежать аллокаций обёрток. Экземпляры типизированных декодеров можно хранить
      * в реестре схем (например, на уровне SchemaRegistry) для мгновенной выдачи
      * подходящего декодера под колонку.
+     *
+     * Потокобезопасность: реализации должны быть статичными/неизменяемыми или синхронизированными.
+     * Контракт: входные массивы рассматриваются как только для чтения; допускается null.
      */
     @FunctionalInterface
     interface Typed<T> {

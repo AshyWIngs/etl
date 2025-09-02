@@ -165,11 +165,16 @@
     <value>10</value>
   </property>
 
-  <!-- Осмысленный client.id для метрик в Kafka (имя продьюсера). -->
-  <property>
-    <name>h2k.producer.client.id</name>
-    <value>h2k-repl</value>
-  </property>
+  <!--
+    Осмысленный client.id для метрик в Kafka (имя продьюсера).
+    РЕКОМЕНДАЦИЯ: не задавайте фиксированное значение, чтобы на каждой ноде был уникальный id
+    (ендпоинт сам возьмёт hostname, а при проблемах с DNS — сгенерирует UUID).
+    Если нужно задать явно, убедитесь, что строка уникальна на ноду (ниже пример).
+    <property>
+      <name>h2k.producer.client.id</name>
+      <value>h2k-repl-${HOSTNAME}</value>
+    </property>
+  -->
 
   <!--
     Управление ожиданием подтверждений в самом репликаторе:
@@ -184,6 +189,20 @@
   <property>
     <name>h2k.producer.await.timeout.ms</name>
     <value>180000</value>
+  </property>
+
+  <!--
+    Диагностика BatchSender (не влияет на горячий путь; читается при старте):
+      h2k.producer.batch.counters.enabled — включить внутренние счётчики (DEBUG)
+      h2k.producer.batch.debug.on.failure — печатать подробности при сбоях авто‑сброса (DEBUG)
+  -->
+  <property>
+    <name>h2k.producer.batch.counters.enabled</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>h2k.producer.batch.debug.on.failure</name>
+    <value>false</value>
   </property>
 
   <!--
@@ -211,6 +230,84 @@
     <name>h2k.schema.path</name>
     <value>/etc/h2k/schema.json</value>
   </property>
+
+  <!--
+    Дополнительные поля в payload (по умолчанию выключены):
+      include.meta      — служебные поля о таблице/CF/счетчиках клеток
+      include.meta.wal  — поля WAL (_wal_seq/_wal_write_time)
+      include.rowkey    — добавлять rowkey (ниже можно выбрать формат base64/hex)
+  -->
+  <property>
+    <name>h2k.include.meta</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>h2k.include.meta.wal</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>h2k.include.rowkey</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>h2k.rowkey.base64</name>
+    <value>true</value>
+  </property>
+
+  <!--
+    (Опционально) Фильтрация по минимальному WAL‑timestamp для целевого CF:
+      h2k.filter.by.wal.ts = true
+      h2k.wal.min.ts       = epochMillis
+    По умолчанию фильтр выключен.
+  -->
+  <!--
+  <property>
+    <name>h2k.filter.by.wal.ts</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>h2k.wal.min.ts</name>
+    <value>-1</value>
+  </property>
+  -->
+
+  <!--
+    ===== Автопроверка/создание Kafka‑топиков (TopicEnsurer) =====
+    ensure.topics=true — при старте и на лету проверять существование топика и при необходимости создавать.
+    topic.partitions/replication — параметры создания (возьмите значения под вашу нагрузку/кластер).
+    admin.timeout.ms — таймаут операций AdminClient.
+    unknown.backoff.ms — короткий бэкофф на «неуверенные» ошибки (например, временные проблемы сети/ZK).
+  -->
+  <property>
+    <name>h2k.ensure.topics</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>h2k.topic.partitions</name>
+    <value>12</value>
+  </property>
+  <property>
+    <name>h2k.topic.replication</name>
+    <value>3</value>
+  </property>
+  <property>
+    <name>h2k.admin.timeout.ms</name>
+    <value>30000</value>
+  </property>
+  <property>
+    <name>h2k.ensure.unknown.backoff.ms</name>
+    <value>5000</value>
+  </property>
+
+  <!--
+    Конфиги создаваемого топика: префикс h2k.topic.config.* будет перенесён как есть
+    в свойства Kafka при создании.
+    Примеры (РАЗКОММЕНТИРУЙТЕ при необходимости):
+    <property><name>h2k.topic.config.retention.ms</name><value>604800000</value></property>     <!-- 7 дней -->
+    <property><name>h2k.topic.config.cleanup.policy</name><value>delete</value></property>
+    <property><name>h2k.topic.config.compression.type</name><value>lz4</value></property>
+    <property><name>h2k.topic.config.min.insync.replicas</name><value>2</value></property>
+  -->
 
   <!--
     ===== Рекомендации по инфраструктуре (не параметры приложения) =====

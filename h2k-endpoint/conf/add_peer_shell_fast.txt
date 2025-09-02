@@ -1,6 +1,6 @@
 # ВКЛЮЧАЕМ РЕПЛИКАЦИЮ ДЛЯ НУЖНОЙ CF (колонко‑семейство '0') В ТАБЛИЦЕ
 disable 'TBL_JTI_TRACE_CIS_HISTORY'
-alter  'TBL_JTI_TRACE_CIS_HISTORY', {NAME =&gt; '0', REPLICATION_SCOPE =&gt; 1}
+alter  'TBL_JTI_TRACE_CIS_HISTORY', {NAME => '0', REPLICATION_SCOPE => 1}
 enable 'TBL_JTI_TRACE_CIS_HISTORY'
 
 # ДОБАВЛЯЕМ PEER С КАСТОМНЫМ ENDPOINT (наш класс) И ВСЕМИ НУЖНЫМИ КОНФИГАМИ
@@ -9,55 +9,58 @@ enable 'TBL_JTI_TRACE_CIS_HISTORY'
 add_peer 'h2k_fast',
   "10.254.3.111,10.254.3.112,10.254.3.113:2181:/hbase",
   {
-    'replication_endpoint_impl' =&gt; 'kz.qazmarka.h2k.endpoint.KafkaReplicationEndpoint',
-    'configuration' =&gt; {
+    'replication_endpoint_impl' => 'kz.qazmarka.h2k.endpoint.KafkaReplicationEndpoint',
+    'configuration' => {
       # ======== ОБЯЗАТЕЛЬНО ========
       # Bootstrap Kafka (без аутентификации)
-      'h2k.kafka.bootstrap.servers' =&gt; '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
+      'h2k.kafka.bootstrap.servers' => '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
 
       # ======== ОБЩИЕ НАСТРОЙКИ ЭНДПОИНТА ========
       # Имя топика по шаблону; доступны ${table}, ${namespace}, ${qualifier}
-      'h2k.topic.pattern'           =&gt; '${table}',
+      # client.id не задаём — KafkaReplicationEndpoint сгенерирует уникальный per-host (hostname/UUID) при старте
+      'h2k.topic.pattern'           => '${table}',
 
       # Какое CF реплицируем (имя/байтовое имя семейства колонок)
-      'h2k.cf'                      =&gt; '0',
+      'h2k.cf'                      => '0',
 
       # Если rowkey посолен — включите и задайте длину соли (в байтах)
-      'h2k.salted'                  =&gt; 'false',
-      'h2k.salt.bytes'              =&gt; '1',
+      'h2k.salted'                  => 'false',
+      'h2k.salt.bytes'              => '1',
 
       # Режим декодирования значений: simple | json-phoenix
-      'h2k.decode.mode'             =&gt; 'json-phoenix',
+      'h2k.decode.mode'             => 'json-phoenix',
       # Путь к JSON‑схеме колонок (см. README)
-      'h2k.schema.path'             =&gt; '/etc/h2k/schema.json',
+      'h2k.schema.path'             => '/etc/h2k/schema.json',
 
       # Сериализовать ли null‑поля в JSON (экономия трафика = false)
-      'h2k.json.serialize.nulls'    =&gt; 'false',
+      'h2k.json.serialize.nulls'    => 'false',
 
       # Сколько отправок ждать, прежде чем вызвать get() на фьючерсах (баланс задержки/пропускной способности)
-      'h2k.producer.await.every'    =&gt; '500',
+      'h2k.producer.await.every'    => '500',
       # Глобальный таймаут ожидания подтверждений, мс
-      'h2k.producer.await.timeout.ms' =&gt; '180000',
+      'h2k.producer.await.timeout.ms' => '180000',
+      # Диагностика BatchSender (читается при старте; на горячий путь не влияет)
+      'h2k.producer.batch.counters.enabled'   => 'false',
+      'h2k.producer.batch.debug.on.failure'   => 'false',
 
       # ======== НАСТРОЙКИ KAFKA PRODUCER (максимальная скорость, дубли ловим на потребителе) ========
-      'h2k.producer.acks'                 =&gt; '1',
-      'h2k.producer.enable.idempotence'   =&gt; 'false',
-      'h2k.producer.max.in.flight'        =&gt; '5',
+      'h2k.producer.acks'                 => '1',
+      'h2k.producer.enable.idempotence'   => 'false',
+      'h2k.producer.max.in.flight'        => '5',
 
       # Группировка и сжатие
-      'h2k.producer.linger.ms'            =&gt; '100',
-      'h2k.producer.batch.size'           =&gt; '524288',   # 512 КБ
-      'h2k.producer.compression.type'     =&gt; 'lz4',      # самый быстрый; можно snappy
+      'h2k.producer.linger.ms'            => '100',
+      'h2k.producer.batch.size'           => '524288',   # 512 КБ
+      'h2k.producer.compression.type'     => 'lz4',      # самый быстрый; можно snappy
 
       # Буферы и размеры
-      'h2k.producer.buffer.memory'        =&gt; '268435456', # 256 МБ
-      'h2k.producer.max.request.size'     =&gt; '2097152',   # 2 МБ
+      'h2k.producer.buffer.memory'        => '268435456', # 256 МБ
+      'h2k.producer.max.request.size'     => '2097152',   # 2 МБ
 
       # Таймауты/ретраи
-      'h2k.producer.request.timeout.ms'   =&gt; '30000',
-      'h2k.producer.delivery.timeout.ms'  =&gt; '90000',
-      'h2k.producer.retries'              =&gt; '10',
-      'h2k.producer.client.id'            =&gt; 'h2k-repl-fast'
+      'h2k.producer.request.timeout.ms'   => '30000',
+      'h2k.producer.delivery.timeout.ms'  => '90000',
+      'h2k.producer.retries'              => '10'
     }
   }
 

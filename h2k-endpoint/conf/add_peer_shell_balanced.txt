@@ -13,7 +13,7 @@ add_peer 'h2k_balanced',
     'configuration' => {
       # Обязательные базовые ключи
       'h2k.kafka.bootstrap.servers'   => '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
-      'h2k.producer.client.id'         => 'h2k-repl-balanced',
+      # client.id не задаём — KafkaReplicationEndpoint сгенерирует уникальный per-host (hostname/UUID) при старте
       'h2k.topic.pattern'             => '${table}',   # ${table}|${namespace}|${qualifier}
       'h2k.cf'                        => '0',
       'h2k.salted'                    => 'false',
@@ -27,6 +27,9 @@ add_peer 'h2k_balanced',
       # Параметры ожидания подтверждений (регулируйте под SLA)
       'h2k.producer.await.every'      => '1000',       # ждать ack каждые N сообщений
       'h2k.producer.await.timeout.ms' => '300000',
+      # Диагностика BatchSender (читается при старте; на горячий путь не влияет)
+      'h2k.producer.batch.counters.enabled'   => 'false',
+      'h2k.producer.batch.debug.on.failure'   => 'false',
 
       # --- Сбалансированный профиль Kafka Producer ---
       'h2k.producer.enable.idempotence'           => 'true',
@@ -76,4 +79,3 @@ status 'replication'
 #
 # Наблюдаемость:
 #  - Включите DEBUG для 'kz.qazmarka.h2k.endpoint' при первичном пуске.
-#  - По JMX снимайте метрики продьюсера (p95/p99 latency, batch-size-avg, records-per-request-avg) — это поможет выбирать значения linger/batch.size.
