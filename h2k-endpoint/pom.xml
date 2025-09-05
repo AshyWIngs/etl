@@ -26,7 +26,7 @@
   <properties>
     <!-- Версии ядра стека Hadoop/HBase/Phoenix/Kafka (согласованы между собой) -->
     <!-- Версия Hadoop (рантайм — из кластера) -->
-    <hadoop.version>2.7.4</hadoop.version>
+    <hadoop.version>3.4.0</hadoop.version>
     <!-- Версия HBase (RegionServer окружение) -->
     <hbase.version>1.4.13</hbase.version>
     <!-- Версия Phoenix, собранная под HBase 1.4 -->
