@@ -130,7 +130,7 @@
       <dependency>
         <groupId>org.xerial.snappy</groupId>
         <artifactId>snappy-java</artifactId>
-        <version>1.1.7.3</version>
+        <version>1.1.10.4</version>
       </dependency>
       <!-- jsr305: аннотации, разные версии часто конфликтуют в IDE; выравниваем -->
       <dependency>
