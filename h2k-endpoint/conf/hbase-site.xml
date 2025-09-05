@@ -31,28 +31,33 @@
   </property>
 
   <!--
-    Семейство колонок (CF), по которому берём значения. Строка в UTF‑8 (как в WAL).
-    Если таблица хранит бизнес‑данные в другом CF — укажите его.
+    Список семейств колонок (CF), по которым берём значения. CSV без пробелов.
+    Примеры: "d,b", "0,DOCUMENTS". Имена — ровно как в HBase (см. describe).
+    Несуществующие в таблице CF игнорируются без ошибок.
   -->
   <property>
-    <name>h2k.cf</name>
-    <value>0</value>
+    <name>h2k.cf.list</name>
+    <value>d</value>
   </property>
 
   <!--
-    Признак SALT в rowkey Phoenix. Если rowkey начинается с соль‑байта/байтов, то:
-      h2k.salted=true и h2k.salt.bytes — количество байтов соли.
-    Если SALT не используется — оставляем false.
+    Карта соли Phoenix per-table: "TABLE=bytes" через запятую.
+    'default' — фолбэк для остальных таблиц (0 = соли нет).
+    Пример: TBL_JTI_TRACE_CIS_HISTORY=1,TBL_JTI_TRACE_CIS=1,RECEIPT=1,DOCUMENT=1
   -->
   <property>
-    <name>h2k.salted</name>
-    <value>false</value>
+    <name>h2k.salt.map</name>
+    <value>TBL_JTI_TRACE_CIS_HISTORY=1</value>
   </property>
 
-  <!-- Количество байтов SALT (активно только при h2k.salted=true). Обычно 1. -->
+  <!--
+    Подсказки ёмкости JSON‑payload (число ключей в корневой map) per-table.
+    Нужны для точного подбора LinkedHashMap без ре‑хешей.
+    'default=0' — использовать быструю оценку в рантайме.
+  -->
   <property>
-    <name>h2k.salt.bytes</name>
-    <value>1</value>
+    <name>h2k.capacity.hints</name>
+    <value>TBL_JTI_TRACE_CIS_HISTORY=32</value>
   </property>
 
   <!--
@@ -228,14 +233,14 @@
   <!-- Путь к файлу схемы (schema.json) для режима json-phoenix. -->
   <property>
     <name>h2k.schema.path</name>
-    <value>/etc/h2k/schema.json</value>
+    <value>/opt/hbase-default-current/conf/schema.json</value>
   </property>
 
   <!--
     Дополнительные поля в payload (по умолчанию выключены):
       include.meta      — служебные поля о таблице/CF/счетчиках клеток
       include.meta.wal  — поля WAL (_wal_seq/_wal_write_time)
-      include.rowkey    — добавлять rowkey (ниже можно выбрать формат base64/hex)
+      include.rowkey    — добавлять rowkey (ниже можно выбрать формат BASE64/HEX)
   -->
   <property>
     <name>h2k.include.meta</name>
@@ -250,8 +255,8 @@
     <value>false</value>
   </property>
   <property>
-    <name>h2k.rowkey.base64</name>
-    <value>true</value>
+    <name>h2k.rowkey.encoding</name>
+    <value>BASE64</value>
   </property>
 
   <!--
@@ -260,7 +265,6 @@
       h2k.wal.min.ts       = epochMillis
     По умолчанию фильтр выключен.
   -->
-  <!--
   <property>
     <name>h2k.filter.by.wal.ts</name>
     <value>false</value>
@@ -269,7 +273,6 @@
     <name>h2k.wal.min.ts</name>
     <value>-1</value>
   </property>
-  -->
 
   <!--
     ===== Автопроверка/создание Kafka‑топиков (TopicEnsurer) =====
@@ -303,7 +306,7 @@
     Конфиги создаваемого топика: префикс h2k.topic.config.* будет перенесён как есть
     в свойства Kafka при создании.
     Примеры (РАЗКОММЕНТИРУЙТЕ при необходимости):
-    <property><name>h2k.topic.config.retention.ms</name><value>604800000</value></property>     <!-- 7 дней -->
+    <property><name>h2k.topic.config.retention.ms</name><value>604800000</value></property>     — 7 дней
     <property><name>h2k.topic.config.cleanup.policy</name><value>delete</value></property>
     <property><name>h2k.topic.config.compression.type</name><value>lz4</value></property>
     <property><name>h2k.topic.config.min.insync.replicas</name><value>2</value></property>
@@ -319,16 +322,3 @@
       зависят от вашей версии HBase 1.4.x.
   -->
 </configuration>
-
-<!--
-  Пример секции безопасности (СЕЙЧАС НЕ ИСПОЛЬЗУЕТСЯ, у нас без авторизации).
-  Оставляем здесь как справку на будущее — при необходимости раскомментируйте и заполните.
-
-  <property><name>h2k.producer.security.protocol</name><value>SASL_SSL</value></property>
-  <property><name>h2k.producer.sasl.mechanism</name><value>SCRAM-SHA-512</value></property>
-  <property>
-    <name>h2k.producer.sasl.jaas.config</name>
-    <value>org.apache.kafka.common.security.scram.ScramLoginModule required username="user" password="pass";</value>
-  </property>
-  <property><name>h2k.producer.ssl.endpoint.identification.algorithm</name><value></value></property>
--->

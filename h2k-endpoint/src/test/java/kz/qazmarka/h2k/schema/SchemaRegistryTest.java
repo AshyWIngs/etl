@@ -1,0 +1,168 @@
+package kz.qazmarka.h2k.schema;
+
+import org.apache.hadoop.hbase.TableName;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import java.util.HashMap;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Юнит-тесты для интерфейса {@link SchemaRegistry} (дефолт-методы).
+ *
+ * Назначение:
+ *  • Зафиксировать поведение «релаксированного» поиска типов колонок: exact → UPPER → lower.
+ *  • Проверить контракты orDefault/has-вариантов и фабрики {@link SchemaRegistry#empty()}.
+ *  • Проверить fail-fast валидацию аргументов (NPE) в default-методах.
+ *
+ * Технические детали:
+ *  • Используется лёгкая in-memory реализация реестра на основе HashMap без IO.
+ *  • JUnit 5 (Jupiter), совместим с Java 8 (без List.of/var и т.п.).
+ */
+class SchemaRegistryTest {
+
+    /** Условная таблица (namespace:table) для тестов. */
+    private static final TableName TBL = TableName.valueOf("DEFAULT:TBL_JTI_TRACE_CIS_HISTORY");
+
+    @BeforeAll
+    static void quietLogging() {
+        // На некоторых стендах log4j может пытаться писать в корень — подстрахуемся.
+        System.setProperty("h2k.log.dir", "target");
+    }
+
+    @Test
+    @DisplayName("empty(): всегда null/false")
+    void emptyRegistry() {
+        SchemaRegistry r = SchemaRegistry.empty();
+        assertNull(r.columnType(TBL, "any"));
+        assertNull(r.columnTypeRelaxed(TBL, "any"));
+        assertFalse(r.hasColumn(TBL, "any"));
+        assertFalse(r.hasColumnRelaxed(TBL, "any"));
+        assertEquals("VARCHAR", r.columnTypeOrDefault(TBL, "x", "VARCHAR"));
+        assertEquals("VARCHAR", r.columnTypeOrDefaultRelaxed(TBL, "x", "VARCHAR"));
+
+        // refresh — no-op
+        r.refresh();
+    }
+
+    @Test
+    @DisplayName("columnTypeOrDefault: возвращает default при отсутствии типа")
+    void orDefault() {
+        SchemaRegistry r = mapRegistry()
+                .put("DEFAULT:TBL_JTI_TRACE_CIS_HISTORY", "id", "VARCHAR")
+                .build();
+
+        assertEquals("VARCHAR", r.columnTypeOrDefault(TBL, "id", "CHAR"));
+        assertEquals("CHAR", r.columnTypeOrDefault(TBL, "missing", "CHAR"));
+    }
+
+    @Test
+    @DisplayName("columnTypeRelaxed: exact/UPPER/lower поиск без лишних аллокаций")
+    void relaxedLookup() {
+        SchemaRegistry r = mapRegistry()
+                // В карте лежат типы с разным регистром ключей:
+                .put("DEFAULT:TBL_JTI_TRACE_CIS_HISTORY", "MiXeD", "TIMESTAMP") // exact
+                .put("DEFAULT:TBL_JTI_TRACE_CIS_HISTORY", "FOO",   "INT")       // UPPER
+                .put("DEFAULT:TBL_JTI_TRACE_CIS_HISTORY", "bar",   "BIGINT")    // lower
+                .build();
+
+        // exact
+        assertEquals("TIMESTAMP", r.columnTypeRelaxed(TBL, "MiXeD"));
+
+        // приход "foo" → пробует UPPER("FOO")
+        assertEquals("INT", r.columnTypeRelaxed(TBL, "foo"));
+
+        // приход "BAR" → пробует lower("bar")
+        assertEquals("BIGINT", r.columnTypeRelaxed(TBL, "BAR"));
+
+        // не найдено ни в одном регистре
+        assertNull(r.columnTypeRelaxed(TBL, "absent"));
+    }
+
+    @Test
+    @DisplayName("hasColumn / hasColumnRelaxed: true/false в ожидаемых случаях")
+    void hasChecks() {
+        SchemaRegistry r = mapRegistry()
+                .put("DEFAULT:TBL_JTI_TRACE_CIS_HISTORY", "X", "VARCHAR")
+                .build();
+
+        // exact-версия — только точное совпадение
+        assertTrue(r.hasColumn(TBL, "X"));
+        assertFalse(r.hasColumn(TBL, "x"));
+
+        // relaxed — найдёт через UPPER
+        assertTrue(r.hasColumnRelaxed(TBL, "x"));
+        assertFalse(r.hasColumnRelaxed(TBL, "missing"));
+    }
+
+    @Test
+    @DisplayName("columnTypeOrDefaultRelaxed: default при отсутствии")
+    void orDefaultRelaxed() {
+        SchemaRegistry r = mapRegistry().build();
+        assertEquals("VARCHAR", r.columnTypeOrDefaultRelaxed(TBL, "nope", "VARCHAR"));
+    }
+
+    @Test
+    @DisplayName("NPE: все default-методы валидируют аргументы (fail-fast)")
+    void nullChecks() {
+        SchemaRegistry r = SchemaRegistry.empty();
+        assertThrows(NullPointerException.class, () -> r.columnTypeOrDefault(null, "q", "V"));
+        assertThrows(NullPointerException.class, () -> r.columnTypeOrDefault(TBL, null, "V"));
+        assertThrows(NullPointerException.class, () -> r.columnTypeOrDefault(TBL, "q", null));
+
+        assertThrows(NullPointerException.class, () -> r.columnTypeOrDefaultRelaxed(null, "q", "V"));
+        assertThrows(NullPointerException.class, () -> r.columnTypeOrDefaultRelaxed(TBL, null, "V"));
+        assertThrows(NullPointerException.class, () -> r.columnTypeOrDefaultRelaxed(TBL, "q", null));
+
+        assertThrows(NullPointerException.class, () -> r.columnTypeRelaxed(null, "q"));
+        assertThrows(NullPointerException.class, () -> r.columnTypeRelaxed(TBL, null));
+
+        assertThrows(NullPointerException.class, () -> r.hasColumnRelaxed(null, "q"));
+        assertThrows(NullPointerException.class, () -> r.hasColumnRelaxed(TBL, null));
+    }
+
+    /* ======================== вспомогательная in-memory реализация ======================== */
+
+    /**
+     * Простейший map-бэкенд: ищет тип только по exact-ключу (без нормализации регистра).
+     * Дефолт-методы интерфейса поверх него проверяют relaxed-логику.
+     */
+    private static class MapBackedRegistry implements SchemaRegistry {
+        private final Map<String, String> map;
+
+        MapBackedRegistry(Map<String, String> map) {
+            this.map = map;
+        }
+
+        @Override
+        public String columnType(TableName table, String qualifier) {
+            return map.get(key(table, qualifier));
+        }
+
+        static String key(TableName t, String q) {
+            // у TableName.getNameAsString() уже содержит namespace:table
+            return t.getNameAsString() + "|" + q;
+        }
+    }
+
+    /** builder для удобного наполнения тестового реестра. */
+    private static class MapRegistryBuilder {
+        private final Map<String, String> map = new HashMap<>();
+
+        MapRegistryBuilder put(String table, String qualifier, String type) {
+            map.put(table + "|" + qualifier, type);
+            return this;
+        }
+
+        SchemaRegistry build() {
+            return new MapBackedRegistry(map);
+        }
+    }
+
+    private static MapRegistryBuilder mapRegistry() {
+        return new MapRegistryBuilder();
+    }
+}

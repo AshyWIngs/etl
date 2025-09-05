@@ -34,31 +34,57 @@ import org.apache.phoenix.schema.types.PVarcharArray;
 import org.apache.phoenix.schema.types.PhoenixArray;
 
 /**
- * ValueCodecPhoenix
- * Декод значений колонок через Phoenix PDataType, опираясь на реестр типов SchemaRegistry.
- * Обеспечивает точное соответствие семантике Phoenix (UNSIGNED-типы, TIMESTAMP/DATE/TIME, ARRAY и т.п.).
+ * ValueCodecPhoenix — декодер значений колонок через Phoenix {@link PDataType}, опираясь на {@link SchemaRegistry}.
  *
- * Нормализация результата:
- * - TIMESTAMP/DATE/TIME -> миллисекунды epoch (long)
- * - Любой Phoenix ARRAY -> java.util.List&lt;Object&gt; (без копии для Object[], с минимальной копией для примитивных массивов)
- * - VARBINARY/BINARY -> byte[] как есть
- * - Прочие типы возвращаются как есть (String/Number/Boolean)
+ * Назначение
+ *  • Обеспечивает точное соответствие семантике Phoenix (UNSIGNED‑типы, TIMESTAMP/DATE/TIME, ARRAY и т.п.).
+ *  • Унифицирует результат: TIMESTAMP/DATE/TIME → epoch millis (long); любой Phoenix ARRAY → {@code List<Object>};
+ *    VARBINARY/BINARY → {@code byte[]} как есть; прочие типы — как вернул {@code PDataType}.
+ *
+ * Горячий путь и производительность
+ *  • Для ускорения использует локальный кэш соответствий (table, qualifier) → {@code PDataType}.
+ *  • Нормализация строкового имени типа выполняется ровно один раз на колонку (при первом доступе).
+ *  • Все преобразования массивов выполняются с минимальными аллокациями.
+ *
+ * Логи
+ *  • При неизвестном типе в реестре один раз для конкретной колонки пишет WARN и использует VARCHAR по умолчанию.
+ *  • Повторные промахи фиксируются в DEBUG (если включён).
+ *
+ * Потокобезопасность
+ *  • Класс использует только потокобезопасные структуры и безопасен для многопоточности в RegionServer.
  */
 public final class ValueCodecPhoenix implements Decoder {
+    /** Логгер класса; все сообщения — на русском языке. */
     private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(ValueCodecPhoenix.class);
 
-    /** Каноническое имя строкового типа в Phoenix. Используем в нескольких местах, чтобы не дублировать литерал. */
+    /** Каноническое имя строкового типа Phoenix, используемое как дефолт. */
     private static final String T_VARCHAR = "VARCHAR";
 
+    /** Источник знаний о типах Phoenix для колонок (JSON/System Catalog и т.п.). */
     private final SchemaRegistry registry;
 
-    /** Локальный кэш сопоставлений (table, qualifier) -> PDataType для устранения повторной нормализации строк типов. */
-    private final ConcurrentMap<ColKey, PDataType<?>> typeCache = new ConcurrentHashMap<>();
+    /**
+     * Двухуровневый потокобезопасный кэш:
+     *  верхний уровень — по TableName,
+     *  нижний — по qualifier (String).
+     * Минимизирует аллокации ключей на горячем пути (избегаем создания ColKey/строк из TableName).
+     */
+    private final ConcurrentMap<TableName, ConcurrentMap<String, PDataType<?>>> typeCache = new ConcurrentHashMap<>();
 
-    /** Набор колонок, для которых уже выводили предупреждение об неизвестном типе (чтобы не шуметь). */
+    /**
+     * Набор колонок, для которых уже был выведен WARN об неизвестном типе в реестре — чтобы не зашумлять логи.
+     */
     private final java.util.Set<ColKey> unknownTypeWarned = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-    /** Быстрый словарь соответствий: строковое имя типа -> PDataType. */
+    /**
+     * Быстрый словарь соответствий: каноническое строковое имя Phoenix‑типа → экземпляр {@link PDataType}.
+     *
+     * Примечания
+     *  • Ключи должны быть уже нормализованы методом {@link #normalizeTypeName(String)} (UPPERCASE, схлопнутые пробелы,
+     *    «UNSIGNED INT» и т.п.).
+     *  • Допускаем общепринятые синонимы (NUMERIC/NUMBER → DECIMAL, STRING → VARCHAR, ANSI формы и пр.).
+     *  • Расширять словарь безопасно: добавление новых ключей не влияет на существующее поведение.
+     */
     private static final Map<String, PDataType<?>> TYPE_MAP;
     static {
         Map<String, PDataType<?>> m = new HashMap<>(64);
@@ -94,36 +120,55 @@ public final class ValueCodecPhoenix implements Decoder {
         m.put("STRING", PVarchar.INSTANCE);              // синоним VARCHAR
         m.put("CHARACTER VARYING", PVarchar.INSTANCE);   // ANSI-форма VARCHAR
         m.put("BINARY VARYING", PVarbinary.INSTANCE);    // ANSI-форма VARBINARY
+        m.put("LONG", PLong.INSTANCE);     // синоним BIGINT
+        m.put("BOOL", PBoolean.INSTANCE);  // синоним BOOLEAN
         TYPE_MAP = java.util.Collections.unmodifiableMap(m);
     }
 
+    /**
+     * @param registry реализация реестра типов Phoenix для колонок; не должна быть {@code null}
+     */
     public ValueCodecPhoenix(SchemaRegistry registry) {
         this.registry = registry;
     }
 
-    /** Быстрое разрешение PDataType с кэшированием по колонке. */
+    /**
+     * Быстрое разрешение {@link PDataType} для колонки с кэшированием по (table, qualifier).
+     * Применяет нормализацию строкового имени типа, использует {@link #TYPE_MAP}, поддерживает несколько синонимов.
+     * При неизвестном типе один раз пишет WARN и возвращает {@link PVarchar#INSTANCE}.
+     */
     private PDataType<?> resolvePType(TableName table, String qualifier) {
-        ColKey key = new ColKey(table, qualifier);
-        return typeCache.computeIfAbsent(key, k -> {
-            String raw = registry.columnType(table, qualifier);
-            String norm = normalizeTypeName(raw == null ? T_VARCHAR : raw);
-            PDataType<?> pd = TYPE_MAP.get(norm);
-            if (pd != null) return pd;
-            if ("LONG".equals(norm)) return PLong.INSTANCE;    // синоним BIGINT
-            if ("BOOL".equals(norm)) return PBoolean.INSTANCE; // синоним BOOLEAN
+        // Верхний уровень по TableName — без аллокаций строк из TableName на каждом вызове
+        final ConcurrentMap<String, PDataType<?>> byQualifier =
+                typeCache.computeIfAbsent(table, t -> new ConcurrentHashMap<>());
+
+        // Нижний уровень по строке qualifier (она уже есть) — никаких доп. объектов
+        return byQualifier.computeIfAbsent(qualifier, q -> {
+            final String raw  = registry.columnType(table, q);
+            final String norm = normalizeTypeName(raw == null ? T_VARCHAR : raw);
+
+            final PDataType<?> pd = TYPE_MAP.get(norm);
+            if (pd != null) {
+                return pd;
+            }
+
             // Неизвестный тип — предупредим один раз для этой колонки, дальше молчим (DEBUG)
-            if (unknownTypeWarned.add(k)) {
+            final ColKey warnKey = new ColKey(table, q); // создаём только в редкой ветке
+            if (unknownTypeWarned.add(warnKey)) {
                 LOG.warn("Неизвестный тип Phoenix в реестре: {}.{} -> '{}' (нормализовано '{}'). Использую VARCHAR по умолчанию.",
-                         table.getNameAsString(), qualifier, raw, norm);
+                         table.getNameAsString(), q, raw, norm);
             } else if (LOG.isDebugEnabled()) {
                 LOG.debug("Повтор неизвестного типа Phoenix: {}.{} -> '{}' (нормализовано '{}')",
-                          table.getNameAsString(), qualifier, raw, norm);
+                          table.getNameAsString(), q, raw, norm);
             }
             return PVarchar.INSTANCE;
         });
     }
 
-    /** Компактный ключ кэша без ссылок на TableName-объекты (только строки). */
+    /**
+     * Компактный ключ кэша: имена namespace/таблицы/квалификатора в виде строк + предвычисленный хеш.
+     * Избегаем хранения ссылок на тяжёлые объекты и уменьшаем стоимость {@link #hashCode()}.
+     */
     private static final class ColKey {
         final String ns;
         final String name;
@@ -152,16 +197,20 @@ public final class ValueCodecPhoenix implements Decoder {
     }
 
     /**
-     * Декодирует значение колонки через Phoenix-тип из реестра.
-     * Преобразования результата:
-     * - TIMESTAMP/DATE/TIME -> миллисекунды epoch (long)
-     * - Любой ARRAY -> List<Object> (без копии для Object[], минимальная копия для примитивов)
-     * - VARBINARY/BINARY -> byte[] как есть
-     * - Прочие типы возвращаются как есть
+     * Декодирует значение колонки согласно Phoenix‑типу из реестра.
      *
-     * @param table     имя таблицы (не null)
-     * @param qualifier имя колонки (не null)
-     * @param value     байты значения; null возвращается как null
+     * Унификация результата
+     *  • TIMESTAMP/DATE/TIME → миллисекунды epoch (long);
+     *  • любой Phoenix ARRAY → {@code List<Object>} (без копии для Object[], минимальная коробка для примитивов);
+     *  • VARBINARY/BINARY → {@code byte[]} как есть;
+     *  • прочие типы возвращаются как есть (строки/числа/Boolean), как их выдал {@link PDataType}.
+     *
+     * @param table     имя таблицы (не {@code null})
+     * @param qualifier имя колонки (не {@code null})
+     * @param value     байты значения; {@code null} возвращается как {@code null}
+     * @return нормализованное значение в соответствии с правилами выше
+     * @throws NullPointerException  если {@code table} или {@code qualifier} равны {@code null}
+     * @throws IllegalStateException если {@link PDataType#toObject(byte[], int, int)} выбросил исключение
      */
     @Override
     public Object decode(TableName table, String qualifier, byte[] value) {
@@ -193,7 +242,10 @@ public final class ValueCodecPhoenix implements Decoder {
         return obj;
     }
 
-    /** Преобразует PhoenixArray в List<Object>, оборачивая возможный SQLException в IllegalStateException. */
+    /**
+     * Безопасно извлекает массив из {@link PhoenixArray} и конвертирует его в {@code List<Object>}.
+     * Любой {@link SQLException} заворачивается в {@link IllegalStateException} с контекстом.
+     */
     private static java.util.List<Object> toListFromPhoenixArray(PhoenixArray pa, TableName table, String qualifier) {
         try {
             Object raw = pa.getArray();
@@ -203,7 +255,10 @@ public final class ValueCodecPhoenix implements Decoder {
         }
     }
 
-    /** Универсальное преобразование массива (Object[] или примитивного) в List<Object> с минимальными аллокациями. */
+    /**
+     * Универсальная конвертация массивов (как объектных, так и примитивных) в {@code List<Object>} с минимальными
+     * аллокациями. Для Object[] используется {@link Arrays#asList(Object[])}, для примитивов — коробка значений.
+     */
     private static java.util.List<Object> toListFromRawArray(Object raw) {
         if (raw instanceof Object[]) {
             return Arrays.asList((Object[]) raw);
@@ -226,48 +281,56 @@ public final class ValueCodecPhoenix implements Decoder {
         return list;
     }
 
+    /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
     private static java.util.List<Object> boxIntArray(int[] a) {
         if (a.length == 0) return java.util.Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (int v : a) list.add(v);
         return list;
     }
+    /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
     private static java.util.List<Object> boxLongArray(long[] a) {
         if (a.length == 0) return java.util.Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (long v : a) list.add(v);
         return list;
     }
+    /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
     private static java.util.List<Object> boxDoubleArray(double[] a) {
         if (a.length == 0) return java.util.Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (double v : a) list.add(v);
         return list;
     }
+    /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
     private static java.util.List<Object> boxFloatArray(float[] a) {
         if (a.length == 0) return java.util.Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (float v : a) list.add(v);
         return list;
     }
+    /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
     private static java.util.List<Object> boxShortArray(short[] a) {
         if (a.length == 0) return java.util.Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (short v : a) list.add(v);
         return list;
     }
+    /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
     private static java.util.List<Object> boxByteArray(byte[] a) {
         if (a.length == 0) return java.util.Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (byte v : a) list.add(v);
         return list;
     }
+    /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
     private static java.util.List<Object> boxBooleanArray(boolean[] a) {
         if (a.length == 0) return java.util.Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (boolean v : a) list.add(v);
         return list;
     }
+    /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
     private static java.util.List<Object> boxCharArray(char[] a) {
         if (a.length == 0) return java.util.Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
@@ -275,7 +338,11 @@ public final class ValueCodecPhoenix implements Decoder {
         return list;
     }
 
-    /** Приводит имя типа к каноническому виду: верхний регистр, одинарные пробелы, ARRAY-формы к "<BASE> ARRAY". */
+    /**
+     * Канонизирует строковое имя Phoenix‑типа: UPPERCASE (Locale.ROOT), удаление параметров в скобках,
+     * унификация массивов к форме "BASE ARRAY", замена подчёркиваний на пробелы и схлопывание пробелов.
+     * Пустая или {@code null} строка даёт {@code VARCHAR}.
+     */
     private static String normalizeTypeName(String typeName) {
         String t = typeName == null ? "" : typeName.trim().toUpperCase(Locale.ROOT);
         if (t.isEmpty()) return T_VARCHAR;
@@ -290,7 +357,7 @@ public final class ValueCodecPhoenix implements Decoder {
         return collapseSpaces(t);
     }
 
-    /** Удаляет параметры в круглых скобках у базового типа: VARCHAR(100) -> VARCHAR, DECIMAL(10,2) -> DECIMAL. */
+    /** Убирает параметры в круглых скобках у базового типа: VARCHAR(100) → VARCHAR, DECIMAL(10,2) → DECIMAL. */
     private static String stripParenParams(String t) {
         int p = t.indexOf('(');
         if (p < 0) return t;
@@ -301,7 +368,7 @@ public final class ValueCodecPhoenix implements Decoder {
         return t.substring(0, p).trim();
     }
 
-    /** Унифицирует записи массивов: T[] и ARRAY<T> -> "T ARRAY"; внутренний тип тоже очищается от параметров. */
+    /** Приводит записи массивов T[] и ARRAY<T> к единому виду: "T ARRAY" (внутренний тип тоже очищается от параметров). */
     private static String normalizeArraySyntax(String t) {
         if (t.endsWith("[]")) {
             String base = t.substring(0, t.length() - 2).trim();
@@ -316,7 +383,7 @@ public final class ValueCodecPhoenix implements Decoder {
         return t;
     }
 
-    /** Схлопывает последовательности пробельных символов до одного пробела без использования RegEx. */
+    /** Схлопывает последовательности пробелов/табов/переводов строк до одного пробела без использования RegEx. */
     private static String collapseSpaces(String t) {
         StringBuilder sb = new StringBuilder(t.length());
         boolean space = false;

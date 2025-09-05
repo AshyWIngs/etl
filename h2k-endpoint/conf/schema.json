@@ -34,12 +34,5 @@
       "pvad": "VARCHAR",
       "ag": "VARCHAR"
     }
-  },
-  "ANOTHER_TABLE": {
-    "columns": {
-      "col_a": "VARCHAR",
-      "col_b": "INTEGER",
-      "created_at": "TIMESTAMP"
-    }
   }
 }

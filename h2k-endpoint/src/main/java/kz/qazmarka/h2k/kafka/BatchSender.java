@@ -125,7 +125,7 @@ public final class BatchSender implements AutoCloseable {
         if (sent.size() >= awaitEvery && !autoFlushSuspended) {
             // "Тихий" сброс: не нарушает горячий путь checked-исключениями.
             // Ошибку можно получить позже через явный flush().
-            boolean cleared = quietFlush("add");
+            boolean cleared = flushQuietInternal("add");
             if (!cleared) {
                 autoFlushSuspended = true; // больше не пытаемся авто‑сбрасывать до успешного flush
             }
@@ -133,18 +133,16 @@ public final class BatchSender implements AutoCloseable {
     }
 
     /**
-     * Добавить коллекцию futures «кусками», минимизируя число проверок/сбросов.
-     * Тихий {@code flushInternal(false)} вызывается только при реальном достижении/превышении
-     * порога {@code awaitEvery} за серию вставок. Остаток (&lt; {@code awaitEvery}) остаётся
-     * в буфере до следующего {@link #add(Future)} или явного {@link #flush()} / {@link #tryFlush()}.
-     */
-    /**
-     * Попытаться выполнить «тихий» авто‑сброс. Возвращает новое значение счётчика remainingToThreshold:
-     * awaitEvery — если буфер очищён; Integer.MAX_VALUE — если авто‑сброс подавлён из‑за неуспеха.
-     * Также поднимает флаг autoFlushSuspended при неуспехе.
+     * Пытается выполнить «тихий» авто‑сброс накопленного буфера.
+     *
+     * При неуспехе поднимает флаг {@code autoFlushSuspended} — дальнейшие авто‑сбросы
+     * подавляются до первого успешного явного/тихого {@link #flush()} / {@link #tryFlush()}.
+     *
+     * @param where короткая метка для лога (контекст вызова)
+     * @return {@code awaitEvery}, если буфер очищён; {@code Integer.MAX_VALUE}, если авто‑сброс подавлён/неуспешен
      */
     private int tryAutoQuietFlush(String where) {
-        boolean cleared = quietFlush(where);
+        boolean cleared = flushQuietInternal(where);
         if (!cleared) {
             autoFlushSuspended = true;
             return Integer.MAX_VALUE;
@@ -153,7 +151,11 @@ public final class BatchSender implements AutoCloseable {
     }
 
     /**
-     * Рассчитать начальное количество оставшихся до порога отправок для addAll() с учётом текущего состояния.
+     * Рассчитывает начальное количество элементов до порога {@code awaitEvery} для addAll(),
+     * учитывая текущее состояние буфера и возможную блокировку авто‑сброса.
+     *
+     * @return положительное число, если до порога ещё есть место; {@code awaitEvery} после успешного авто‑сброса;
+     *         {@code Integer.MAX_VALUE}, если авто‑сброс временно подавлён
      */
     private int initialRemainingForAddAll() {
         if (autoFlushSuspended) return Integer.MAX_VALUE;
@@ -162,6 +164,22 @@ public final class BatchSender implements AutoCloseable {
         return tryAutoQuietFlush("addAll/iter-pre");
     }
 
+    /**
+     * Добавить коллекцию futures «кусками», минимизируя число проверок и «тихих» сбросов.
+     *
+     * Алгоритм:
+     *  - сначала вычисляется, сколько элементов осталось до ближайшего порога {@code awaitEvery}
+     *    с учётом уже накопленного буфера;
+     *  - затем элементы добавляются по одному; когда счётчик достигает нуля —
+     *    выполняется «тихий» авто‑сброс (если он не подавлен после предыдущей ошибки);
+     *  - остаток (меньше {@code awaitEvery}) остаётся в буфере до следующего {@link #add(Future)}
+     *    или явного {@link #flush()} / {@link #tryFlush()}.
+     *
+     * Исключения в «тихом» режиме не пробрасываются (см. {@link #tryFlush()});
+     * для строгой семантики используйте {@link #flush()}.
+     *
+     * @param futures коллекция futures на подтверждение; null‑элементы пропускаются, пустая коллекция игнорируется
+     */
     public void addAll(Collection<? extends Future<RecordMetadata>> futures) {
         if (futures == null || futures.isEmpty()) {
             return; // быстрый путь
@@ -185,8 +203,14 @@ public final class BatchSender implements AutoCloseable {
     }
 
     /**
-     * Дождаться подтверждения для всех futures с одним общим таймаутом.
-     * Ветвится на оптимизированный путь для RandomAccess и обычный итераторный.
+     * Дождаться подтверждений для всех futures в пределах общего таймаута.
+     * Выбирает оптимизированный путь для {@link java.util.RandomAccess} списков.
+     *
+     * @param futures список futures (null или пустой — быстрый выход)
+     * @param timeoutMs общий таймаут ожидания в миллисекундах на весь набор
+     * @throws InterruptedException если поток прерван (флаг прерывания сохраняется вызывающим кодом)
+     * @throws java.util.concurrent.ExecutionException если одна из отправок завершилась с ошибкой
+     * @throws java.util.concurrent.TimeoutException если общий дедлайн исчерпан до подтверждения всех элементов
      */
     private static void waitAll(List<Future<RecordMetadata>> futures, int timeoutMs)
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
@@ -201,7 +225,7 @@ public final class BatchSender implements AutoCloseable {
         }
     }
 
-    /** Быстрый путь: доступ к списку по индексу (RandomAccess). */
+    /** Быстрый путь ожидания: доступ по индексу (списки, реализующие RandomAccess). */
     private static void waitAllRA(List<Future<RecordMetadata>> futures, long deadlineNs)
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
         for (int i = 0, n = futures.size(); i < n; i++) {
@@ -209,7 +233,7 @@ public final class BatchSender implements AutoCloseable {
         }
     }
 
-    /** Универсальный путь: обход коллекции через итератор. */
+    /** Универсальный путь ожидания: итератором по коллекции. */
     private static void waitAllIter(List<Future<RecordMetadata>> futures, long deadlineNs)
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
         for (Future<RecordMetadata> f : futures) {
@@ -219,7 +243,12 @@ public final class BatchSender implements AutoCloseable {
 
     /**
      * Ожидание подтверждения одного future с учётом общего дедлайна.
-     * Если {@code f == null}, метод ничего не делает.
+     *
+     * @param f future (если {@code null}, метод ничего не делает)
+     * @param deadlineNs абсолютный дедлайн в наносекундах (System.nanoTime())
+     * @throws InterruptedException при прерывании ожидания (флаг прерывания сохраняется)
+     * @throws java.util.concurrent.ExecutionException при ошибке выполнения
+     * @throws java.util.concurrent.TimeoutException если дедлайн истёк
      */
     private static void awaitOne(Future<RecordMetadata> f, long deadlineNs)
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
@@ -234,9 +263,13 @@ public final class BatchSender implements AutoCloseable {
     }
 
     /**
-     * Внутренний общий метод ожидания подтверждений.
-     * @param strict если true — при неуспехе выбрасывает исключение; если false — возвращает false
-     * @return true при успешном ожидании, false при неуспехе в «тихом» режиме
+     * Общая реализация сброса: строгий (с исключениями) или «тихий» (true/false).
+     *
+     * @param strict {@code true} — строгая семантика; {@code false} — «тихий» режим
+     * @return {@code true} при успехе (в «тихом» режиме)
+     * @throws InterruptedException см. {@link #waitAll(List, int)}
+     * @throws java.util.concurrent.ExecutionException см. {@link #waitAll(List, int)}
+     * @throws java.util.concurrent.TimeoutException см. {@link #waitAll(List, int)}
      */
     private boolean flushInternal(boolean strict)
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
@@ -247,7 +280,12 @@ public final class BatchSender implements AutoCloseable {
         return flushQuietInternal();
     }
 
-    /** Строгий сброс: при неуспехе выбрасывает исключение. */
+    /**
+     * Строгий сброс: ожидает все futures и очищает буфер или пробрасывает исключение при неуспехе.
+     * @throws InterruptedException при прерывании ожидания
+     * @throws java.util.concurrent.ExecutionException при ошибке отправки
+     * @throws java.util.concurrent.TimeoutException при истечении общего таймаута
+     */
     private void flushStrictInternal()
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
         if (sent.isEmpty()) {
@@ -269,8 +307,10 @@ public final class BatchSender implements AutoCloseable {
     }
 
     /**
-     * Тихий сброс с указанием контекста для лога (например, "add", "addAll/iter", "tryFlush").
-     * При неуспехе возвращает false; обновляет счётчики и пишет DEBUG‑сообщение, если включено.
+     * «Тихий» сброс: пытается дождаться подтверждений без выбрасывания checked‑исключений.
+     *
+     * @param where короткая метка для контекста лога (например, "add", "addAll/iter", "tryFlush")
+     * @return {@code true} — буфер очищен; {@code false} — произошла ошибка/таймаут/прерывание
      */
     private boolean flushQuietInternal(String where) {
         if (sent.isEmpty()) {
@@ -327,6 +367,7 @@ public final class BatchSender implements AutoCloseable {
         return flushUpToFirstFailureIter(deadline, dbg);
     }
 
+    /** Вариант flushUpToFirstFailure() для RandomAccess‑списков. Возвращает число успешно подтверждённых элементов. */
     private int flushUpToFirstFailureRA(long deadlineNs, boolean dbg)
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
         int ok = 0;
@@ -358,6 +399,7 @@ public final class BatchSender implements AutoCloseable {
         return ok;
     }
 
+    /** Вариант flushUpToFirstFailure() для произвольных коллекций. Возвращает число успешно подтверждённых элементов. */
     private int flushUpToFirstFailureIter(long deadlineNs, boolean dbg)
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
         int ok = 0;
@@ -415,25 +457,30 @@ public final class BatchSender implements AutoCloseable {
      * {@link #flush()} и получить исходное исключение там, где это уместно.
      */
     public boolean tryFlush() {
-        return quietFlush("tryFlush");
+        return flushQuietInternal("tryFlush");
     }
 
     /**
      * Текущее число отправок, накопленных и ещё не подтверждённых внутри BatchSender.
      * Важно: это объём локального буфера между вызовами {@link #flush()},
      * а не количество in‑flight на стороне брокера Kafka.
+     * @return текущий размер буфера неподтверждённых отправок
      */
     public int getPendingCount() {
         return sent.size();
     }
 
-    /** Есть ли сейчас неподтверждённые отправки. */
+    /**
+     * Есть ли сейчас неподтверждённые отправки.
+     * @return есть ли сейчас неподтверждённые отправки
+     */
     public boolean hasPending() {
         return !sent.isEmpty();
     }
 
     /**
      * Текущее целевое количество отправок в пачке перед ожиданием.
+     * @return целевое количество отправок в пачке перед ожиданием
      */
     public int getAwaitEvery() {
         return awaitEvery;
@@ -441,6 +488,7 @@ public final class BatchSender implements AutoCloseable {
 
     /**
      * Общий таймаут ожидания подтверждений (на один цикл flush), мс.
+     * @return общий таймаут ожидания подтверждений, мс
      */
     public int getAwaitTimeoutMs() {
         return awaitTimeoutMs;
@@ -448,32 +496,48 @@ public final class BatchSender implements AutoCloseable {
 
     /**
      * Быстрая проверка, пуст ли буфер накопленных отправок.
+     * @return true, если буфер пуст
      */
     public boolean isEmpty() {
         return sent.isEmpty();
     }
 
-    /** Включены ли счётчики. */
+    /**
+     * Включены ли счётчики.
+     * @return включены ли диагностические счётчики
+     */
     public boolean isCountersEnabled() {
         return enableCounters;
     }
 
-    /** Включено ли логирование причин неуспеха в DEBUG. */
+    /**
+     * Включено ли логирование причин неуспеха в DEBUG.
+     * @return включено ли DEBUG‑логирование неуспехов тихого сброса
+     */
     public boolean isDebugOnFailureEnabled() {
         return debugOnFailure;
     }
 
-    /** Сколько подтверждений получено успешно (суммарно по успешным flush/tryFlush). */
+    /**
+     * Сколько подтверждений получено успешно (суммарно по успешным flush/tryFlush).
+     * @return количество подтверждённых отправок (накопительно)
+     */
     public long getConfirmedCount() {
         return confirmedCount;
     }
 
-    /** Сколько успешных вызовов flush/tryFlush. */
+    /**
+     * Сколько успешных вызовов flush/tryFlush.
+     * @return число успешных вызовов flush/tryFlush
+     */
     public long getFlushCalls() {
         return flushCalls;
     }
 
-    /** Сколько неуспешных попыток flush/tryFlush. */
+    /**
+     * Сколько неуспешных попыток «тихого» сброса.
+     * @return число неуспешных «тихих» сбросов (tryFlush/авто-сброс); строгий flush() счётчик не изменяет
+     */
     public long getFailedFlushes() {
         return failedFlushes;
     }
@@ -505,13 +569,5 @@ public final class BatchSender implements AutoCloseable {
         }
         sb.append('}');
         return sb.toString();
-    }
-    /**
-     * Выполнить «тихий» сброс без выбрасывания checked-исключений.
-     * Возвращает true при успехе, false при неуспехе. Логирует причины в DEBUG при включённом флаге.
-     * @param where короткая метка для контекста лога (например, "add", "addAll/iter")
-     */
-    private boolean quietFlush(String where) {
-        return flushQuietInternal(where);
     }
 }

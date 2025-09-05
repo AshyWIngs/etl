@@ -2,7 +2,6 @@ package kz.qazmarka.h2k.kafka;
 
 import java.security.SecureRandom;
 import java.time.Duration;
-import java.util.Collections;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -19,23 +18,37 @@ import org.slf4j.LoggerFactory;
 import kz.qazmarka.h2k.config.H2kConfig;
 
 /**
- * Проверка/создание Kafka-топиков (+применение per-topic конфигов из H2kConfig).
- * Если ensureTopics=false — используем No-Op (admin=null).
- * Кэширует только УСПЕШНО проверенные/созданные топики (ensured), чтобы не повторять вызовы.
- * Валидирует имя топика (допустимые символы, длина, "."/"..").
- * Важно: класс только проверяет существование и при необходимости СОЗДАЁТ тему.
- * Ничего не «правит» у уже существующих тем (число партиций, фактор репликации, конфиги) — это осознанно.
- * Конфиги из H2kConfig применяются ТОЛЬКО при создании новой темы.
- * Поведение идемпотентно, учитывает гонки (TopicExistsException) и сетевые «неуверенные» ошибки через короткий backoff.
- * AdminClient получает client.id из H2kConfig; REQUEST_TIMEOUT_MS синхронизирован с adminTimeoutMs.
- * Лог‑уровни: подробные сообщения (повторные проверки, backoff, гоночные ситуации) пишутся на DEBUG; на INFO остаются только редкие события создания темы и предупреждения/ошибки.
+ * Проверка/создание Kafka-топиков и применение per-topic конфигов из {@link H2kConfig}.
+ *
+ * Назначение
+ *  - При старте/в рантайме убедиться, что целевые темы существуют; при отсутствии — создать с нужными
+ *    параметрами (число партиций, фактор репликации, минимальный набор конфигов).
+ *  - Ничего не «правит» у уже существующих тем — поведение идемпотентно и безопасно к гонкам.
+ *
+ * Производительность и потокобезопасность
+ *  - Класс предназначен для использования из одного потока (в рамках RegionServer‑репликации),
+ *    но внутренние структуры — неблокирующие (ConcurrentHashMap/LongAdder) и корректны при редких
+ *    конкурентных вызовах.
+ *  - На горячем пути не находится: обращения происходят редко (при первом упоминании темы/ошибках сети).
+ *  - Есть кеш успешно проверенных/созданных тем (ensured) и короткий backoff для «неуверенных» ошибок.
+ *
+ * Логирование
+ *  - INFO: только факты создания темы и явные ошибки.
+ *  - DEBUG: повторные проверки, backoff‑решения, диагностические детали и сводка применённых конфигов.
+ *
+ * Конфигурация
+ *  - Bootstrap/ClientId/таймауты берутся из {@link H2kConfig}; REQUEST_TIMEOUT_MS у AdminClient
+ *    синхронизирован с adminTimeoutMs из конфига.
  */
 public final class TopicEnsurer implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(TopicEnsurer.class);
-    /** Максимальная длина имени топика по Kafka. */
+    /**
+     * Максимальная разрешённая длина имени Kafka‑топика (ограничение брокера).
+     * На момент разработки: 249 символов.
+     */
     private static final int TOPIC_NAME_MAX_LEN = 249;
 
-    // Ключи часто используемых конфигов топика (для сводки в логах)
+    /** Ключи часто используемых конфигов темы, выводимых в краткой сводке (см. summarizeTopicConfigs). */
     private static final String CFG_RETENTION_MS       = "retention.ms";
     private static final String CFG_CLEANUP_POLICY     = "cleanup.policy";
     private static final String CFG_COMPRESSION_TYPE   = "compression.type";
@@ -44,11 +57,17 @@ public final class TopicEnsurer implements AutoCloseable {
     // Сообщение о некорректном имени топика (чтобы не дублировать литерал)
     private static final String WARN_INVALID_TOPIC =
             "Некорректное имя Kafka-топика '{}': допускаются [a-zA-Z0-9._-], длина 1..{}, запрещены '.' и '..'";
-    private final AdminClient admin;
+    /** Обёртка над AdminClient для unit‑тестируемости и стабильного API в классе. Может быть null, если ensureTopics=false. */
+    private final TopicAdmin admin;
+    /** Таймаут админских операций в миллисекундах (describe/create). */
     private final long adminTimeoutMs;
+    /** Число партиций для создаваемых тем (валидируется: минимум 1). */
     private final int topicPartitions;
+    /** Фактор репликации для создаваемых тем (валидируется: минимум 1). */
     private final short topicReplication;
+    /** Кеш тем, существование которых уже подтверждено (describe/create завершились успешно). */
     private final Set<String> ensured = ConcurrentHashMap.newKeySet();
+    /** Конфиги, применяемые ТОЛЬКО при создании новой темы; для существующих тем не используются. */
     private final Map<String, String> topicConfigs;
 
     // ---- Лёгкие метрики (для отладки/наблюдаемости) ----
@@ -61,30 +80,103 @@ public final class TopicEnsurer implements AutoCloseable {
     private final LongAdder createRace       = new LongAdder();
     private final LongAdder createFail       = new LongAdder();
 
-    /** Backoff для повторной проверки/создания топика после неуверенной ошибки (таймаут/сеть/ACL). */
+    /** Базовая величина backoff (мс) на «неуверенные» ошибки describe/create. */
     private final long unknownBackoffMs;
-
-    /** Предвычисленный backoff в наносекундах (для быстрых расчётов). */
+    /** Предвычисленный backoff в наносекундах (для быстрых расчётов задержки). */
     private final long unknownBackoffNs;
+    /** Политика генерации задержки с джиттером (SecureRandom), без аллокаций на вызов. */
+    private final BackoffPolicy backoff;
 
     /** Таймстемпы (nano) до которых мы не трогаем топик из-за предыдущего UNKNOWN-состояния. */
     private final ConcurrentHashMap<String, Long> unknownUntil = new ConcurrentHashMap<>();
 
-    /** Трёхзначный результат проверки существования топика. */
+    /**
+     * Трёхзначный результат проверки существования темы.
+     * TRUE    — тема подтверждена брокером (describeTopics без ошибок/таймаута).
+     * FALSE   — брокер ответил, что темы нет (UnknownTopicOrPartitionException).
+     * UNKNOWN — «неуверенная» ошибка (таймаут, прерывание, ACL/сеть/прочее) — включаем короткий backoff.
+     */
     private enum TopicExistence { TRUE, FALSE, UNKNOWN }
 
-    /**
-     * Криптографически стойкий генератор для редкого джиттера backoff.
-     * Один общий экземпляр на процесс: потокобезопасен и не создаёт лишних аллокаций.
-     */
-    private static final SecureRandom SR = new SecureRandom();
+    /** Минимальный интерфейс для админских вызовов Kafka, удобный для unit-тестов. */
+    private interface TopicAdmin {
+        /**
+         * Описывает набор тем одним сетевым вызовом.
+         * @param names имена тем
+         * @return карта topic → KafkaFuture с TopicDescription; get() может бросить Timeout/ExecutionException
+         */
+        java.util.Map<String, org.apache.kafka.common.KafkaFuture<org.apache.kafka.clients.admin.TopicDescription>>
+        describeTopics(java.util.Set<String> names);
 
-    /** Пометить тему как успешно проверенную/созданную и снять возможный backoff. */
+        /**
+         * Создаёт несколько тем батчем.
+         * @param newTopics список спецификаций новых тем
+         * @return карта topic → KafkaFuture<Void> для ожидания результатов по отдельности
+         */
+        java.util.Map<String, org.apache.kafka.common.KafkaFuture<Void>>
+        createTopics(java.util.List<org.apache.kafka.clients.admin.NewTopic> newTopics);
+
+        /**
+         * Создаёт одну тему и блокирующе ожидает завершения с заданным таймаутом.
+         * Может бросить InterruptedException/TimeoutException/ExecutionException.
+         */
+        void createTopic(org.apache.kafka.clients.admin.NewTopic topic, long timeoutMs)
+                throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException;
+
+        /** Закрывает клиент с ожиданием до указанного таймаута. */
+        void close(java.time.Duration timeout);
+    }
+
+    /** Реализация TopicAdmin поверх реального AdminClient. Не содержит бизнес‑логики, только адаптация API. */
+    private static final class AdminFacade implements TopicAdmin {
+        private final org.apache.kafka.clients.admin.AdminClient delegate;
+        AdminFacade(org.apache.kafka.clients.admin.AdminClient delegate) { this.delegate = delegate; }
+
+        @Override
+        public java.util.Map<String, org.apache.kafka.common.KafkaFuture<org.apache.kafka.clients.admin.TopicDescription>>
+        describeTopics(java.util.Set<String> names) {
+            return delegate.describeTopics(names).values();
+        }
+
+        @Override
+        public java.util.Map<String, org.apache.kafka.common.KafkaFuture<Void>>
+        createTopics(java.util.List<org.apache.kafka.clients.admin.NewTopic> newTopics) {
+            return delegate.createTopics(newTopics).values();
+        }
+
+        @Override
+        public void createTopic(org.apache.kafka.clients.admin.NewTopic topic, long timeoutMs)
+                throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
+            delegate.createTopics(java.util.Collections.singleton(topic))
+                    .all()
+                    .get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+
+        @Override
+        public void close(java.time.Duration timeout) { delegate.close(timeout); }
+    }
+
+    /**
+     * Помечает тему как подтверждённую (существует/успешно создана) и снимает возможный backoff.
+     *
+     * <p>Вызов безопасен при повторении; кеш и карта backoff будут приведены к согласованному состоянию.</p>
+     *
+     * @param t имя Kafka‑топика
+     */
     private void markEnsured(String t) {
         ensured.add(t);
         unknownUntil.remove(t);
     }
 
+    /**
+     * Создаёт экземпляр {@link TopicEnsurer}, если включена опция ensureTopics.
+     *
+     * <p>Параметры AdminClient (bootstrap, client.id, request.timeout.ms) берутся из {@link H2kConfig}.
+     * Если bootstrap не задан — возвращает {@code null} и пишет предупреждение.</p>
+     *
+     * @param cfg конфигурация H2K
+     * @return инициализированный {@code TopicEnsurer} или {@code null}, если ensureTopics=false / отсутствует bootstrap
+     */
     public static TopicEnsurer createIfEnabled(H2kConfig cfg) {
         if (!cfg.isEnsureTopics()) return null;
         final String bootstrap = cfg.getBootstrap();
@@ -97,7 +189,8 @@ public final class TopicEnsurer implements AutoCloseable {
         ap.put(AdminClientConfig.CLIENT_ID_CONFIG, cfg.getAdminClientId());
         // Синхронизируем таймаут запросов AdminClient с конфигурацией (ускоряет фейлы и снижает зависания)
         ap.put(AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, (int) cfg.getAdminTimeoutMs());
-        AdminClient admin = AdminClient.create(ap);
+        AdminClient ac = AdminClient.create(ap);
+        TopicAdmin admin = new AdminFacade(ac);
         return new TopicEnsurer(
             admin,
             cfg.getAdminTimeoutMs(),
@@ -108,8 +201,18 @@ public final class TopicEnsurer implements AutoCloseable {
         );
     }
 
-    private TopicEnsurer(AdminClient admin, long adminTimeoutMs, int topicPartitions, short topicReplication,
-                         Map<String, String> topicConfigs, long unknownBackoffMs) {
+    /**
+     * Внутренний конструктор. Выполняет валидацию входных параметров и подготавливает неизменяемые поля.
+     *
+     * @param admin обёртка над AdminClient или {@code null}, если ensureTopics=false
+     * @param adminTimeoutMs таймаут админских вызовов, мс
+     * @param topicPartitions число партиций (минимум 1)
+     * @param topicReplication фактор репликации (минимум 1)
+     * @param topicConfigs конфиги для создаваемых тем (read‑only snapshot)
+     * @param unknownBackoffMs базовый backoff на «неуверенные» ошибки (мс)
+     */
+    private TopicEnsurer(TopicAdmin admin, long adminTimeoutMs, int topicPartitions, short topicReplication,
+                        Map<String, String> topicConfigs, long unknownBackoffMs) {
         this.admin = admin;
         this.adminTimeoutMs = adminTimeoutMs;
         int parts = topicPartitions;
@@ -129,8 +232,17 @@ public final class TopicEnsurer implements AutoCloseable {
                 : java.util.Collections.unmodifiableMap(new java.util.HashMap<>(topicConfigs)));
         this.unknownBackoffMs = unknownBackoffMs;
         this.unknownBackoffNs = TimeUnit.MILLISECONDS.toNanos(unknownBackoffMs);
+        this.backoff = new BackoffPolicy(TimeUnit.MILLISECONDS.toNanos(1), 20); // min=1ms, jitter≈20%
     }
 
+    /**
+     * Проверяет существование темы и при отсутствии — пытается создать её (идемпотентно).
+     *
+     * <p>Быстрые ветки: пустое/некорректное имя → WARN и выход; кеш ensured; активный backoff.
+     * При UNKNOWN‑ситуациях (таймаут/ACL/сеть) назначает короткий backoff с джиттером.</p>
+     *
+     * @param topic имя Kafka‑топика
+     */
     public void ensureTopic(String topic) {
         if (admin == null) return;
         ensureInvocations.increment();
@@ -162,7 +274,12 @@ public final class TopicEnsurer implements AutoCloseable {
         }
     }
 
-    /** Быстрый путь: если тема уже успешно проверялась/создавалась раньше. */
+    /**
+     * Быстрая проверка кеша подтверждённых тем.
+     *
+     * @param t имя Kafka‑топика
+     * @return {@code true}, если тема уже была подтверждена ранее и повторная проверка не требуется
+     */
     private boolean fastCacheHit(String t) {
         if (ensured.contains(t)) {
             ensureHitCache.increment();
@@ -174,7 +291,12 @@ public final class TopicEnsurer implements AutoCloseable {
         return false;
     }
 
-    /** Учитываем активный backoff после неуверенной ошибки. Возвращает true, если надо пропустить попытку сейчас. */
+    /**
+     * Учитывает активный backoff после «неуверенной» ошибки по теме.
+     *
+     * @param t имя Kafka‑топика
+     * @return {@code true}, если «окно ожидания» ещё не истекло и попытку следует отложить
+     */
     private boolean respectBackoffIfAny(String t) {
         Long until = unknownUntil.get(t);
         if (until == null) return false;
@@ -190,7 +312,11 @@ public final class TopicEnsurer implements AutoCloseable {
         return false;
     }
 
-    /** Обработка случая: тема существует. */
+    /**
+     * Обработка кейса: тема существует (describeTopics успешен).
+     *
+     * @param t имя Kafka‑топика
+     */
     private void onExistsTrue(String t) {
         existsTrue.increment();
         markEnsured(t);
@@ -199,7 +325,12 @@ public final class TopicEnsurer implements AutoCloseable {
         }
     }
 
-    /** Обработка случая: неизвестно (таймаут/ACL/сеть). */
+    /**
+     * Обработка кейса: статус существования темы не определён (таймаут/ACL/сеть).
+     * Планирует повторную попытку через короткий backoff.
+     *
+     * @param t имя Kafka‑топика
+     */
     private void onExistsUnknown(String t) {
         existsUnknown.increment();
         scheduleUnknown(t);
@@ -209,7 +340,11 @@ public final class TopicEnsurer implements AutoCloseable {
         }
     }
 
-    /** Попытка создать тему с обработкой гонок/таймаута/исключений. */
+    /**
+     * Пытается создать тему, учитывая гонки и таймауты; обновляет метрики/кеш/логи.
+     *
+     * @param t имя Kafka‑топика
+     */
     private void tryCreateTopic(String t) {
         try {
             createTopic(t);
@@ -239,14 +374,14 @@ public final class TopicEnsurer implements AutoCloseable {
     }
 
     /**
-     * Ensure + вернуть статус существования темы.
-     * Возвращает {@code true} только если тема точно существует (была ранее, создана сейчас,
-     * либо подтверждена describeTopics). Возвращает {@code false}, если:
-     *  - ensure выключен (admin == null),
-     *  - имя пустое/некорректное,
-     *  - текущее состояние не удалось определить (назначен короткий backoff),
-     *  - произошла ошибка проверки/создания.
-     * Метод не бросает исключений.
+     * Убеждается, что тема существует, и возвращает итог.
+     *
+     * <p>Возвращает {@code true}, если тема подтверждена (была ранее/создана сейчас/подтверждена describeTopics).
+     * Возвращает {@code false}, если ensure отключён, имя пустое/некорректное, действует backoff либо произошла ошибка.
+     * Метод никогда не бросает исключений.</p>
+     *
+     * @param topic имя Kafka‑топика
+     * @return {@code true}, если тема гарантированно существует; иначе {@code false}
      */
     public boolean ensureTopicOk(String topic) {
         if (admin == null) return false;               // ensureTopics=false
@@ -261,9 +396,12 @@ public final class TopicEnsurer implements AutoCloseable {
     }
 
     /**
-     * Пакетная проверка/создание нескольких топиков с минимальным числом сетевых вызовов.
-     * Для уже проверенных ранее тем используется кеш (ensured), для неуверенных ошибок — короткий backoff.
-     * Ничего не делает, если ensureTopics=false или список пуст.
+     * Пакетная проверка/создание тем одним/двумя сетевыми вызовами.
+     *
+     * <p>Нормализует имена (trim/валидация), исключает уже подтверждённые и попавшие в backoff,
+     * затем вызывает describeTopics и createTopics для отсутствующих.</p>
+     *
+     * @param topics коллекция имён Kafka‑топиков
      */
     public void ensureTopics(java.util.Collection<String> topics) {
         if (admin == null || topics == null || topics.isEmpty()) return;
@@ -275,8 +413,11 @@ public final class TopicEnsurer implements AutoCloseable {
     }
 
     /**
-     * Нормализует вход: trim, валидация имени, учёт кеша ensured и активного backoff.
-     * Возвращает набор кандидатов для проверки у брокера одним вызовом.
+     * Нормализует входной набор имён: trim, валидация по правилам брокера,
+     * учёт кеша и активного backoff.
+     *
+     * @param topics исходные имена
+     * @return отфильтрованный набор имён, которые имеет смысл проверять у брокера
      */
     private java.util.LinkedHashSet<String> normalizeCandidates(java.util.Collection<String> topics) {
         java.util.LinkedHashSet<String> toCheck = new java.util.LinkedHashSet<>(topics.size());
@@ -298,13 +439,16 @@ public final class TopicEnsurer implements AutoCloseable {
     }
 
     /**
-     * Одним вызовом describeTopics определяет какие темы существуют, а какие отсутствуют.
-     * Существующие попадают в кеш ensured, отсутствующие возвращаются в списке missing.
+     * Вызывает describeTopics для набора имён и распределяет результаты:
+     * существующие → кеш, отсутствующие → список на создание.
+     *
+     * @param toCheck имена тем, прошедших нормализацию
+     * @return список отсутствующих тем
      */
     private java.util.ArrayList<String> describeAndCollectMissing(java.util.Set<String> toCheck) {
         java.util.ArrayList<String> missing = new java.util.ArrayList<>(toCheck.size());
-        org.apache.kafka.clients.admin.DescribeTopicsResult dtr = admin.describeTopics(toCheck);
-        java.util.Map<String, org.apache.kafka.common.KafkaFuture<org.apache.kafka.clients.admin.TopicDescription>> fmap = dtr.values();
+        java.util.Map<String, org.apache.kafka.common.KafkaFuture<org.apache.kafka.clients.admin.TopicDescription>> fmap =
+                admin.describeTopics(toCheck);
         for (String t : toCheck) {
             classifyDescribeTopic(fmap, t, missing);
         }
@@ -312,7 +456,14 @@ public final class TopicEnsurer implements AutoCloseable {
     }
 
     /**
-     * Обрабатывает результат describeTopics для одной темы: обновляет кеш/метрики или добавляет в missing.
+     * Обрабатывает результат describeTopics по одной теме.
+     *
+     * <p>UnknownTopic → добавляет в {@code missing}; Timeout/Execution(не UnknownTopic)/Interrupted → планирует backoff,
+     * ведёт DEBUG‑лог и инкрементирует метрики.</p>
+     *
+     * @param fmap   карта topic → future TopicDescription
+     * @param t      имя Kafka‑топика
+     * @param missing результирующий список отсутствующих тем
      */
     private void classifyDescribeTopic(
             java.util.Map<String, org.apache.kafka.common.KafkaFuture<org.apache.kafka.clients.admin.TopicDescription>> fmap,
@@ -335,7 +486,9 @@ public final class TopicEnsurer implements AutoCloseable {
         } catch (java.util.concurrent.TimeoutException te) {
             existsUnknown.increment();
             scheduleUnknown(t);
-            LOG.warn("Проверка Kafka-топика '{}' превысила таймаут {} мс (batch)", t, adminTimeoutMs, te);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Проверка Kafka-топика '{}' превысила таймаут {} мс (batch)", t, adminTimeoutMs, te);
+            }
         } catch (java.util.concurrent.ExecutionException ee) {
             Throwable cause = ee.getCause();
             if (cause instanceof UnknownTopicOrPartitionException) {
@@ -344,13 +497,17 @@ public final class TopicEnsurer implements AutoCloseable {
             } else {
                 existsUnknown.increment();
                 scheduleUnknown(t);
-                LOG.warn("Ошибка при проверке Kafka-топика '{}' (batch)", t, ee);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Ошибка при проверке Kafka-топика '{}' (batch)", t, ee);
+                }
             }
         }
     }
 
     /**
-     * Создаёт отсутствующие темы одним батчем createTopics и обрабатывает гонки/таймауты.
+     * Пакетно создаёт отсутствующие темы и обрабатывает результаты по каждой.
+     *
+     * @param missing имена отсутствующих тем
      */
     private void createMissingTopics(java.util.List<String> missing) {
         java.util.List<NewTopic> newTopics = new java.util.ArrayList<>(missing.size());
@@ -359,15 +516,17 @@ public final class TopicEnsurer implements AutoCloseable {
             if (!topicConfigs.isEmpty()) nt.configs(topicConfigs);
             newTopics.add(nt);
         }
-        org.apache.kafka.clients.admin.CreateTopicsResult ctr = admin.createTopics(newTopics);
-        java.util.Map<String, org.apache.kafka.common.KafkaFuture<Void>> cvals = ctr.values();
+        java.util.Map<String, org.apache.kafka.common.KafkaFuture<Void>> cvals = admin.createTopics(newTopics);
         for (String t : missing) {
             processCreateResult(cvals, t);
         }
     }
 
     /**
-     * Завершает создание одной темы: учитывает гонки/таймауты, обновляет кеш и метрики.
+     * Обрабатывает результат {@code createTopics} по одной теме: успех, гонка (TopicExists), таймаут, иные ошибки.
+     *
+     * @param cvals карта topic → future результата создания
+     * @param t     имя Kafka‑топика
      */
     private void processCreateResult(
             java.util.Map<String, org.apache.kafka.common.KafkaFuture<Void>> cvals,
@@ -402,39 +561,28 @@ public final class TopicEnsurer implements AutoCloseable {
         }
     }
 
-
-    /** Возвращает случайное long в полуинтервале [originInclusive, boundExclusive) на базе SecureRandom без смещения. */
-    private static long nextLongBetweenSecure(long originInclusive, long boundExclusive) {
-        long n = boundExclusive - originInclusive;
-        if (n <= 0) return originInclusive; // защита от некорректных диапазонов
-        long bits;
-        long val;
-        do {
-            bits = SR.nextLong() >>> 1;       // неотрицательное
-            val  = bits % n;                  // минимизируем bias через rejection sampling
-        } while (bits - val + (n - 1) < 0L);  // как в Random#nextInt
-        return originInclusive + val;
-    }
-
     /**
-     * Jitter для backoff теперь берётся из SecureRandom, так что предупреждение S2245 неактуально.
-     * Это по‑прежнему не security‑контекст, но SecureRandom здесь не на горячем пути и не влияет на TPS.
+     * Назначает короткий backoff с крипто‑джиттером для указанной темы.
+     *
+     * @param topic имя Kafka‑топика
      */
     private void scheduleUnknown(String topic) {
-        long base = unknownBackoffNs;
-        long jitter = Math.max(1L, base / 5); // ≈20% от базового
-        long delta = nextLongBetweenSecure(-jitter, jitter + 1); // [-jitter, +jitter]
-        long delay = base + delta;
-        long min = TimeUnit.MILLISECONDS.toNanos(1);
-        if (delay < min) delay = min;
+        long delay = backoff.nextDelayNanos(unknownBackoffNs);
         unknownUntil.put(topic, System.nanoTime() + delay);
     }
 
+    /**
+     * Выполняет describeTopics для одной темы и маппит результат на {@link TopicExistence}.
+     *
+     * @param topic имя Kafka‑топика
+     * @return {@code TRUE} — тема подтверждена; {@code FALSE} — брокер сообщил «не существует»;
+     *         {@code UNKNOWN} — таймаут/прерывание/иная ошибка (будет назначен backoff)
+     */
     private TopicExistence topicExists(String topic) {
         try {
-            admin.describeTopics(Collections.singleton(topic))
-                .all()
-                .get(adminTimeoutMs, TimeUnit.MILLISECONDS);
+            java.util.Map<String, org.apache.kafka.common.KafkaFuture<org.apache.kafka.clients.admin.TopicDescription>> m =
+                    admin.describeTopics(java.util.Collections.singleton(topic));
+            m.get(topic).get(adminTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
             return TopicExistence.TRUE;
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
@@ -442,7 +590,9 @@ public final class TopicEnsurer implements AutoCloseable {
             scheduleUnknown(topic);
             return TopicExistence.UNKNOWN;
         } catch (java.util.concurrent.TimeoutException te) {
-            LOG.warn("Проверка Kafka-топика '{}' превысила таймаут {} мс", topic, adminTimeoutMs, te);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Проверка Kafka-топика '{}' превысила таймаут {} мс", topic, adminTimeoutMs, te);
+            }
             scheduleUnknown(topic);
             return TopicExistence.UNKNOWN;
         } catch (java.util.concurrent.ExecutionException ee) {
@@ -451,17 +601,26 @@ public final class TopicEnsurer implements AutoCloseable {
                 existsFalse.increment();
                 return TopicExistence.FALSE;
             }
-            LOG.warn("Ошибка при проверке Kafka-топика '{}'", topic, ee);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Ошибка при проверке Kafka-топика '{}'", topic, ee);
+            }
             scheduleUnknown(topic);
             return TopicExistence.UNKNOWN;
         } catch (RuntimeException re) {
-            LOG.warn("Не удалось проверить Kafka-топик '{}' (runtime)", topic, re);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Не удалось проверить Kafka-топик '{}' (runtime)", topic, re);
+            }
             scheduleUnknown(topic);
             return TopicExistence.UNKNOWN;
         }
     }
 
-    /** Проверка имени Kafka-топика по основным правилам брокера (без RegEx для минимальных аллокаций). */
+    /**
+     * Проверка имени Kafka‑топика по основным правилам брокера (без RegEx для минимальных аллокаций).
+     *
+     * @param topic имя Kafka‑топика
+     * @return {@code true}, если имя валидно
+     */
     private static boolean isValidTopicName(String topic) {
         if (topic == null) return false;
         int len = topic.length();
@@ -474,7 +633,12 @@ public final class TopicEnsurer implements AutoCloseable {
         return true;
     }
 
-    /** Разрешённые символы имён топиков: a-z, A-Z, 0-9, '.', '_', '-'. */
+    /**
+     * Проверяет, входит ли символ в множество допустимых: {@code a-z}, {@code A-Z}, {@code 0-9}, {@code '.'}, {@code '_'}, {@code '-'}.
+     *
+     * @param c символ
+     * @return {@code true}, если символ допустим в имени топика
+     */
     private static boolean isAllowedTopicChar(char c) {
         if (c >= 'a' && c <= 'z') return true;
         if (c >= 'A' && c <= 'Z') return true;
@@ -482,7 +646,11 @@ public final class TopicEnsurer implements AutoCloseable {
         return c == '.' || c == '_' || c == '-';
     }
 
-    /** Короткая человекочитаемая сводка ключевых конфигов темы. */
+    /**
+     * Формирует краткую человекочитаемую сводку ключевых конфигов темы для логов.
+     *
+     * @return строка с основными конфигами или «без явных конфигов»
+     */
     private String summarizeTopicConfigs() {
         if (topicConfigs == null || topicConfigs.isEmpty()) return "без явных конфигов";
         StringBuilder sb = new StringBuilder(128);
@@ -504,7 +672,12 @@ public final class TopicEnsurer implements AutoCloseable {
         return sb.toString();
     }
 
-    /** Считает количество ненулевых значений среди переданных. */
+    /**
+     * Считает количество ненулевых значений среди аргументов.
+     *
+     * @param vals значения
+     * @return число ненулевых элементов
+     */
     private static int countNonNull(Object... vals) {
         int n = 0;
         if (vals != null) {
@@ -513,7 +686,15 @@ public final class TopicEnsurer implements AutoCloseable {
         return n;
     }
 
-    /** Добавляет пару key=value в summary, учитывая разделитель и флаг first. Возвращает новый флаг first. */
+    /**
+     * Добавляет пару {@code key=value} в summary с учётом разделителя.
+     *
+     * @param sb    буфер
+     * @param key   ключ конфига
+     * @param value значение конфига; если {@code null}, ничего не добавляется
+     * @param first признак «первого элемента» (без разделителя)
+     * @return новый признак «первого элемента» (всегда {@code false}, если была добавлена пара)
+     */
     private static boolean appendConfig(StringBuilder sb, String key, String value, boolean first) {
         if (value == null) return first;
         if (!first) sb.append(", ");
@@ -521,6 +702,17 @@ public final class TopicEnsurer implements AutoCloseable {
         return false;
     }
 
+    /**
+     * Создаёт одну тему и логирует факт/применённые конфиги.
+     *
+     * <p>Бросает {@link InterruptedException}, {@link java.util.concurrent.ExecutionException},
+     * {@link java.util.concurrent.TimeoutException}; вызывающая сторона отвечает за перевод в метрики/лог.</p>
+     *
+     * @param topic имя Kafka‑топика
+     * @throws InterruptedException если поток прерван
+     * @throws java.util.concurrent.ExecutionException ошибка выполнения на стороне брокера
+     * @throws java.util.concurrent.TimeoutException по истечении {@code adminTimeoutMs}
+     */
     private void createTopic(String topic)
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
         NewTopic nt = new NewTopic(topic, topicPartitions, topicReplication);
@@ -530,18 +722,63 @@ public final class TopicEnsurer implements AutoCloseable {
                 LOG.debug("Применяю конфиги для Kafka-топика '{}': {}", topic, topicConfigs);
             }
         }
-        admin.createTopics(Collections.singleton(nt))
-                .all()
-                .get(adminTimeoutMs, TimeUnit.MILLISECONDS);
+        admin.createTopic(nt, adminTimeoutMs);
         LOG.info("Создал Kafka-топик '{}': partitions={}, replication={}", topic, topicPartitions, topicReplication);
         if (LOG.isDebugEnabled()) {
             LOG.debug("Конфиги Kafka-топика '{}': {}", topic, summarizeTopicConfigs());
         }
     }
 
+    /** Политика backoff с крипто-джиттером без смещения; без аллокаций на вызов. */
+    private static final class BackoffPolicy {
+        private static final SecureRandom SR = new SecureRandom();
+        private final long minNanos;
+        private final int jitterPercent; // 0..100
+
+        /**
+         * @param minNanos минимальная задержка в наносекундах
+         * @param jitterPercent доля джиттера в процентах (0..100)
+         */
+        BackoffPolicy(long minNanos, int jitterPercent) {
+            this.minNanos = minNanos;
+            this.jitterPercent = jitterPercent;
+        }
+
+        /**
+         * Возвращает задержку вокруг baseNanos с равномерным джиттером ±jitterPercent.
+         * Минимум ограничен minNanos.
+         */
+        long nextDelayNanos(long baseNanos) {
+            long jitter = Math.max(1L, (baseNanos * jitterPercent) / 100L);
+            long delta = nextLongBetweenSecure(-jitter, jitter + 1);
+            long d = baseNanos + delta;
+            return (d < minNanos) ? minNanos : d;
+        }
+
+        /**
+         * Генерирует псевдослучайное целое из полуинтервала [{@code originInclusive}; {@code boundExclusive}).
+         *
+         * @param originInclusive нижняя граница (включительно)
+         * @param boundExclusive  верхняя граница (исключительно)
+         * @return случайное значение из заданного диапазона; при некорректном диапазоне возвращает {@code originInclusive}
+         */
+        private static long nextLongBetweenSecure(long originInclusive, long boundExclusive) {
+            long n = boundExclusive - originInclusive;
+            if (n <= 0) return originInclusive;
+            long bits;
+            long val;
+            do {
+                bits = SR.nextLong() >>> 1;
+                val  = bits % n;
+            } while (bits - val + (n - 1) < 0L);
+            return originInclusive + val;
+        }
+    }
+
     /**
-     * Снимок счётчиков (для диагностики/метрик).
-     * Возвращает немодифицируемую Map<metricName, value>.
+     * Возвращает неизменяемый снимок внутренних счётчиков.
+     *
+     * @return карта «имя метрики → значение»
      */
     public Map<String, Long> getMetrics() {
         java.util.Map<String, Long> m = new java.util.LinkedHashMap<>(13);
@@ -557,6 +794,7 @@ public final class TopicEnsurer implements AutoCloseable {
         return java.util.Collections.unmodifiableMap(m);
     }
 
+    /** Закрывает AdminClient через обёртку TopicAdmin с таймаутом adminTimeoutMs. Безопасен к повторным вызовам. */
     @Override public void close() {
         try {
             if (admin != null) {

@@ -1,59 +1,83 @@
-# --- Подготовка таблицы (включаем репликацию для CF '0') ---
+# HBase 1.4.13 / Shell
+# Внимание: кластерный ключ формата "zk1,zk2,zk3:2181:/hbase" —
+# hostы перечисляются через запятую, порт и znode‑parent задаются один раз в конце.
+# --- Подготовка таблиц (включаем репликацию нужных CF) ---
+# Пример: HISTORY — включаем репликацию CF 'd'
 disable 'TBL_JTI_TRACE_CIS_HISTORY'
-alter  'TBL_JTI_TRACE_CIS_HISTORY', { NAME => '0', REPLICATION_SCOPE => 1 }
+alter  'TBL_JTI_TRACE_CIS_HISTORY', { NAME => 'd', REPLICATION_SCOPE => 1 }
 enable 'TBL_JTI_TRACE_CIS_HISTORY'
+
+# Пример: таблица RECEIPT, хотим 'b' и 'd'
+# disable 'RECEIPT'
+# alter  'RECEIPT', { NAME => 'b', REPLICATION_SCOPE => 1 }
+# alter  'RECEIPT', { NAME => 'd', REPLICATION_SCOPE => 1 }
+# enable 'RECEIPT'
+
+# Пример: DOCUMENTS с CF '0' и 'DOCUMENTS'
+# disable 'DOCUMENTS'
+# alter  'DOCUMENTS', { NAME => '0',          REPLICATION_SCOPE => 1 }
+# alter  'DOCUMENTS', { NAME => 'DOCUMENTS',  REPLICATION_SCOPE => 1 }
+# enable 'DOCUMENTS'
 
 # --- Добавление peer со сбалансированным профилем ---
 #  acks=all, idempotence=true, max.in.flight=3 — компромисс скорость/надёжность.
 #  Чуть больший linger и batch.size для лучшей утилизации сети/CPU.
 add_peer 'h2k_balanced',
-  "10.254.3.111,10.254.3.112,10.254.3.113:2181:/hbase",
   {
-    'replication_endpoint_impl' => 'kz.qazmarka.h2k.endpoint.KafkaReplicationEndpoint',
-    'configuration' => {
-      # Обязательные базовые ключи
-      'h2k.kafka.bootstrap.servers'   => '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
-      # client.id не задаём — KafkaReplicationEndpoint сгенерирует уникальный per-host (hostname/UUID) при старте
-      'h2k.topic.pattern'             => '${table}',   # ${table}|${namespace}|${qualifier}
-      'h2k.cf'                        => '0',
-      'h2k.salted'                    => 'false',
-      'h2k.salt.bytes'                => '1',
+    'ENDPOINT_CLASSNAME' => 'kz.qazmarka.h2k.endpoint.KafkaReplicationEndpoint',
+    'CONFIG' => {
+      # БАЗА: ключи читаются в Endpoint; peer-параметры перекрывают hbase-site.xml
+      'h2k.kafka.bootstrap.servers'         => '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
+      # client.id не задаём — Endpoint сам сгенерирует уникальный id per-host (hostname/UUID)
+      'h2k.topic.pattern'                   => '${table}',              # ${table}|${namespace}|${qualifier}
+      'h2k.cf.list'                         => 'd',                     # можно CSV: 'b,d'
 
-      # Режим декодирования
-      'h2k.decode.mode'               => 'json-phoenix',          # 'simple' или 'json-phoenix'
-      'h2k.schema.path'               => '/etc/h2k/schema.json',
-      'h2k.json.serialize.nulls'      => 'false',
+      # Декодирование
+      'h2k.decode.mode'                     => 'json-phoenix',          # 'simple' | 'json-phoenix'
+      'h2k.schema.path'                     => '/opt/hbase-default-current/conf/schema.json',
+      'h2k.json.serialize.nulls'            => 'false',
 
-      # Параметры ожидания подтверждений (регулируйте под SLA)
-      'h2k.producer.await.every'      => '1000',       # ждать ack каждые N сообщений
-      'h2k.producer.await.timeout.ms' => '300000',
-      # Диагностика BatchSender (читается при старте; на горячий путь не влияет)
-      'h2k.producer.batch.counters.enabled'   => 'false',
-      'h2k.producer.batch.debug.on.failure'   => 'false',
+      # RowKey/соль/подсказки ёмкости (для DEFAULT namespace имя без префикса)
+      'h2k.rowkey.encoding'                 => 'BASE64',
+      'h2k.salt.map'                        => 'TBL_JTI_TRACE_CIS_HISTORY=1',
+      'h2k.capacity.hints'                  => 'TBL_JTI_TRACE_CIS_HISTORY=32',
 
-      # --- Сбалансированный профиль Kafka Producer ---
-      'h2k.producer.enable.idempotence'           => 'true',
-      'h2k.producer.acks'                         => 'all',
-      'h2k.producer.max.in.flight'                => '3',        # 2..5 допустимо; >1 может нарушать порядок при ретраях
-      'h2k.producer.retries'                      => '2147483647',
-      'h2k.producer.delivery.timeout.ms'          => '300000',
+      # Ожидание подтверждений внутри BatchSender
+      'h2k.producer.await.every'            => '500',
+      'h2k.producer.await.timeout.ms'       => '300000',
+      # Диагностика BatchSender (читается при старте)
+      'h2k.producer.batch.counters.enabled' => 'false',
+      'h2k.producer.batch.debug.on.failure' => 'false',
 
-      # Батчинг/сжатие: выше throughput, умеренная задержка
-      'h2k.producer.linger.ms'                    => '100',      # 50..200
-      'h2k.producer.batch.size'                   => '131072',   # 128 KiB
-      'h2k.producer.compression.type'             => 'lz4'       # или 'snappy' если CPU ограничен
+      # --- Профиль BALANCED: компромисс скорость/надёжность ---
+      'h2k.producer.enable.idempotence'     => 'true',
+      'h2k.producer.acks'                   => 'all',
+      'h2k.producer.max.in.flight'          => '3',          # 2..5 допустимо; >1 может нарушать порядок при ретраях
+      'h2k.producer.retries'                => '2147483647',
+      'h2k.producer.request.timeout.ms'     => '60000',
+      'h2k.producer.delivery.timeout.ms'    => '300000',
 
-      # Любые нативные ключи Kafka можно добавить через префикс h2k.producer.*
-      # Например:
-      # 'h2k.producer.request.timeout.ms'         => '60000',
-      # 'h2k.producer.buffer.memory'              => '134217728'
+      # Батчинг/сжатие
+      'h2k.producer.linger.ms'              => '100',
+      'h2k.producer.batch.size'             => '131072',
+      'h2k.producer.compression.type'       => 'lz4',
+
+      # Буферы/размеры (выравниваем с fast-профилем по умолчанию)
+      'h2k.producer.buffer.memory'          => '268435456',
+      'h2k.producer.max.request.size'       => '2097152',
+
+      # TopicEnsurer (самодостаточность пира)
+      'h2k.ensure.topics'                   => 'true',
+      'h2k.topic.partitions'                => '12',
+      'h2k.topic.replication'               => '3',
+      'h2k.admin.timeout.ms'                => '30000',
+      'h2k.ensure.unknown.backoff.ms'       => '5000'
     }
   }
 
 # --- Проверка/отладка ---
 list_peers
-show_peer_config 'h2k_balanced'
-status 'replication'
+show_peer_tableCFs 'h2k_balanced'  # опционально: покажет фильтр таблиц/CF, если задан через set_peer_tableCFs
 # remove_peer 'h2k_balanced'  # для удаления при необходимости
 
 # --- Быстрые подсказки по тюнингу (balanced) ---
@@ -71,7 +95,7 @@ status 'replication'
 #  - Увеличьте частоту ожиданий ACK: уменьшите 'h2k.producer.await.every' (например, до 500), чтобы разгружать пул фьючерсов.
 #
 # Слишком большие сообщения:
-#  - Увеличьте 'h2k.producer.max.request.size' (например, 10485760 = 10 MiB) и на брокерах 'message.max.bytes'/'replica.fetch.max.bytes'.
+#  - Увеличьте 'h2k.producer.max.request.size' (например, 10485760 = 10 МиB) и на брокерах 'message.max.bytes'/'replica.fetch.max.bytes'.
 #  - При необходимости используйте более агрессивное сжатие (lz4) или уменьшайте размер отдельных колонок в источнике.
 #
 # Порядок доставки:
@@ -79,3 +103,9 @@ status 'replication'
 #
 # Наблюдаемость:
 #  - Включите DEBUG для 'kz.qazmarka.h2k.endpoint' при первичном пуске.
+#
+#  - Подсказки ёмкости и соль таблиц можно задавать в peer ИЛИ в hbase-site.xml.
+#    Приоритет: значение из peer перекрывает hbase-site.xml.
+#      Примеры (default-namespace без префикса):
+#        h2k.capacity.hints = TBL_JTI_TRACE_CIS_HISTORY=32
+#        h2k.salt.map       = TBL_JTI_TRACE_CIS_HISTORY=1

@@ -1,25 +1,73 @@
+<!--
+  H2K Endpoint: Репликация HBase 1.4.13 -> Kafka 2.3.1
+
+  Назначение этого pom.xml:
+   • собрать ТОНКИЙ (thin) JAR для запуска внутри RegionServer (все тяжёлые библиотеки — provided);
+   • жёстко зафиксировать версии транзитивных зависимостей под стек HBase 1.4.13, чтобы избежать конфликтов в IDE/сборке;
+   • обеспечить сборку строго на JDK 8 и Maven >= 3.6;
+   • предоставить профиль dev для локального запуска с простым логгером.
+
+  Совместимость (проверено):
+   • Hadoop 2.7.x, HBase 1.4.13, Phoenix 4.14.2-HBase-1.4, Kafka clients 2.3.1, JDK 1.8.
+
+  Важно:
+   • dependencyManagement используется только для «якорения» версий транзитивных зависимостей, JAR их НЕ тянет внутрь;
+   • exclusions у phoenix-core и hbase-server гарантируют отсутствие дублей библиотек на runtime.
+-->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
   <groupId>kz.qazmarka</groupId>
   <artifactId>h2k-endpoint</artifactId>
-  <version>0.1.0</version>
+  <version>0.0.1</version>
   <name>HBase 1.4.13 -> Kafka 2.3.1 ReplicationEndpoint</name>
 
   <properties>
-    <!-- Согласовано с Phoenix 4.14 / HBase 1.4 -->
+    <!-- Версии ядра стека Hadoop/HBase/Phoenix/Kafka (согласованы между собой) -->
+    <!-- Версия Hadoop (рантайм — из кластера) -->
     <hadoop.version>2.7.4</hadoop.version>
+    <!-- Версия HBase (RegionServer окружение) -->
     <hbase.version>1.4.13</hbase.version>
+    <!-- Версия Phoenix, собранная под HBase 1.4 -->
     <phoenix.version>4.14.2-HBase-1.4</phoenix.version>
+    <!-- Версия Kafka клиента (совместима с JDK 8) -->
     <kafka.version>2.3.1</kafka.version>
+
+    <!-- Логирование через SLF4J API; бэкенд выбирается окружением (log4j2/logback/slf4j-simple в dev) -->
     <slf4j.version>1.7.36</slf4j.version>
-    <!-- Версия lz4-java, требуется в runtime для compression.type=lz4 -->
+
+    <!-- lz4-java нужна только если на брокере включён compression.type=lz4; помечаем provided -->
     <lz4.version>1.6.0</lz4.version>
+
+    <!-- Кодировка компиляции -->
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
   </properties>
+
+  <!--
+    dependencyManagement: «якоря» версий для транзитивных библиотек HBase/ Hadoop/ Phoenix.
+    Задача — снять предупреждения о конфликтующих версиях и обеспечить детерминированное разрешение зависимостей на compile.
+    ВАЖНО: эти артефакты НЕ попадут в наш JAR (мы не ссылаемся на них напрямую либо используем scope=provided).
+  -->
   <dependencyManagement>
     <dependencies>
+      <!-- Базовые артефакты, которые мы используем напрямую и хотим централизованно версионировать -->
+      <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+        <version>${slf4j.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.google.code.gson</groupId>
+        <artifactId>gson</artifactId>
+        <version>2.10.1</version>
+      </dependency>
+      <dependency>
+        <groupId>org.lz4</groupId>
+        <artifactId>lz4-java</artifactId>
+        <version>${lz4.version}</version>
+      </dependency>
+      <!-- Ниже — «якоря» версий транзитивных зависимостей под HBase 1.4.13 (анти-шум для IDE) -->
       <dependency>
         <groupId>com.google.guava</groupId>
         <artifactId>guava</artifactId>
@@ -36,6 +84,17 @@
         <version>1.9</version>
       </dependency>
       <dependency>
+        <groupId>commons-collections</groupId>
+        <artifactId>commons-collections</artifactId>
+        <version>3.2.2</version>
+      </dependency>
+      <dependency>
+        <groupId>commons-lang</groupId>
+        <artifactId>commons-lang</artifactId>
+        <version>2.6</version>
+      </dependency>
+      <!-- Старый Jackson 1.x, который тянут HBase/Hadoop. Фиксируем последнюю 1.9.13 для единообразия. -->
+      <dependency>
         <groupId>org.codehaus.jackson</groupId>
         <artifactId>jackson-core-asl</artifactId>
         <version>1.9.13</version>
@@ -45,6 +104,7 @@
         <artifactId>jackson-mapper-asl</artifactId>
         <version>1.9.13</version>
       </dependency>
+      <!-- HttpClient/HttpCore — версии, с которыми собран HBase 1.4.x -->
       <dependency>
         <groupId>org.apache.httpcomponents</groupId>
         <artifactId>httpclient</artifactId>
@@ -55,70 +115,41 @@
         <artifactId>httpcore</artifactId>
         <version>4.4.4</version>
       </dependency>
+      <!-- Zookeeper и Netty — частые источники конфликтов; фиксируем версии из дистрибутива HBase 1.4.x -->
       <dependency>
         <groupId>org.apache.zookeeper</groupId>
         <artifactId>zookeeper</artifactId>
         <version>3.4.10</version>
       </dependency>
       <dependency>
-        <groupId>io.dropwizard.metrics</groupId>
-        <artifactId>metrics-core</artifactId>
-        <version>3.1.2</version>
+        <groupId>io.netty</groupId>
+        <artifactId>netty-all</artifactId>
+        <version>4.1.8.Final</version>
       </dependency>
-      <dependency>
-        <groupId>org.slf4j</groupId>
-        <artifactId>slf4j-api</artifactId>
-        <version>${slf4j.version}</version>
-      </dependency>
-      <dependency>
-        <groupId>com.google.code.gson</groupId>
-        <artifactId>gson</artifactId>
-        <version>2.10.1</version>
-      </dependency>
-      <dependency>
-        <groupId>commons-lang</groupId>
-        <artifactId>commons-lang</artifactId>
-        <version>2.6</version>
-      </dependency>
-      <dependency>
-        <groupId>commons-collections</groupId>
-        <artifactId>commons-collections</artifactId>
-        <version>3.2.2</version>
-      </dependency>
+      <!-- snappy-java: фиксируем «безопасную» версию, чтобы дерево зависимостей было стабильным -->
       <dependency>
         <groupId>org.xerial.snappy</groupId>
         <artifactId>snappy-java</artifactId>
-        <version>1.0.5</version>
+        <version>1.1.7.3</version>
       </dependency>
-      <!-- LZ4: быстрый алгоритм компрессии; нужен на рантайме для Kafka compression.type=lz4 -->
-      <dependency>
-        <groupId>org.lz4</groupId>
-        <artifactId>lz4-java</artifactId>
-        <version>${lz4.version}</version>
-      </dependency>
-      <dependency>
-        <groupId>io.netty</groupId>
-        <artifactId>netty-all</artifactId>
-        <version>4.0.23.Final</version>
-      </dependency>
+      <!-- jsr305: аннотации, разные версии часто конфликтуют в IDE; выравниваем -->
       <dependency>
         <groupId>com.google.code.findbugs</groupId>
         <artifactId>jsr305</artifactId>
-        <version>2.0.1</version>
-      </dependency>
-      <dependency>
-        <groupId>log4j</groupId>
-        <artifactId>log4j</artifactId>
-        <version>1.2.17</version>
+        <version>3.0.0</version>
       </dependency>
     </dependencies>
   </dependencyManagement>
 
-  <!-- Профиль для локального запуска: только простой логгер, без притягивания Phoenix в compile -->
+  <!--
+    Профиль dev: удобный локальный запуск без внешнего конфигурирования логгера.
+    В рантайме RS этот профиль НЕ используется.
+  -->
   <profiles>
     <profile>
       <id>dev</id>
       <dependencies>
+        <!-- Простой консольный логгер для локала; в проде используем log4j2/logback из окружения -->
         <dependency>
           <groupId>org.slf4j</groupId>
           <artifactId>slf4j-simple</artifactId>
@@ -129,13 +160,18 @@
     </profile>
   </profiles>
 
+  <!--
+    Основные зависимости модуля. Практически все — scope=provided, т.к. исполняться будем внутри RegionServer,
+    где эти библиотеки уже присутствуют в $HBASE_HOME/lib. Это позволяет выпускать ТОНКИЙ JAR.
+  -->
   <dependencies>
-    <!-- Всё тяжёлое — provided: на кластере эти банки уже есть в $HBASE_HOME/lib -->
+    <!-- HBase Server API (compile-контракты ReplicationEndpoint). provided: в рантайме библиотека уже есть на RS. -->
     <dependency>
       <groupId>org.apache.hbase</groupId>
       <artifactId>hbase-server</artifactId>
       <version>${hbase.version}</version>
       <scope>provided</scope>
+      <!-- Исключаем старые логгеры (log4j1 и привязку slf4j-log4j12), чтобы не перетёрли конфигурацию логирования на кластере -->
       <exclusions>
         <exclusion>
           <groupId>org.slf4j</groupId>
@@ -147,12 +183,14 @@
         </exclusion>
       </exclusions>
     </dependency>
+    <!-- HBase Client: типы TableName/Cell и т.д. -->
     <dependency>
       <groupId>org.apache.hbase</groupId>
       <artifactId>hbase-client</artifactId>
       <version>${hbase.version}</version>
       <scope>provided</scope>
     </dependency>
+    <!-- Hadoop базовые libs (классы конфигурации/безопасности). provided: берём из окружения кластера. -->
     <dependency>
       <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-common</artifactId>
@@ -166,11 +204,13 @@
       <scope>provided</scope>
     </dependency>
 
+    <!-- Phoenix (клиентская часть для декодирования типов). provided: уже есть на RS. -->
     <dependency>
       <groupId>org.apache.phoenix</groupId>
       <artifactId>phoenix-core</artifactId>
       <version>${phoenix.version}</version>
       <scope>provided</scope>
+      <!-- Массовые exclusions: избегаем дубликатов HBase/Hadoop/Netty/ZK/Jackson и прочего, т.к. эти банки уже будут на RS -->
       <exclusions>
         <exclusion><groupId>org.apache.hbase</groupId><artifactId>hbase-annotations</artifactId></exclusion>
         <exclusion><groupId>org.apache.hbase</groupId><artifactId>hbase-common</artifactId></exclusion>
@@ -204,37 +244,54 @@
       </exclusions>
     </dependency>
 
-    <!-- Kafka-клиент, LZ4 и Gson: тоже provided, чтобы JAR был тонким.
-         ВАЖНО: на рантайме на всех RS должны лежать:
-           - kafka-clients-${kafka.version}.jar
-           - lz4-java-${lz4.version}.jar (для compression.type=lz4)
-           - gson (совместимая версия; желательно ≥ 2.8)
-         Обычно их кладут в $HBASE_HOME/lib. -->
+    <!-- Kafka Producer API. provided: jar клиента ставится на все RS (совместим с брокерами 2.3.x+). -->
     <dependency>
       <groupId>org.apache.kafka</groupId>
       <artifactId>kafka-clients</artifactId>
       <version>${kafka.version}</version>
       <scope>provided</scope>
     </dependency>
-    <!-- Явно фиксируем наличие LZ4 на compile-time, но не тащим в JAR -->
+    <!-- LZ4 кодек: нужен только если включён compression.type=lz4 на Kafka. provided: кладётся на RS. -->
     <dependency>
       <groupId>org.lz4</groupId>
       <artifactId>lz4-java</artifactId>
       <scope>provided</scope>
     </dependency>
+    <!-- Gson для сборки JSON-пейлоада. provided: чтобы не тащить внутрь JAR. -->
     <dependency>
       <groupId>com.google.code.gson</groupId>
       <artifactId>gson</artifactId>
       <scope>provided</scope>
     </dependency>
 
+    <!-- SLF4J API: поставляется окружением (logback/log4j2). -->
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
       <scope>provided</scope>
     </dependency>
+    <!-- JUnit 5 для юнит-тестов (engine + api). На прод JAR не влияет. -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-api</artifactId>
+      <version>5.10.2</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-engine</artifactId>
+      <version>5.10.2</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-params</artifactId>
+      <version>5.10.2</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
+  <!-- Конфигурация сборочных плагинов: контроль JDK/Maven, компиляция под 1.8, MANIFEST и запуск тестов JUnit 5. -->
   <build>
     <plugins>
       <!-- Жёстко запрещаем сборку не на JDK 8; проверяем версию Maven. -->
@@ -247,15 +304,27 @@
             <id>enforce-java-maven</id>
             <goals><goal>enforce</goal></goals>
             <configuration>
+              <!-- Жёсткие правила окружения сборки -->
               <rules>
+                <!-- Запрещаем сборку не на JDK 8 -->
                 <requireJavaVersion>
                   <version>[1.8,1.9)</version>
                   <message>Сборка должна выполняться на JDK 8 (HBase 1.4.x / Hadoop 2.x / Phoenix 4.14 этого требуют).</message>
                 </requireJavaVersion>
+                <!-- Требуем Maven >= 3.6 -->
                 <requireMavenVersion>
                   <version>[3.6.0,)</version>
                 </requireMavenVersion>
-                <!-- ВНИМАНИЕ: dependencyConvergence намеренно убран для тонкого JAR -->
+                <!-- Баним конфликтные логгер-биндинги -->
+                <bannedDependencies>
+                  <!-- Блокируем ТОЛЬКО прямые зависимости (а не транзитивные из HBase/Hadoop/Phoenix с scope=provided) -->
+                  <searchTransitive>false</searchTransitive>
+                  <excludes>
+                    <exclude>log4j:log4j</exclude>
+                    <exclude>org.slf4j:slf4j-log4j12</exclude>
+                  </excludes>
+                </bannedDependencies>
+                <!-- Не включаем dependencyConvergence сознательно: нам нужен тонкий JAR без жёсткой унификации всего дерева. -->
               </rules>
               <fail>true</fail>
             </configuration>
@@ -263,7 +332,7 @@
         </executions>
       </plugin>
 
-      <!-- Компилируем строго под Java 8 -->
+      <!-- Компилятор Java: строго целимся в bytecode 1.8, включаем полезные предупреждения -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
@@ -279,7 +348,7 @@
         </configuration>
       </plugin>
 
-      <!-- (Опционально) аккуратный MANIFEST с версией сборки -->
+      <!-- JAR-плагин: добавляем базовые записи в MANIFEST для отладки версий -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-jar-plugin</artifactId>
@@ -291,6 +360,16 @@
               <addDefaultSpecificationEntries>true</addDefaultSpecificationEntries>
             </manifest>
           </archive>
+        </configuration>
+      </plugin>
+      <!-- Surefire: JUnit 5, корректный запуск на Java 8 -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+        <configuration>
+          <!-- Для Java 8 отключаем module path, иначе древние либы могут интерпретироваться как модули -->
+          <useModulePath>false</useModulePath>
         </configuration>
       </plugin>
     </plugins>
