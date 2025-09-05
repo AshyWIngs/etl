@@ -16,25 +16,16 @@
    ```
 2) **Подготовьте схему Phoenix** (если используете `json-phoenix`), файл:
    `/opt/hbase-default-current/conf/schema.json` (см. раздел «Схема Phoenix»).
-3) **Включите репликацию CF** в нужных таблицах (пример для `TBL_JTI_TRACE_CIS_HISTORY`, CF `d`):
-   Также убедитесь, что в глобальном `hbase-site.xml` включена репликация кластера:
+3) **Включите репликацию CF** в нужных таблицах (см. раздел «Включение репликации нужных CF» ниже). Также убедитесь, что в глобальном `hbase-site.xml` включена репликация кластера:
    ```
    <property><name>hbase.replication</name><value>true</value></property>
    ```
-
-   ```
-   # HBase shell
-   disable 'TBL_JTI_TRACE_CIS_HISTORY'
-   alter  'TBL_JTI_TRACE_CIS_HISTORY', { NAME => 'd', REPLICATION_SCOPE => 1 }
-   enable 'TBL_JTI_TRACE_CIS_HISTORY'
-   ```
-4) **Создайте peer** (выберите профиль ниже: `FAST` / `BALANCED` / `RELIABLE`). Минимальный набор ключей:
-   - `h2k.kafka.bootstrap.servers`
-   - `h2k.cf.list` (например, `d`)
-   - `h2k.decode.mode=json-phoenix`
-   - `h2k.schema.path=/opt/hbase-default-current/conf/schema.json`
-   - `h2k.salt.map=TBL_JTI_TRACE_CIS_HISTORY=1`
-   - `h2k.capacity.hints=TBL_JTI_TRACE_CIS_HISTORY=32`
+4) **Создайте peer** готовым скриптом (HBase 1.4.13), выберите профиль:
+   - `conf/add_peer_shell_fast.txt` — FAST (макс. скорость)
+   - `conf/add_peer_shell_balanced.txt` — BALANCED (компромисс)
+   - `conf/add_peer_shell_reliable.txt` — RELIABLE (надёжность)
+   Запуск: `bin/hbase shell conf/add_peer_shell_fast.txt`  
+   Подробности: см. раздел «Профили peer (готовые скрипты)».
 5) **Проверьте доставку**: сообщения появляются в Kafka‑топике `${table}`.
 
 ## Поддерживаемые версии
@@ -102,7 +93,7 @@ mvn -q test -Dtest=Value*Test    # выборочно
 ## Ключи `h2k.*`
 
 
-### TL;DR: минимально достаточно для запуска
+### Кратко: минимально достаточный набор для запуска
 
 Если вы реплицируете `TBL_JTI_TRACE_CIS_HISTORY` (CF `d`) в режиме Phoenix‑декодера:
 ```properties
@@ -128,64 +119,6 @@ h2k.topic.pattern=${table}
 | `h2k.salt.map` | **PayloadBuilder / Decoder** | Длина префикса соли для «salted» таблиц (у Phoenix всегда `1`) |
 | `h2k.capacity.hints` | **PayloadBuilder** | Подсказка ёмкости корневого JSON‑объекта (избегаем расширений) |
 
-### Обязательные
-
-- `h2k.kafka.bootstrap.servers` — брокеры Kafka, напр.:  
-  `10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092`
-- `h2k.cf.list` — список CF для экспорта (например: `d`, `b`, `0`; несколько через запятую).
-- `h2k.salt.map` — карта «таблица → длина префикса соли в байтах». Для Phoenix‑salted таблиц (`SALT_BUCKETS>0`) значение **всегда `1`**. Пример: `TBL_JTI_TRACE_CIS_HISTORY=1`. Обязательно указывать для всех salted‑таблиц, чтобы корректно работать с rowkey.
-- `h2k.capacity.hints` — карта «таблица → ожидаемое число ключей в корневом JSON». Помогает заранее выделить ёмкость `LinkedHashMap` и избежать расширений. Пример: `TBL_JTI_TRACE_CIS_HISTORY=32`. В продакшене настоятельно рекомендуем указывать.
-- Для режима json-phoenix дополнительно обязательны: h2k.decode.mode=json-phoenix и h2k.schema.path=/opt/hbase-default-current/conf/schema.json.
-
-### Поведение Endpoint/Decoder
-
-- `h2k.topic.pattern` — шаблон топика; по умолчанию `${table}`.  
-  Плейсхолдеры: `${table}` (=`namespace_qualifier`), `${namespace}`, `${qualifier}`.
-- `h2k.cf.list` — какие ColumnFamily экспортировать: список через запятую, напр.: `d,b,0`.  
-  Для CF в `DEFAULT`‑неймспейсе просто имя CF; для других таблиц CF указываются так же, как в `describe`.
-- `h2k.decode.mode` — `simple` или `json-phoenix`.
-- `h2k.schema.path` — путь к `schema.json` (обязателен при `json-phoenix`).
-- `h2k.json.serialize.nulls` — сериализовать `null` в JSON (по умолчанию `false`).
-- `h2k.include.meta` — включать служебные поля `_table/_namespace/_qualifier/_cf/_cells_total/_cells_cf/event_version/delete` (по умолчанию `false`).
-- `h2k.include.meta.wal` — включать `_wal_seq/_wal_write_time` (по умолчанию `false`).
-- `h2k.include.rowkey` — включать rowkey в JSON (по умолчанию `false`).
-- `h2k.rowkey.encoding` — формат rowkey при включении `include.rowkey`: `BASE64` (по умолчанию) или `HEX`.
-- `h2k.filter.by.wal.ts` — включить фильтрацию по минимальному WAL‑timestamp (по умолчанию `false`).
-- `h2k.wal.min.ts` — минимальный `timestamp` (epoch ms), учитывается при `filter.by.wal.ts=true`.
-- `h2k.salt.map` — карта «таблица → длина префикса соли в байтах». Для Phoenix‑salted таблиц значение всегда `1`. Пример: `TBL_JTI_TRACE_CIS_HISTORY=1,AGG.INC_DOCS_ACT=1`.
-- `h2k.capacity.hints` — карта «таблица → подсказка ёмкости корневого JSON‑объекта». Пример: `TBL_JTI_TRACE_CIS_HISTORY=32`.
-
-### Параметры дозированного ожидания ACK (BatchSender)
-
-- `h2k.producer.await.every` — ждать подтверждения каждые **N** отправок (по умолчанию `500`).
-- `h2k.producer.await.timeout.ms` — общий таймаут ожидания всех futures, мс (по умолчанию `180000`).
-- `h2k.producer.batch.counters.enabled` — лёгкие счётчики для диагностики (по умолчанию `false`).
-- `h2k.producer.batch.debug.on.failure` — подробности авто‑сброса в DEBUG (по умолчанию `false`).
-
-### Kafka Producer (pass‑through)
-
-Любые ключи с префиксом `h2k.producer.*` прокидываются в `KafkaProducer` как нативные. Важные:
-
-- `h2k.producer.acks` — `0` / `1` / `all`
-- `h2k.producer.enable.idempotence` — `true` / `false`
-- `h2k.producer.max.in.flight` — `1` для строгого порядка; `2..5` быстрее
-- `h2k.producer.linger.ms`, `h2k.producer.batch.size`
-- `h2k.producer.compression.type` — **рекомендуем `lz4`**
-- `h2k.producer.delivery.timeout.ms`, `retries`, `request.timeout.ms`, `buffer.memory`, `client.id`, ...
-
-Остальные ключи `h2k.producer.*` прокидываются в `KafkaProducer` без переименования.
-
-> **Про `client.id`:** **не задавайте фиксированное значение**. Endpoint сам сформирует уникальный `client.id` на каждой ноде (по `hostname`, фолбэк — `UUID`), чтобы исключить конфликты и упростить метрики. Если всё‑таки задаёте вручную — обеспечьте уникальность на ноду.
-
-### Автосоздание топиков (опционально)
-
-- `h2k.ensure.topics` — включить проверку/создание тем при старте (по умолчанию `true`).
-- `h2k.topic.partitions` / `h2k.topic.replication` — параметры при создании темы.
-- `h2k.topic.config.*` — pass‑through‑свойства темы (`retention.ms`, `cleanup.policy`, ...).
-- `h2k.admin.timeout.ms` — таймаут операций AdminClient (по умолчанию `30000`).
-- `h2k.ensure.unknown.backoff.ms` — короткий backoff на не‑фатальные ошибки (по умолчанию `5000`).
-
----
 
 ## Таблица ключей (сводно)
 
@@ -252,7 +185,7 @@ h2k.topic.pattern=${table}
 - если `h2k.include.meta.wal=true` → `+2` ключа: `_wal_seq,_wal_write_time`;
 - если `h2k.include.rowkey=true` → `+1` ключ: `rowkey` (`hex` или `base64`).
 
-**Пример (ваш прод):**  
+**Пример:**  
 Таблица `TBL_JTI_TRACE_CIS_HISTORY` имеет 32 логических поля.  
 При текущих настройках (`h2k.include.meta=false`, `h2k.include.meta.wal=false`, `h2k.include.rowkey=false`) разумный hint — **`32`**.  
 Если позже включите базовые мета‑поля и rowkey, станет `32 + 8 + 1 = 41`. Для запаса можно округлять вверх до ближайшей «красивой» величины (например, 44).
@@ -297,119 +230,40 @@ alter  'DOCUMENTS', { NAME => 'DOCUMENTS', REPLICATION_SCOPE => 1 }
 enable 'DOCUMENTS'
 ```
 
-## Профили peer (готовые команды)
+## Профили peer (готовые скрипты)
 
-Подставьте ваши ZK/пути.  
-**ZK:** `10.254.3.111,10.254.3.112,10.254.3.113:2181:/hbase`  
-**Kafka:** `10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092`
+Скрипты для создания peer находятся в каталоге `conf/`:
+- FAST — `conf/add_peer_shell_fast.txt` (максимальная скорость)
+- BALANCED — `conf/add_peer_shell_balanced.txt` (компромисс)
+- RELIABLE — `conf/add_peer_shell_reliable.txt` (строгие гарантии)
 
-### 1) FAST — максимальная скорость
+Как запускать:
+```bash
+# выполнить скрипт целиком
+bin/hbase shell conf/add_peer_shell_fast.txt
 
-```
-# HBase shell
-repconf = org.apache.hadoop.hbase.replication.ReplicationPeerConfig.new
-repconf.setClusterKey("10.254.3.111,10.254.3.112,10.254.3.113:2181:/hbase")
-repconf.setReplicationEndpointImpl("kz.qazmarka.h2k.endpoint.KafkaReplicationEndpoint")
-
-java_conf = repconf.getConfiguration
-java_conf.put("h2k.kafka.bootstrap.servers", "10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092")
-java_conf.put("h2k.topic.pattern", "${table}")
-java_conf.put("h2k.cf.list", "d")
-java_conf.put("h2k.decode.mode", "json-phoenix")
-java_conf.put("h2k.schema.path", "/opt/hbase-default-current/conf/schema.json")
-java_conf.put("h2k.salt.map", "TBL_JTI_TRACE_CIS_HISTORY=1")
-java_conf.put("h2k.capacity.hints", "TBL_JTI_TRACE_CIS_HISTORY=32")
-
-# скорость > надёжность
-java_conf.put("h2k.producer.acks", "1")
-java_conf.put("h2k.producer.enable.idempotence", "false")
-java_conf.put("h2k.producer.max.in.flight", "5")
-java_conf.put("h2k.producer.linger.ms", "100")
-java_conf.put("h2k.producer.batch.size", "524288")       # 512 KiB
-java_conf.put("h2k.producer.compression.type", "lz4")
-java_conf.put("h2k.producer.retries", "10")
-java_conf.put("h2k.producer.request.timeout.ms", "30000")
-java_conf.put("h2k.producer.delivery.timeout.ms", "90000")
-java_conf.put("h2k.producer.buffer.memory", "268435456")  # 256 MiB
-java_conf.put("h2k.producer.max.request.size", "2097152") # 2 MiB
-java_conf.put("h2k.producer.await.every", "500")
-java_conf.put("h2k.producer.await.timeout.ms", "180000")
-
-rep_admin = org.apache.hadoop.hbase.client.replication.ReplicationAdmin.new(@hbase.configuration)
-rep_admin.addPeer("kafka_peer_fast", repconf, java.util.HashMap.new)
+# или открыть, скопировать и вставить содержимое в интерактивный shell
+bin/hbase shell
 ```
 
-### 2) BALANCED — компромисс
-
-```
-# HBase shell
-repconf = org.apache.hadoop.hbase.replication.ReplicationPeerConfig.new
-repconf.setClusterKey("10.254.3.111,10.254.3.112,10.254.3.113:2181:/hbase")
-repconf.setReplicationEndpointImpl("kz.qazmarka.h2k.endpoint.KafkaReplicationEndpoint")
-
-java_conf = repconf.getConfiguration
-java_conf.put("h2k.kafka.bootstrap.servers", "10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092")
-java_conf.put("h2k.topic.pattern", "${table}")
-java_conf.put("h2k.cf.list", "d")
-java_conf.put("h2k.decode.mode", "json-phoenix")
-java_conf.put("h2k.schema.path", "/opt/hbase-default-current/conf/schema.json")
-java_conf.put("h2k.salt.map", "TBL_JTI_TRACE_CIS_HISTORY=1")
-java_conf.put("h2k.capacity.hints", "TBL_JTI_TRACE_CIS_HISTORY=32")
-
-# компромисс скорость/надёжность
-java_conf.put("h2k.producer.acks", "all")
-java_conf.put("h2k.producer.enable.idempotence", "true")
-java_conf.put("h2k.producer.max.in.flight", "3")
-java_conf.put("h2k.producer.linger.ms", "100")
-java_conf.put("h2k.producer.batch.size", "131072")        # 128 KiB
-java_conf.put("h2k.producer.compression.type", "lz4")
-java_conf.put("h2k.producer.retries", "2147483647")
-java_conf.put("h2k.producer.request.timeout.ms", "60000")
-java_conf.put("h2k.producer.delivery.timeout.ms", "300000")
-java_conf.put("h2k.producer.buffer.memory", "268435456")  # 256 MiB
-java_conf.put("h2k.producer.max.request.size", "2097152") # 2 MiB
-java_conf.put("h2k.producer.await.every", "500")
-java_conf.put("h2k.producer.await.timeout.ms", "300000")
-
-rep_admin = org.apache.hadoop.hbase.client.replication.ReplicationAdmin.new(@hbase.configuration)
-rep_admin.addPeer("kafka_peer_balanced", repconf, java.util.HashMap.new)
+Проверка:
+```HBase shell
+list_peers
+show_peer_tableCFs 'kafka_peer_fast'   # вернёт nil, если ограничений нет
 ```
 
-### 3) RELIABLE — строгие гарантии
+---
 
+#### Ограничить набор таблиц/CF на стороне HBase (опционально)
+По умолчанию `TABLE_CFS = nil` → HBase отдаёт в Endpoint все таблицы/CF, у которых `REPLICATION_SCOPE => 1`. 
+Чтобы сузить поток **ещё на стороне HBase**, используйте:
 ```
-# HBase shell
-repconf = org.apache.hadoop.hbase.replication.ReplicationPeerConfig.new
-repconf.setClusterKey("10.254.3.111,10.254.3.112,10.254.3.113:2181:/hbase")
-repconf.setReplicationEndpointImpl("kz.qazmarka.h2k.endpoint.KafkaReplicationEndpoint")
-
-java_conf = repconf.getConfiguration
-java_conf.put("h2k.kafka.bootstrap.servers", "10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092")
-java_conf.put("h2k.topic.pattern", "${table}")
-java_conf.put("h2k.cf.list", "d")
-java_conf.put("h2k.decode.mode", "json-phoenix")
-java_conf.put("h2k.schema.path", "/opt/hbase-default-current/conf/schema.json")
-java_conf.put("h2k.salt.map", "TBL_JTI_TRACE_CIS_HISTORY=1")
-java_conf.put("h2k.capacity.hints", "TBL_JTI_TRACE_CIS_HISTORY=32")
-
-# приоритет — порядок и отсутствие дублей
-java_conf.put("h2k.producer.acks", "all")
-java_conf.put("h2k.producer.enable.idempotence", "true")
-java_conf.put("h2k.producer.max.in.flight", "1")
-java_conf.put("h2k.producer.linger.ms", "50")
-java_conf.put("h2k.producer.batch.size", "65536")         # 64 KiB
-java_conf.put("h2k.producer.compression.type", "snappy")
-java_conf.put("h2k.producer.retries", "2147483647")
-java_conf.put("h2k.producer.request.timeout.ms", "120000")
-java_conf.put("h2k.producer.delivery.timeout.ms", "300000")
-java_conf.put("h2k.producer.buffer.memory", "268435456")  # 256 MiB
-java_conf.put("h2k.producer.max.request.size", "2097152") # 2 MiB
-java_conf.put("h2k.producer.await.every", "500")
-java_conf.put("h2k.producer.await.timeout.ms", "300000")
-
-rep_admin = org.apache.hadoop.hbase.client.replication.ReplicationAdmin.new(@hbase.configuration)
-rep_admin.addPeer("kafka_peer_reliable", repconf, java.util.HashMap.new)
+# только DOCUMENTS:0 и RECEIPT:b,d
+set_peer_tableCFs 'kafka_peer_fast', 'DOCUMENTS:0;RECEIPT:b,d'
+show_peer_tableCFs 'kafka_peer_fast'   # проверка
 ```
+Это уменьшает объём обрабатываемых WALEdit до того, как они попадут в Endpoint.
+
 ---
 
 ## Матрица профилей (ключевые отличия)
@@ -529,8 +383,6 @@ _Пример ниже — реальная строка из `TBL_JTI_TRACE_CIS
 }
 ```
 
-
-
 ## Логирование
 
 Мы используем Log4j с консольным выводом и ротацией файлов (RollingFileAppender).
@@ -585,25 +437,21 @@ Environment="HBASE_OPTS=${HBASE_OPTS} -Dh2k.log.dir=/opt/hbase-default-current/l
    ```
    Топик по умолчанию — имя таблицы (см. `h2k.topic.pattern`, по дефолту `${table}`).
 
-**Проверка репликации (HBase shell):**
 
-```
-# HBase shell
-list_peers
-```
+**Полезные операции (HBase 1.4.13):**
 
-**Полезные операции:**
-
-```
 # HBase shell
 # включить/выключить peer
 enable_peer 'kafka_peer_fast'
 disable_peer 'kafka_peer_fast'
 
-# обновить конфиг (например, поменяли acks или bootstrap) — через Java API в 1.4.13
+# показать/изменить ограничения по таблицам/CF
+show_peer_tableCFs 'kafka_peer_fast'       # вернёт nil, если ограничений нет
+set_peer_tableCFs   'kafka_peer_fast', 'TBL1:cf1;TBL2:cf2,cf3'
+
+# обновить конфиг (например, поменяли acks или bootstrap) — надёжнее через Java API в 1.4.13
 rep_admin = org.apache.hadoop.hbase.client.replication.ReplicationAdmin.new(@hbase.configuration)
 rep_admin.updatePeerConfig("kafka_peer_fast", repconf)
-```
 
 **JMX/метрики:**
 
@@ -683,16 +531,13 @@ HBase RegionServer
 ## FAQ
 
 **Почему нельзя указывать `DEFAULT.TBL_NAME`?**  
-В Phoenix для таблиц из дефолт‑неймспейса используется просто `TBL_NAME` без префикса `DEFAULT.`. Указание `DEFAULT.TBL_NAME` приводит к `ERROR 601 (42P00) Syntax error` или `ERROR 1012 (42M03) Table undefined`.
+В Phoenix таблицы из дефолт-неймспейса указываются как `TBL_NAME` без префикса `DEFAULT.`. Запись `DEFAULT.TBL_NAME` приводит к ошибке парсера.
 
-**Почему `scope=provided` в POM?**  
-Чтобы не тащить в наш JAR то, что уже присутствует на RS (HBase/Hadoop/Phoenix/Kafka). Это снижает риски конфликтов и размер артефакта.
+**LZ4 или Snappy для `compression.type`?**  
+Обычно LZ4 быстрее при сопоставимой компрессии, поэтому в профилях FAST/BALANCED используется `lz4`. Для максимальной совместимости и строгих гарантий профиль RELIABLE оставляет `snappy`.
 
-**Snappy или LZ4?**  
-Для нашей нагрузки **LZ4** обычно выигрывает (ниже CPU/latency при сравнимой компрессии), поэтому примеры используют `lz4`.
-
-**Где лежат логи?**  
-По умолчанию — `${hbase.log.dir}` (как у HBase). Можно переопределить `-Dh2k.log.dir`. Имя файла: `h2k-endpoint.log`.
+**Где искать логи endpoint?**  
+По умолчанию — `${hbase.log.dir}/h2k-endpoint.log`. Можно переопределить `-Dh2k.log.dir`. Ротация управляется `h2k.log.maxFileSize` и `h2k.log.maxBackupIndex`.
 
 ---
 
