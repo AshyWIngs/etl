@@ -437,6 +437,7 @@ Environment="HBASE_OPTS=${HBASE_OPTS} -Dh2k.log.dir=/opt/hbase-default-current/l
 
 **Полезные операции (HBase 1.4.13):**
 
+```HBase shell
 # HBase shell
 # включить/выключить peer
 enable_peer 'kafka_peer_fast'
@@ -449,6 +450,7 @@ set_peer_tableCFs   'kafka_peer_fast', 'TBL1:cf1;TBL2:cf2,cf3'
 # обновить конфиг (например, поменяли acks или bootstrap) — надёжнее через Java API в 1.4.13
 rep_admin = org.apache.hadoop.hbase.client.replication.ReplicationAdmin.new(@hbase.configuration)
 rep_admin.updatePeerConfig("kafka_peer_fast", repconf)
+```
 
 **JMX/метрики:**
 
