@@ -126,4 +126,103 @@ class JsonSchemaRegistryTest {
         JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
         assertNull(reg.columnType(TableName.valueOf("ANY"), "col"));
     }
+
+    /**
+     * Fail-fast контракт аргументов: columnType(...) бросает NPE при null table/qualifier.
+     */
+    @Test
+    @DisplayName("Fail-fast: NPE на null table/qualifier")
+    void npeOnNullArgs(@TempDir Path dir) throws IOException {
+        Path f = dir.resolve("schema.json");
+        Files.write(f, ("{\n" +
+                "  \"TBL_NPE\": {\"columns\": {\"x\": \"VARCHAR\"}}\n" +
+                "}").getBytes(StandardCharsets.UTF_8));
+
+        JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
+        TableName tNpe = TableName.valueOf("TBL_NPE");
+        assertThrows(NullPointerException.class, () -> reg.columnType(null, "x"));
+        assertThrows(NullPointerException.class, () -> reg.columnType(tNpe, null));
+    }
+
+    /**
+     * Поведение при отсутствии файла схемы: реестр инициализируется пустым и не падает.
+     */
+    @Test
+    @DisplayName("Отсутствующий файл схемы: реестр пустой, исключений нет")
+    void missingSchemaFile() {
+        JsonSchemaRegistry reg = new JsonSchemaRegistry("/path/not/existing/schema.json");
+        assertNull(reg.columnType(TableName.valueOf("ANY"), "col"));
+    }
+
+    /**
+     * Поддержка Unicode-имён таблиц/колонок (русский/казахский): регистр qualifier игнорируется.
+     */
+    @Test
+    @DisplayName("ASCII: имена таблиц и колонок — латиницей (значения могут быть Unicode)")
+    void unicodeNamesSupported(@TempDir Path dir) throws IOException {
+        String json = "{\n" +
+                "  \"DEFAULT:ZAKAZY\": {\n" +
+                "    \"columns\": { \"name\": \"VARCHAR\", \"date\": \"DATE\" }\n" +
+                "  }\n" +
+                "}";
+        Path f = dir.resolve("schema.json");
+        Files.write(f, json.getBytes(StandardCharsets.UTF_8));
+
+        JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
+        // короткое имя таблицы без DEFAULT
+        TableName tShort = TableName.valueOf("ZAKAZY");
+        // регистр qualifier игнорируется
+        assertEquals("VARCHAR", reg.columnType(tShort, "name"));
+        assertEquals("VARCHAR", reg.columnType(tShort, "NAME"));
+        assertEquals("DATE", reg.columnType(tShort, "date"));
+        assertEquals("DATE", reg.columnType(tShort, "DATE"));
+        // неизвестная колонка → null
+        assertNull(reg.columnType(tShort, "unknown"));
+        // неизвестная таблица → null
+        assertNull(reg.columnType(TableName.valueOf("NOT_EXISTS"), "name"));
+    }
+
+    /**
+     * Синонимы массивов для совместимости: JsonSchemaRegistry возвращает тип-строку как есть.
+     */
+    @Test
+    @DisplayName("Массивы: 'CHARACTER VARYING ARRAY' и 'STRING ARRAY' возвращаются как есть")
+    void arraySynonymsReturnedAsIs(@TempDir Path dir) throws IOException {
+        String json = "{\n" +
+                "  \"TBL_SYNONYMS\": {\"columns\": {\"a\": \"CHARACTER VARYING ARRAY\", \"b\": \"STRING ARRAY\"}}\n" +
+                "}";
+        Path f = dir.resolve("schema.json");
+        Files.write(f, json.getBytes(StandardCharsets.UTF_8));
+
+        JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
+        TableName t = TableName.valueOf("TBL_SYNONYMS");
+        assertEquals("CHARACTER VARYING ARRAY", reg.columnType(t, "a"));
+        assertEquals("STRING ARRAY", reg.columnType(t, "b"));
+    }
+
+    /**
+     * Дополнение к refresh(): удаление колонки после обновления отражается в результатах.
+     */
+    @Test
+    @DisplayName("refresh(): удаление колонки делает columnType(...)==null")
+    void refreshRemovesColumn(@TempDir Path dir) throws IOException {
+        Path f = dir.resolve("schema.json");
+        Files.write(f, ("{\n" +
+                "  \"TBL_D\": {\"columns\": {\"keep\": \"INT\", \"drop\": \"VARCHAR\"}}\n" +
+                "}").getBytes(StandardCharsets.UTF_8));
+
+        JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
+        TableName t = TableName.valueOf("TBL_D");
+        assertEquals("INT", reg.columnType(t, "keep"));
+        assertEquals("VARCHAR", reg.columnType(t, "drop"));
+
+        // Обновляем файл: колонку drop удаляем
+        Files.write(f, ("{\n" +
+                "  \"TBL_D\": {\"columns\": {\"keep\": \"INT\"}}\n" +
+                "}").getBytes(StandardCharsets.UTF_8));
+        reg.refresh();
+
+        assertEquals("INT", reg.columnType(t, "keep"));
+        assertNull(reg.columnType(t, "drop"));
+    }
 }

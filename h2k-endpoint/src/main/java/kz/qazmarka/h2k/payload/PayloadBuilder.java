@@ -59,7 +59,7 @@ public final class PayloadBuilder {
      *  - _cells_total, _cells_cf — общее количество ячеек в строке и число ячеек целевого CF;
      *  - event_version — максимальная метка времени среди ячеек CF;
      *  - delete — признак, что в партии встречалась операция удаления по строке;
-     *  - rowkey_hex / rowkey_b64 — представление rowkey (включается по флагу includeRowKey);
+     *  - _rowkey — представление rowkey (HEX или Base64 в зависимости от h2k.rowkey.encoding; включается по флагу includeRowKey);
      *  - _wal_seq, _wal_write_time — метаданные WAL (включаются по includeMetaWal).
      */
     private static final String K_TABLE          = "_table";
@@ -70,8 +70,8 @@ public final class PayloadBuilder {
     private static final String K_CELLS_CF       = "_cells_cf";
     private static final String K_EVENT_VERSION  = "event_version";
     private static final String K_DELETE         = "delete";
-    private static final String K_ROWKEY_HEX     = "rowkey_hex";
-    private static final String K_ROWKEY_B64     = "rowkey_b64";
+    /** Единое имя поля rowkey согласно требованиям проекта (HEX/BASE64 выбирается по конфигу). */
+    private static final String K_ROWKEY         = "_rowkey";
     private static final String K_WAL_SEQ        = "_wal_seq";
     private static final String K_WAL_WRITE_TIME = "_wal_write_time";
 
@@ -153,16 +153,16 @@ public final class PayloadBuilder {
         final boolean includeRowKeyPresent = includeRowKey && rowKey != null;
 
         // Точный/приближённый прогноз числа целевых ячеек.
-        // Если в конфиге задана подсказка ёмкости — используем её приоритетно, иначе берём оценку по прескану.
+        // Подсказка ёмкости учитывается на этапе newRootMap(...) как итоговое целевое число ключей.
+        // Здесь для оценки числа колонок используем только прескан.
         final byte[][] cfFamilies = cfg.getCfFamiliesBytes();
         final int sampledCellsEstimate = estimateTargetCells(cells, cfFamilies);
-        final int hintColumns = cfg.getCapacityHintFor(table); // >0 — приоритетная подсказка из конфига; 0 — нет подсказки
-        final int effectiveCellsEstimate = (hintColumns > 0 ? hintColumns : sampledCellsEstimate);
+        final int effectiveCellsEstimate = sampledCellsEstimate;
 
         int cap = 1 /*event_version*/
                 + effectiveCellsEstimate
                 + (includeMeta ? 5 : 0)         /*_table,_namespace,_qualifier,_cf,_cells_total*/
-                + (includeRowKeyPresent ? 1 : 0)/*rowkey_hex|rowkey_b64*/
+                + (includeRowKeyPresent ? 1 : 0)/*_rowkey*/
                 + (includeWalMeta ? 2 : 0);     /*_wal_seq,_wal_write_time*/
 
         final Map<String, Object> obj = newRootMap(table, cap);
@@ -356,7 +356,7 @@ public final class PayloadBuilder {
         }
     }
 
-    /** Добавляет rowkey в hex или base64, если он присутствует и включён в конфигурации. */
+    /** Добавляет единое поле `_rowkey` (HEX или Base64 по конфигурации), если ключ присутствует и включён. */
     private static void addRowKeyIfPresent(boolean includeRowKeyPresent,
                                            Map<String, Object> obj,
                                            RowKeySlice rk,
@@ -376,9 +376,9 @@ public final class PayloadBuilder {
             return;
         }
         if (base64) {
-            obj.put(K_ROWKEY_B64, encodeRowKeyBase64(rk.getArray(), off, effLen));
+            obj.put(K_ROWKEY, encodeRowKeyBase64(rk.getArray(), off, effLen));
         } else {
-            obj.put(K_ROWKEY_HEX, toHex(rk.getArray(), off, effLen));
+            obj.put(K_ROWKEY, toHex(rk.getArray(), off, effLen));
         }
     }
 

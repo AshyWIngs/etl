@@ -3,6 +3,9 @@ package kz.qazmarka.h2k.schema;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Objects;
+
+import org.apache.hadoop.hbase.TableName;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -16,14 +19,15 @@ import static org.junit.jupiter.api.Assertions.*;
  *  • Проверить удобные обёртки {@link Decoder#decode(org.apache.hadoop.hbase.TableName, byte[], byte[])}
  *    и {@link Decoder#decodeOrDefault(org.apache.hadoop.hbase.TableName, String, byte[], Object)}.
  *
- * Допущения:
- *  • В тестах в качестве TableName передаётся null — это допустимо по контракту и исключает
- *    побочные эффекты инициализации HBase/Log4j.
+ * Контракт:
+ * • Параметры table и qualifier обязательны (не null) для всех перегрузок; при null — NPE (fail‑fast).
  *
  * Эти тесты не касаются конкретной логики декодирования значений — они проверяют только
  * корректную работу перегрузок, копирование массивов и стабильность строкового qualifier.
  */
 class DecoderTest {
+
+    private static final TableName TBL = TableName.valueOf("DEFAULT:UT_DECODER");
 
     /**
      * Вспомогательный контейнер для проверки того, что базовая перегрузка
@@ -47,6 +51,8 @@ class DecoderTest {
     private static final class EchoDecoder implements Decoder {
         @Override
         public Object decode(org.apache.hadoop.hbase.TableName table, String qualifier, byte[] value) {
+            Objects.requireNonNull(table, "table");
+            Objects.requireNonNull(qualifier, "qualifier");
             return new Holder(qualifier, value);
         }
     }
@@ -77,7 +83,7 @@ class DecoderTest {
         byte[] qual = "colX".getBytes(StandardCharsets.UTF_8);
         byte[] val  = new byte[] {1, 2, 3, 4};
 
-        Holder h = (Holder) d.decode(null, qual, 0, qual.length, val, 0, val.length);
+        Holder h = (Holder) d.decode(TBL, qual, 0, qual.length, val, 0, val.length);
 
         assertEquals("colX", h.qualifier, "Qualifier должен быть собран в String (UTF-8).");
         assertNotSame(val, h.value, "Value должно быть скопировано (другая ссылка).");
@@ -102,7 +108,7 @@ class DecoderTest {
         // В этом массиве будем проверять срез индексов 1..3 (значения 20, 30, 40)
         byte[] val  = new byte[] {10, 20, 30, 40, 50};
 
-        Holder h = (Holder) d.decode(null, qual, 1, 3, val, 1, 3);
+        Holder h = (Holder) d.decode(TBL, qual, 1, 3, val, 1, 3);
 
         assertEquals("bcd", h.qualifier);
         assertArrayEquals(new byte[]{20,30,40}, h.value);
@@ -123,7 +129,7 @@ class DecoderTest {
         byte[] qual = "q".getBytes(StandardCharsets.UTF_8);
         byte[] val  = new byte[] {42};
 
-        Holder h = (Holder) d.decode(null, qual, val);
+        Holder h = (Holder) d.decode(TBL, qual, val);
         assertEquals("q", h.qualifier);
         assertNotSame(val, h.value);
         assertArrayEquals(new byte[]{42}, h.value);
@@ -136,7 +142,102 @@ class DecoderTest {
     @Test
     void decodeOrDefault_returnsFallbackWhenDecoderReturnsNull() {
         Decoder d = new NullDecoder();
-        Object res = d.decodeOrDefault(null, "ignored", new byte[]{1}, 777);
+        Object res = d.decodeOrDefault(TBL, "ignored", new byte[]{1}, 777);
         assertEquals(777, res);
+    }
+
+    /**
+     * Негатив: fail‑fast NPE при null table/qualifier для удобных перегрузок.
+     */
+    @Test
+    void negative_failFast_onNullArgs() {
+        Decoder d = new EchoDecoder();
+        byte[] bytes = new byte[] {1};
+
+        assertThrows(NullPointerException.class, () -> ((Decoder) d).decode(null, "q", bytes));
+        assertThrows(NullPointerException.class, () -> ((Decoder) d).decode(TBL, (String) null, bytes));
+
+        byte[] qual = "q".getBytes(StandardCharsets.UTF_8);
+        assertThrows(NullPointerException.class, () -> d.decode(null, qual, bytes));
+        assertThrows(NullPointerException.class, () -> d.decode(TBL, (byte[]) null, bytes));
+    }
+
+    // -------- Typed API (Decoder.Typed) — объединено сюда из DecoderTypedSliceTest --------
+
+    /**
+     * Дополнение: whole(new byte[0]) возвращает срез с тем же массивом, off=0, len=0 (zero‑copy).
+     */
+    @Test
+    void typed_slice_whole_emptyArray_zeroLenZeroOff() {
+        byte[] arr = new byte[0];
+        Decoder.Typed.Slice s = Decoder.Typed.Slice.whole(arr);
+        assertSame(arr, s.a, "Должна сохраниться та же ссылка на массив");
+        assertEquals(0, s.off);
+        assertEquals(0, s.len);
+    }
+
+    /**
+     * Если декодер возвращает null и defaultValue == null, результат тоже null.
+     */
+    @Test
+    void typed_decodeOrDefault_nullDefault_staysNull() {
+        Decoder.Typed<String> nullTyped =
+                (table, qa, qo, ql, va, vo, vl) -> null;
+
+        Decoder.Typed.Slice q = Decoder.Typed.Slice.whole("q".getBytes(StandardCharsets.UTF_8));
+        Decoder.Typed.Slice v = Decoder.Typed.Slice.EMPTY;
+
+        String res = nullTyped.decodeOrDefault(TBL, q, v, null);
+        assertNull(res);
+    }
+
+    /**
+     * typed.decodeOrDefault корректно передаёт off/len внутрь декодера:
+     * из массива "qualifier" берём подстроку "ali".
+     */
+    @Test
+    void typed_decodeOrDefault_respectsOffsets() {
+        Decoder.Typed<String> toStringSlice =
+                (table, qa, qo, ql, va, vo, vl) -> qa == null ? null : new String(qa, qo, ql, StandardCharsets.UTF_8);
+
+        byte[] src = "qualifier".getBytes(StandardCharsets.UTF_8);
+        // подстрока "ali" начинается с индекса 2 и длиной 3 — собираем подмассив и передаём как Slice
+        byte[] ali = new byte[3];
+        System.arraycopy(src, 2, ali, 0, 3);
+        Decoder.Typed.Slice q = Decoder.Typed.Slice.whole(ali);
+        Decoder.Typed.Slice v = Decoder.Typed.Slice.EMPTY;
+
+        String res = toStringSlice.decodeOrDefault(TBL, q, v, "fallback");
+        assertEquals("ali", res);
+    }
+
+    /**
+     * typed.decodeOrDefault: при ненулевом значении возвращается оно, а не default.
+     */
+    @Test
+    void typed_decodeOrDefault_propagatesNonNullValue() {
+        Decoder.Typed<String> qualifierAsString =
+                (table, qa, qo, ql, va, vo, vl) -> qa == null ? null : new String(qa, qo, ql, StandardCharsets.UTF_8);
+
+        Decoder.Typed.Slice q = Decoder.Typed.Slice.whole("qq".getBytes(StandardCharsets.UTF_8));
+        Decoder.Typed.Slice v = Decoder.Typed.Slice.EMPTY;
+
+        String res = qualifierAsString.decodeOrDefault(TBL, q, v, "fallback");
+        assertEquals("qq", res);
+    }
+
+    /**
+     * typed.decodeOrDefault: если декодер вернул null — отдаём default.
+     */
+    @Test
+    void typed_decodeOrDefault_returnsDefaultOnNull() {
+        Decoder.Typed<String> nullTyped =
+                (table, qa, qo, ql, va, vo, vl) -> null;
+
+        Decoder.Typed.Slice q = Decoder.Typed.Slice.whole("x".getBytes(StandardCharsets.UTF_8));
+        Decoder.Typed.Slice v = Decoder.Typed.Slice.EMPTY;
+
+        String res = nullTyped.decodeOrDefault(TBL, q, v, "fallback");
+        assertEquals("fallback", res);
     }
 }

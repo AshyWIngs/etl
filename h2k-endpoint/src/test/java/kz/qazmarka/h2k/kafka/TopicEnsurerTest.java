@@ -121,6 +121,9 @@ class TopicEnsurerTest {
         final Map<String, KafkaFuture<TopicDescription>> describeMap = new HashMap<>();
         final Map<String, KafkaFuture<Void>> createMap = new HashMap<>();
         final Map<String, Action> createSingle = new HashMap<>();
+        // Захватываем последние вызовы create для проверок в тестах
+        final List<NewTopic> createdBatch = new ArrayList<>();
+        NewTopic createdSingle = null;
 
         /**
          * Сценарии для одиночного {@code createTopic}.
@@ -186,6 +189,9 @@ class TopicEnsurerTest {
                 case "createTopics": {
                     @SuppressWarnings("unchecked")
                     List<NewTopic> nts = (List<NewTopic>) args[0];
+                    // зафиксируем параметры созданных топиков для последующих проверок
+                    createdBatch.clear();
+                    createdBatch.addAll(nts);
                     Map<String, KafkaFuture<Void>> out = new LinkedHashMap<>();
                     for (NewTopic nt : nts) {
                         String t = nt.name();
@@ -195,6 +201,8 @@ class TopicEnsurerTest {
                 }
                 case "createTopic": {
                     NewTopic nt = (NewTopic) args[0];
+                    // зафиксируем параметры созданного топика для последующих проверок
+                    createdSingle = nt;
                     String t = nt.name();
                     Action a = createSingle.getOrDefault(t, Action.OK);
                     switch (a) {
@@ -358,5 +366,114 @@ class TopicEnsurerTest {
         assertDoesNotThrow(te::close);
         // повторный close тоже не должен бросать
         assertDoesNotThrow(te::close);
+    }
+    /**
+     * Позитив: существующая тема не создаётся повторно.
+     * Проверяем, что ensureTopicOk возвращает true и create.ok не увеличивается.
+     */
+    @Test
+    @DisplayName("ensureTopicOk: существующая тема → без create (idempotent)")
+    void ensure_existing_topic_skips_creation() throws Exception {
+        FakeAdmin fa = new FakeAdmin()
+                .willDescribeOk("exists");
+        TopicEnsurer te = newEnsurer(fa, 20, 2, (short) 1, Collections.emptyMap(), 10);
+
+        assertTrue(te.ensureTopicOk("exists"));
+        assertEquals(1L, m(te, "exists.true"));
+        assertEquals(0L, m(te, "create.ok"));
+    }
+
+    /**
+     * Негатив: ошибка создания (ExecutionException) приводит к возврату false.
+     * Метрики фиксируют попытку (exists.false=1) и create.fail=1.
+     */
+    @Test
+    @DisplayName("ensureTopicOk: ошибка create (FAIL) → false и счётчик fail")
+    void ensure_create_failure_propagates_false() throws Exception {
+        FakeAdmin fa = new FakeAdmin()
+                .willDescribeNotFound("bad")
+                .willCreateTopicSingle("bad", FakeAdmin.Action.FAIL);
+        TopicEnsurer te = newEnsurer(fa, 25, 3, (short) 2, Collections.emptyMap(), 10);
+
+        assertFalse(te.ensureTopicOk("bad"));
+        assertEquals(1L, m(te, "exists.false"));
+        assertEquals(1L, m(te, "create.fail"));
+        assertEquals(0L, m(te, "create.ok"));
+    }
+
+    /**
+     * Негатив: таймаут создания (TimeoutException) → false, без учёта как create.ok.
+     */
+    @Test
+    @DisplayName("ensureTopicOk: таймаут при create → false, без create.ok")
+    void ensure_create_timeout_returns_false() throws Exception {
+        FakeAdmin fa = new FakeAdmin()
+                .willDescribeNotFound("slowCreate")
+                .willCreateTopicSingle("slowCreate", FakeAdmin.Action.TIMEOUT);
+        TopicEnsurer te = newEnsurer(fa, 15, 2, (short) 1, Collections.emptyMap(), 10);
+
+        assertFalse(te.ensureTopicOk("slowCreate"));
+        assertEquals(1L, m(te, "exists.false"));
+        assertEquals(0L, m(te, "create.ok"));
+    }
+
+    /**
+     * Конструкторские значения по умолчанию передаются в NewTopic для одиночного пути.
+     */
+    @Test
+    @DisplayName("ensureTopicOk: NewTopic использует partitions/replication из конструктора")
+    void single_create_uses_ctor_defaults() throws Exception {
+        FakeAdmin fa = new FakeAdmin()
+                .willDescribeNotFound("pdef")
+                .willCreateTopicSingle("pdef", FakeAdmin.Action.OK);
+        int partitions = 4;
+        short repl = 2;
+        TopicEnsurer te = newEnsurer(fa, 25, partitions, repl, Collections.emptyMap(), 10);
+
+        assertTrue(te.ensureTopicOk("pdef"));
+        assertNotNull(fa.createdSingle, "Должен быть вызов createTopic(single)");
+        assertEquals(partitions, fa.createdSingle.numPartitions());
+        assertEquals(repl, fa.createdSingle.replicationFactor());
+    }
+
+    /**
+     * Batch‑создание: для отсутствующих тем NewTopic получает значения из конструктора.
+     */
+    @Test
+    @DisplayName("ensureTopics(batch): NewTopic получает partitions/replication из конструктора")
+    void batch_create_uses_ctor_defaults_for_missing() throws Exception {
+        FakeAdmin fa = new FakeAdmin()
+                .willDescribeOk("t1")
+                .willDescribeNotFound("t2")
+                .willCreateOk("t2");
+        int partitions = 6;
+        short repl = 3;
+        TopicEnsurer te = newEnsurer(fa, 20, partitions, repl, Collections.emptyMap(), 10);
+
+        te.ensureTopics(Arrays.asList("t1", "t2"));
+        // В батче должен быть один NewTopic — именно t2
+        assertEquals(1, fa.createdBatch.size());
+        NewTopic nt = fa.createdBatch.get(0);
+        assertEquals("t2", nt.name());
+        assertEquals(partitions, nt.numPartitions());
+        assertEquals(repl, nt.replicationFactor());
+    }
+
+    /**
+     * Batch: игнорируем некорректные имена и продолжаем обрабатывать валидные.
+     */
+    @Test
+    @DisplayName("ensureTopics(batch): некорректные имена игнорируются, валидные обрабатываются")
+    void batch_ignores_invalid_names() throws Exception {
+        FakeAdmin fa = new FakeAdmin()
+                .willDescribeOk("ok-exists")
+                .willDescribeNotFound("ok-new")
+                .willCreateOk("ok-new");
+        TopicEnsurer te = newEnsurer(fa, 15, 1, (short) 1, Collections.emptyMap(), 10);
+
+        te.ensureTopics(Arrays.asList("ok-exists", "", ".", "ok-new", " "));
+        assertEquals(1L, m(te, "exists.true"));
+        assertEquals(1L, m(te, "exists.false"));
+        assertEquals(1L, m(te, "create.ok"));
     }
 }

@@ -13,13 +13,14 @@ import static org.junit.jupiter.api.Assertions.*;
  *    отсутствие аллокаций при обычном использовании и предсказуемое поведение вспомогательных методов.
  *  • Быстро выявлять регрессии при изменениях представления rowkey.
  *
- * Что проверяем:
- *  • empty(): одиночный экземпляр пустого среза и корректные длины;
+ * Что проверяем (позитив и негатив):
+ *  • empty(): одиночный экземпляр пустого среза и корректные длины; whole(new byte[0]) → пустой срез, эквивалентный empty();
  *  • whole(byte[]): охват всего массива и совпадение hashCode с Bytes.hashCode;
- *  • equals/hashCode при разных смещениях одного массива;
+ *  • equals/hashCode при разных смещениях одного массива и при одинаковом содержимом на разных массивах;
+ *  • equals: рефлексивность/симметричность; сравнение с null и другим типом → false;
  *  • toByteArray(): возврат копии, не зависящей от исходного массива;
- *  • toString(): компактный превью‑вывод с усечением;
- *  • проверку границ конструктора (offset/length).
+ *  • toString(): компактный превью‑вывод с усечением; для коротких срезов усечения нет;
+ *  • проверку границ конструктора (offset/length) и NPE при null‑массиве.
  *
  * Эти тесты не зависят от HBase‑окружения и выполняются за миллисекунды.
  *
@@ -40,6 +41,17 @@ class RowKeySliceTest {
         assertTrue(e1.isEmpty());
         assertEquals(0, e1.getLength());
         assertEquals(0, e1.toByteArray().length);
+    }
+
+    /**
+     * whole(new byte[0]) возвращает тот же singleton, что и empty().
+     */
+    @Test
+    void wholeEmptyReturnsEmptySingleton() {
+        RowKeySlice e = RowKeySlice.empty();
+        RowKeySlice w = RowKeySlice.whole(new byte[0]);
+        assertEquals(e, w);
+        assertTrue(w.isEmpty());
     }
 
     /**
@@ -75,6 +87,33 @@ class RowKeySliceTest {
     }
 
     /**
+     * equals/hashCode при одинаковом содержимом на разных массивах.
+     */
+    @Test
+    void equalsByContentAcrossDifferentArrays() {
+        byte[] a = new byte[] {0, 1, 2, 3, 0};
+        byte[] b = new byte[] {9, 1, 2, 3, 9};
+        RowKeySlice s1 = new RowKeySlice(a, 1, 3); // [1,2,3]
+        RowKeySlice s2 = new RowKeySlice(b, 1, 3); // [1,2,3]
+        assertEquals(s1, s2);
+        assertEquals(s1.hashCode(), s2.hashCode());
+    }
+
+    /**
+     * equals: рефлексивность/симметричность; сравнение с null и другим типом.
+     */
+    @Test
+    void equalsLawsAndNullAndOtherType() {
+        byte[] a = new byte[] {5, 6, 7, 8};
+        RowKeySlice s1 = new RowKeySlice(a, 1, 2);
+        RowKeySlice s2 = new RowKeySlice(a, 1, 2);
+        assertEquals(s1, s1);                  // рефлексивность
+        assertTrue(s1.equals(s2) && s2.equals(s1)); // симметричность
+        assertNotEquals(null, s1);          // null
+        assertNotEquals("not a slice", s1); // другой тип
+    }
+
+    /**
      * {@code toByteArray()} возвращает копию:
      *  • дальнейшая модификация исходного массива не влияет на возвращённый байтовый массив.
      */
@@ -87,6 +126,18 @@ class RowKeySliceTest {
         // меняем исходный массив — копия не должна измениться
         a[1] = 9;
         assertArrayEquals(new byte[] {7,7}, copy);
+    }
+
+    /**
+     * Для коротких срезов превью не содержит маркера усечения.
+     */
+    @Test
+    void toStringPreviewNoEllipsisWhenShort() {
+        byte[] a = new byte[] {10, 11, 12, 13, 14};
+        RowKeySlice s = RowKeySlice.whole(a);
+        String text = s.toString();
+        assertTrue(text.contains("preview=["));
+        assertFalse(text.contains(",.."), "Для коротких срезов усечения быть не должно");
     }
 
     /**
@@ -105,6 +156,19 @@ class RowKeySliceTest {
     }
 
     /**
+     * hashCode консистентен и совпадает с Bytes.hashCode для неполного диапазона.
+     */
+    @Test
+    void hashCodeConsistentWithBytesForSlice() {
+        byte[] a = new byte[] {42, 1, 2, 3, 99};
+        RowKeySlice s = new RowKeySlice(a, 1, 3); // [1,2,3]
+        int h1 = s.hashCode();
+        int h2 = s.hashCode();
+        assertEquals(h1, h2);
+        assertEquals(Bytes.hashCode(a, 1, 3), h1);
+    }
+
+    /**
      * Валидация границ конструктора:
      *  • отрицательный offset, выход за пределы массива и переполнение offset+length приводят к {@link IllegalArgumentException}.
      */
@@ -114,5 +178,11 @@ class RowKeySliceTest {
         assertThrows(IllegalArgumentException.class, () -> new RowKeySlice(a, -1, 1));
         assertThrows(IllegalArgumentException.class, () -> new RowKeySlice(a, 0, 4));
         assertThrows(IllegalArgumentException.class, () -> new RowKeySlice(a, 3, 1));
+        // пустой срез допустим, но null‑массив — нет
+        assertThrows(NullPointerException.class, () -> new RowKeySlice(null, 0, 0));
+        // допустим нулевой размер на границе массива
+        RowKeySlice emptyTail = new RowKeySlice(a, 3, 0);
+        assertTrue(emptyTail.isEmpty());
+        assertEquals(0, emptyTail.getLength());
     }
 }

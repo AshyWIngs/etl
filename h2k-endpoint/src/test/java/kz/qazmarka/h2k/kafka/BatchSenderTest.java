@@ -6,8 +6,10 @@ import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.ExecutionException;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -161,5 +163,115 @@ final class BatchSenderTest {
             assertEquals(0, sender.getConfirmedCount(), "confirmedCount не должен расти при выключенных счётчиках");
             assertEquals(0, sender.getFailedFlushes(), "failedQuietFlushes не должен расти при выключенных счётчиках");
         }
+    }
+
+    @Test
+    @DisplayName("tryFlush на пустом буфере: true и никаких побочных эффектов")
+    void tryFlush_on_empty_returnsTrue() throws Exception {
+        try (BatchSender sender = new BatchSender(3, 250, true, false)) {
+            assertEquals(0, sender.getPendingCount());
+            long flushCallsBefore = sender.getFlushCalls();
+            long confirmedBefore  = sender.getConfirmedCount();
+            long failedQuietBefore= sender.getFailedFlushes();
+
+            assertTrue(sender.tryFlush(), "На пустом буфере tryFlush должен вернуть true");
+            assertEquals(0, sender.getPendingCount());
+            // Счётчики не обязаны меняться — фиксируем отсутствие роста
+            assertEquals(flushCallsBefore, sender.getFlushCalls());
+            assertEquals(confirmedBefore,  sender.getConfirmedCount());
+            assertEquals(failedQuietBefore, sender.getFailedFlushes());
+        }
+    }
+
+    @Test
+    @DisplayName("flush на пустом буфере: не бросает и буфер остаётся пустым")
+    void strictFlush_on_empty_noop() throws Exception {
+        try (BatchSender sender = new BatchSender(3, 250, true, false)) {
+            assertEquals(0, sender.getPendingCount());
+            assertDoesNotThrow(sender::flush);
+            assertEquals(0, sender.getPendingCount());
+        }
+    }
+
+    @Test
+    @DisplayName("Строгий flush: смесь ok+fail → бросает и буфер сохраняется")
+    void strictFlush_mixed_ok_and_fail_throws_and_keeps_buffer() {
+        @SuppressWarnings("resource")
+        BatchSender sender = new BatchSender(10, 250, true, false);
+        sender.add(ok());
+        sender.add(fail("boom-fail"));
+        assertTrue(sender.hasPending());
+        // ожидаем исключение (путь строгого сброса)
+        ExecutionException ex = assertThrows(ExecutionException.class, sender::flush);
+        assertTrue(ex.getCause() instanceof RuntimeException);
+        assertEquals("boom-fail", ex.getCause().getMessage());
+        // буфер остаётся — caller может принять решение, что делать дальше
+        assertTrue(sender.hasPending());
+        // confirmed не увеличивался (успехи не были подтверждены, т.к. набор завершился с ошибкой)
+        assertEquals(0, sender.getConfirmedCount());
+    }
+
+    @Test
+    @DisplayName("Закрытие: ошибки в буфере ПРОПАГИРУЮТСЯ наружу")
+    void close_in_quiet_mode_swallows_errors() {
+        // Закрытие проходит через strict‑flush и пробрасывает ошибки futures наружу.
+        BatchSender sender = new BatchSender(3, 50, true, true);
+        sender.add(fail("boom-on-close"));
+        sender.add(never()); // чтобы не было случайного успешного завершения
+        assertTrue(sender.hasPending());
+        assertThrows(ExecutionException.class, sender::close);
+    }
+
+    @Test
+    @DisplayName("awaitEvery=1: авто‑сброс после каждого add(ok)")
+    void awaitEvery_one_autoflushes_each_add() throws Exception {
+        try (BatchSender sender = new BatchSender(1, 250, true, false)) {
+            sender.add(ok());
+            assertEquals(0, sender.getPendingCount(), "Должно авто‑сброситься сразу после первого add()");
+            sender.add(ok());
+            assertEquals(0, sender.getPendingCount(), "И после второго тоже");
+            assertTrue(sender.getFlushCalls() >= 2, "Должно быть как минимум два авто‑сброса");
+        }
+    }
+
+    @Test
+    @DisplayName("addAll: пустая коллекция — no-op без побочных эффектов")
+    void addAll_empty_is_noop() throws Exception {
+        try (BatchSender sender = new BatchSender(3, 250, true, false)) {
+            long flushCallsBefore = sender.getFlushCalls();
+            long confirmedBefore  = sender.getConfirmedCount();
+            long failedQuietBefore= sender.getFailedFlushes();
+
+            sender.addAll(Collections.<CompletableFuture<RecordMetadata>>emptyList());
+            assertEquals(0, sender.getPendingCount());
+            assertEquals(flushCallsBefore, sender.getFlushCalls());
+            assertEquals(confirmedBefore,  sender.getConfirmedCount());
+            assertEquals(failedQuietBefore, sender.getFailedFlushes());
+        }
+    }
+
+    @Test
+    @DisplayName("tryFlush: при наличии ошибок confirmedCount не растёт")
+    void quietFlush_with_failure_does_not_increment_confirmed() {
+        @SuppressWarnings("resource")
+        BatchSender sender = new BatchSender(5, 250, true, false);
+        sender.add(fail("boom1"));
+        sender.add(ok());
+        long confirmedBefore = sender.getConfirmedCount();
+
+        assertFalse(sender.tryFlush(), "Ожидаем false из-за ошибки");
+        assertEquals(confirmedBefore, sender.getConfirmedCount(), "confirmedCount не должен расти при неуспешном тихом сбросе");
+        assertTrue(sender.hasPending(), "Буфер должен сохраниться для дальнейшей обработки");
+    }
+
+    @Test
+    @DisplayName("Строгий flush: общий дедлайн применяется к целому набору futures")
+    void strictFlush_deadline_applies_to_whole_batch() {
+        @SuppressWarnings("resource")
+        BatchSender sender = new BatchSender(10, 50, true, false); // 50 мс общий дедлайн
+        sender.add(never());
+        sender.add(never());
+        assertThrows(TimeoutException.class, sender::flush);
+        assertEquals(2, sender.getPendingCount(), "Буфер не очищается при таймауте");
     }
 }

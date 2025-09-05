@@ -39,6 +39,11 @@ import kz.qazmarka.h2k.config.H2kConfig;
  * Конфигурация
  *  - Bootstrap/ClientId/таймауты берутся из {@link H2kConfig}; REQUEST_TIMEOUT_MS у AdminClient
  *    синхронизирован с adminTimeoutMs из конфига.
+ *  - Включение/выключение: {@code h2k.ensure.topics} (true/false).
+ *  - Параметры создаваемых тем: {@code h2k.topic.partitions} (≥1), {@code h2k.topic.replication} (≥1).
+ *  - Дополнительные конфиги при создании: snapshot из {@link H2kConfig#getTopicConfigs()}.
+ *  - Backoff на «неуверенные» ошибки: {@code h2k.ensure.unknown.backoff.ms} (используется с крипто‑джиттером).
+ *  - Класс никогда не изменяет уже существующие темы (конфиги существующих тем остаются без изменений).
  */
 public final class TopicEnsurer implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(TopicEnsurer.class);
@@ -777,6 +782,7 @@ public final class TopicEnsurer implements AutoCloseable {
 
     /**
      * Возвращает неизменяемый снимок внутренних счётчиков.
+     * Счётчики являются накопительными с момента создания инстанса; перезапуск пира обнуляет значения.
      *
      * @return карта «имя метрики → значение»
      */

@@ -119,7 +119,9 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
     private TopicEnsurer topicEnsurer;
     /** Последний успешно проверенный/созданный топик для подавления повторных ensure в рамках потока. */
     private String lastEnsuredTopic;
-    /** Кэш соответствий таблица -> топик для устранения повторных вычислений topicPattern. */
+    /** Кэш соответствий таблица -> топик для устранения повторных вычислений topicPattern.
+     *  TableName имеет стабильные equals/hashCode, кэш корректен на время жизни пира.
+     */
     private final java.util.Map<TableName, String> topicCache = new java.util.HashMap<>(8);
     /** Кэшированный набор CF (в байтах) для фильтрации по WAL-timestamp; вычисляется один раз из конфигурации и не меняется на время жизни пира. */
     private byte[][] cfFamiliesBytesCached;
@@ -225,8 +227,8 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
         if ("json-phoenix".equalsIgnoreCase(mode)) {
             String schemaPath = cfg.get(kz.qazmarka.h2k.config.H2kConfig.Keys.SCHEMA_PATH);
             if (schemaPath == null || schemaPath.trim().isEmpty()) {
-                LOG.warn("Включён режим json-phoenix, но не задан путь схемы (h2k.schema.path) — переключаюсь на простой декодер");
-                return SimpleDecoder.INSTANCE;
+                throw new IllegalStateException(
+                    "Включён режим json-phoenix, но не задан обязательный параметр h2k.schema.path");
             }
             try {
                 SchemaRegistry schema = new JsonSchemaRegistry(schemaPath.trim());
@@ -247,15 +249,19 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
 
     /**
      * Подбирает начальную ёмкость для {@link LinkedHashMap} под ожидаемое число элементов
-     * с учётом коэффициента загрузки 0.75. Эквивалент выражению ⌈expected/0.75⌉ без операций с плавающей точкой.
+     * с учётом коэффициента загрузки 0.75. Эквивалент выражению {@code 1 + ceil(expected/0.75)}
+     * (= {@code 1 + ceil(4*expected/3)}) без операций с плавающей точкой.
+     * Минимум — 16; верхний кэп — {@code 1<<30}.
      *
      * @param expected ожидаемое число пар ключ‑значение
      * @return рекомендуемая начальная ёмкость
      */
     private static int capacityFor(int expected) {
         if (expected <= 0) return 16; // дефолтная начальная ёмкость
-        long cap = (expected * 4L) / 3L + 1L;
-        return cap >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) cap;
+        // 1 + ceil(4*expected/3) в целочисленной форме: 1 + (4*n + 2)/3
+        long cap = 1L + (4L * expected + 2L) / 3L;
+        // безопасный кэп для HashMap в Java 8
+        return cap > (1L << 30) ? (1 << 30) : (int) cap;
     }
 
     /**
@@ -265,7 +271,7 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
      *
      * @param cfg HBase-конфигурация (источник префиксных параметров)
      * @param bootstrap список брокеров Kafka (формат host:port[,host2:port2])
-     * @implNote Сборка properties вынесена в {@code ProducerPropsFactory.build(...)}.
+     * @implNote Сборка properties вынесена в {@code ProducerPropsFactory.build(...)}. Конфигурация cfg уже включает peer-CONFIG; приоритет peer над hbase-site.xml сохраняется.
      */
     private void setupProducer(Configuration cfg, String bootstrap) {
         Properties props = ProducerPropsFactory.build(cfg, bootstrap);
@@ -727,6 +733,11 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
             for (Map.Entry<String, String> e : cfg) {
                 final String k = e.getKey();
                 if (k.startsWith(prefix)) {
+                    // Пропускаем алиас: h2k.producer.max.in.flight уже замаплен на
+                    // max.in.flight.requests.per.connection, не нужно добавлять «неродной» ключ max.in.flight
+                    if ("h2k.producer.max.in.flight".equals(k)) {
+                        continue;
+                    }
                     final String real = k.substring(prefixLen);
                     props.putIfAbsent(real, e.getValue());
                 }

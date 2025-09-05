@@ -20,6 +20,7 @@ import java.util.Locale;
  *    кавычные — регистр сохраняется. Для удобства есть {@link #columnTypeRelaxed(TableName, String)}.
  *  - Default‑методы этого интерфейса выполняют проверку аргументов (fail‑fast) и бросают
  *    {@link NullPointerException} при {@code null} параметрах — это упрощает диагностику.
+ *  - Реестр не выполняет глобальных эвристик — только поиск по паре (table, qualifier) с нормализацией регистра (exact → UPPER → lower при необходимости).
  *
  * Потокобезопасность
  *  - Реализации должны быть потокобезопасными или неизменяемыми, т.к. вызываются из параллельных потоков RegionServer.
@@ -135,12 +136,16 @@ public interface SchemaRegistry {
 
     /**
      * Быстрая проверка наличия определения колонки в реестре (без релаксированного поиска).
+     * Выполняет fail‑fast валидацию аргументов согласно контракту интерфейса.
      *
      * @param table     имя таблицы, не {@code null}
      * @param qualifier имя колонки, не {@code null}
      * @return {@code true}, если тип найден; иначе {@code false}
+     * @throws NullPointerException если любой из параметров равен {@code null}
      */
     default boolean hasColumn(TableName table, String qualifier) {
+        java.util.Objects.requireNonNull(table, "table");
+        java.util.Objects.requireNonNull(qualifier, "qualifier");
         return columnType(table, qualifier) != null;
     }
 

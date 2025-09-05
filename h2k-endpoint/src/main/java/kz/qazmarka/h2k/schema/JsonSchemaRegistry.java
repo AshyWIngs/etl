@@ -50,6 +50,8 @@ import com.google.gson.reflect.TypeToken;
  *    для публикации корня и локальный {@link java.util.concurrent.ConcurrentMap}‑кэш по таблицам.
  *  - типы массивов Phoenix (например, "VARCHAR ARRAY") считаются корректными и не генерируют предупреждений;
  *  - default-namespace можно опускать: записи вида "DEFAULT:TBL" и "TBL" будут доступны при поиске.
+ *  - контракт аргументов: методы API требуют не-null параметров table/qualifier; при null выбрасывается {@link NullPointerException}.
+ *  - реестр не выполняет глобальных эвристик — только поиск по паре (table, qualifier) с нормализацией регистра и поддержкой короткого имени (после ':').
  */
 public final class JsonSchemaRegistry implements SchemaRegistry {
 
@@ -446,13 +448,15 @@ public final class JsonSchemaRegistry implements SchemaRegistry {
      * Возвращает строковый тип колонки (PHOENIX_TYPE_NAME) по таблице и имени колонки.
      * Поиск регистронезависимый: пробует исходный ключ, затем UPPER и lower.
      *
-     * @param table     имя таблицы
-     * @param qualifier имя колонки (любой регистр)
+     * @param table     имя таблицы, не {@code null}
+     * @param qualifier имя колонки (любой регистр), не {@code null}
      * @return тип или {@code null}, если не найдено
+     * @throws NullPointerException если любой из параметров равен {@code null}
      */
     @Override
     public String columnType(TableName table, String qualifier) {
-        if (qualifier == null || table == null) return null;
+        java.util.Objects.requireNonNull(table, "table");
+        java.util.Objects.requireNonNull(qualifier, "qualifier");
 
         final Map<String, String> cols = tableCache.computeIfAbsent(table, this::resolveColumnsForTable);
         if (cols.isEmpty()) return null;

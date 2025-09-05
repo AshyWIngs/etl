@@ -2,6 +2,7 @@ package kz.qazmarka.h2k.schema;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Objects;
 
 import org.apache.hadoop.hbase.TableName;
 
@@ -29,6 +30,7 @@ import org.apache.hadoop.hbase.TableName;
  * Контракт по входным данным
  *  - входные массивы рассматриваются как read‑only; реализация не должна их модифицировать
  *    и не должна кешировать ссылки дольше времени вызова (при необходимости делайте копию).
+ *  - параметры table и qualifier являются обязательными: при {@code null} выбрасывается {@link NullPointerException}.
  *
  * Исключения
  *  - checked‑исключения интерфейс не объявляет; при непарсируемых значениях допустимо
@@ -45,10 +47,13 @@ public interface Decoder {
      * Совместимая «медленная» перегрузка: декодирует значение по строковому имени колонки.
      * Преобразование qualifier в строку предполагает UTF‑8 на стороне вызывающего кода.
      *
-     * @param table     имя таблицы (может использоваться для выбора кодека по схеме)
-     * @param qualifier имя колонки (Phoenix qualifier), допускается {@code null}
+     * Контракт: параметры {@code table} и {@code qualifier} обязательны и не могут быть {@code null}.
+     *
+     * @param table     имя таблицы (может использоваться для выбора кодека по схеме), не {@code null}
+     * @param qualifier имя колонки (Phoenix qualifier), не {@code null}
      * @param value     сырые байты значения, допускается {@code null}
      * @return декодированное значение или {@code null}, если не удалось распознать
+     * @throws NullPointerException если {@code table} или {@code qualifier} равны {@code null}
      */
     Object decode(TableName table, String qualifier, byte[] value);
 
@@ -63,7 +68,7 @@ public interface Decoder {
      * если это безопасно для их контракта и вызывающая сторона не мутирует массив.
      *
      * @param table  имя таблицы
-     * @param qual   массив байт qualifier, допускается {@code null}
+     * @param qual   массив байт qualifier, не {@code null}
      * @param qOff   смещение qualifier в массиве
      * @param qLen   длина qualifier
      * @param value  массив байт значения, допускается {@code null}
@@ -74,10 +79,12 @@ public interface Decoder {
     default Object decode(TableName table,
                           byte[] qual, int qOff, int qLen,
                           byte[] value, int vOff, int vLen) {
-        final String qualifier;
+        Objects.requireNonNull(table, "table");
         if (qual == null) {
-            qualifier = null;
-        } else if (qOff == 0 && qLen == qual.length) {
+            throw new NullPointerException("qualifier");
+        }
+        final String qualifier;
+        if (qOff == 0 && qLen == qual.length) {
             // Быстрый путь: используем весь массив
             qualifier = new String(qual, StandardCharsets.UTF_8);
         } else {
@@ -102,12 +109,14 @@ public interface Decoder {
      * сохраняется в вызываемой перегрузке.
      *
      * @param table имя таблицы
-     * @param qual  массив байт qualifier (или {@code null})
-     * @param value массив байт значения (или {@code null})
+     * @param qual  массив байт qualifier, не {@code null}
+     * @param value массив байт значения (допускается {@code null})
      * @return декодированное значение или {@code null}
      */
     default Object decode(TableName table, byte[] qual, byte[] value) {
-        int qLen = (qual == null ? 0 : qual.length);
+        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(qual, "qualifier");
+        int qLen = qual.length;
         int vLen = (value == null ? 0 : value.length);
         return decode(table, qual, 0, qLen, value, 0, vLen);
     }
@@ -118,10 +127,11 @@ public interface Decoder {
      * и применять дефолт самостоятельно, чтобы исключить лишние аллокации.
      *
      * @param table        имя таблицы
-     * @param qualifier    имя колонки (как строка)
+     * @param qualifier    имя колонки (как строка), не {@code null}
      * @param value        байты значения
      * @param defaultValue значение по умолчанию
      * @return результат декодирования или {@code defaultValue}, если декодер вернул {@code null}
+     * @throws NullPointerException если {@code table} или {@code qualifier} равны {@code null}
      */
     default Object decodeOrDefault(TableName table, String qualifier, byte[] value, Object defaultValue) {
         Object v = decode(table, qualifier, value);

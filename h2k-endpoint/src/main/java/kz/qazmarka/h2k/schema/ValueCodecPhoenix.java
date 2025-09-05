@@ -37,14 +37,25 @@ import org.apache.phoenix.schema.types.PhoenixArray;
  * ValueCodecPhoenix — декодер значений колонок через Phoenix {@link PDataType}, опираясь на {@link SchemaRegistry}.
  *
  * Назначение
- *  • Обеспечивает точное соответствие семантике Phoenix (UNSIGNED‑типы, TIMESTAMP/DATE/TIME, ARRAY и т.п.).
- *  • Унифицирует результат: TIMESTAMP/DATE/TIME → epoch millis (long); любой Phoenix ARRAY → {@code List<Object>};
+ *  • Поддерживает семантику Phoenix для широкого набора типов (UNSIGNED‑типы, TIMESTAMP/DATE/TIME, ARRAY и т.п.).
+ *  • Унифицирует результат: TIMESTAMP/DATE/TIME → epoch millis (long); любой Phoenix ARRAY → {@code List&lt;Object&gt;};
  *    VARBINARY/BINARY → {@code byte[]} как есть; прочие типы — как вернул {@code PDataType}.
  *
- * Горячий путь и производительность
- *  • Для ускорения использует локальный кэш соответствий (table, qualifier) → {@code PDataType}.
+ * Строгая диагностика/исключения
+ *  • Если тип колонки известен (получен из {@link SchemaRegistry}), но байты не соответствуют формату,
+ *    метод {@link #decode(TableName, String, byte[])} выбрасывает {@link IllegalStateException} с контекстом
+ *    (таблица, колонка, тип). Это позволяет рано обнаруживать «битые» данные и ошибки конфигурации.
+ *  • Для фиксированных типов дополнительно проверяется длина байтового представления (getByteSize); при расхождении выбрасывается IllegalStateException.
+ *  • Входные {@code table} и {@code qualifier} обязательны: при {@code null} выбрасывается {@link NullPointerException}.
+ *  • Если тип колонки в реестре неизвестен, декодер один раз пишет WARN и использует {@code VARCHAR} как дефолт.
+ *  • Для массивов с неизвестным типом (не распознанным реестром/словариём) будет использован дефолтный VARCHAR; это, как правило, приведёт к ошибке декодирования, которая будет выброшена как IllegalStateException (с контекстом).
+ *
+ * Производительность и GC
+ *  • Двухуровневый кэш соответствий (table → qualifier → {@code PDataType}) минимизирует промахи в словарь типов
+ *    и аллокации на «горячем пути».
  *  • Нормализация строкового имени типа выполняется ровно один раз на колонку (при первом доступе).
- *  • Все преобразования массивов выполняются с минимальными аллокациями.
+ *  • Конвертация массивов делает минимум аллокаций: {@code Object[]} не копируются, примитивы боксируются линейно.
+ *  • В редких ветках (ошибки/неизвестные типы) формируются диагностические строки — это не влияет на быстрый путь.
  *
  * Логи
  *  • При неизвестном типе в реестре один раз для конкретной колонки пишет WARN и использует VARCHAR по умолчанию.
@@ -112,6 +123,8 @@ public final class ValueCodecPhoenix implements Decoder {
         m.put("TIME", PTime.INSTANCE);
         m.put("DATE", PDate.INSTANCE);
         m.put("VARCHAR ARRAY", PVarcharArray.INSTANCE);
+        m.put("CHARACTER VARYING ARRAY", PVarcharArray.INSTANCE); // ANSI-форма массива VARCHAR
+        m.put("STRING ARRAY", PVarcharArray.INSTANCE);            // синонимичная форма массива VARCHAR
         m.put("VARBINARY", PVarbinary.INSTANCE);
         m.put("BINARY", PBinary.INSTANCE);
         // Дополнительные синонимы/варианты записи, встречающиеся в реестрах/DDL
@@ -134,8 +147,8 @@ public final class ValueCodecPhoenix implements Decoder {
 
     /**
      * Быстрое разрешение {@link PDataType} для колонки с кэшированием по (table, qualifier).
-     * Применяет нормализацию строкового имени типа, использует {@link #TYPE_MAP}, поддерживает несколько синонимов.
-     * При неизвестном типе один раз пишет WARN и возвращает {@link PVarchar#INSTANCE}.
+     * Применяет нормализацию строкового имени типа, использует {@link #TYPE_MAP}, поддерживает синонимы и разные записи массивов.
+     * При неизвестном типе один раз пишет WARN (per колонка) и возвращает {@link PVarchar#INSTANCE}; последующие промахи идут в DEBUG.
      */
     private PDataType<?> resolvePType(TableName table, String qualifier) {
         // Верхний уровень по TableName — без аллокаций строк из TableName на каждом вызове
@@ -166,8 +179,11 @@ public final class ValueCodecPhoenix implements Decoder {
     }
 
     /**
-     * Компактный ключ кэша: имена namespace/таблицы/квалификатора в виде строк + предвычисленный хеш.
-     * Избегаем хранения ссылок на тяжёлые объекты и уменьшаем стоимость {@link #hashCode()}.
+     * Компактный ключ для «warn-once» по неизвестным типам.
+     * Содержит имена namespace/таблицы/квалификатора в виде строк + предвычисленный хеш.
+     * Почему не {@link TableName}:
+     *  • не хотим держать лишние ссылки на тяжёлые объекты в долгоживущих структурах;
+     *  • предвычисленный hash удешевляет {@link #hashCode()} и сравнение в наборах.
      */
     private static final class ColKey {
         final String ns;
@@ -201,9 +217,14 @@ public final class ValueCodecPhoenix implements Decoder {
      *
      * Унификация результата
      *  • TIMESTAMP/DATE/TIME → миллисекунды epoch (long);
-     *  • любой Phoenix ARRAY → {@code List<Object>} (без копии для Object[], минимальная коробка для примитивов);
+     *  • любой Phoenix ARRAY → {@code List&lt;Object&gt;} (без копии для Object[], минимальная коробка для примитивов);
      *  • VARBINARY/BINARY → {@code byte[]} как есть;
      *  • прочие типы возвращаются как есть (строки/числа/Boolean), как их выдал {@link PDataType}.
+     *
+     * Контракты и ошибки
+     *  • {@code value == null} → возвращается {@code null} без попытки декодирования;
+     *  • при несовпадении объявленного типа и фактических байтов — {@link IllegalStateException} с контекстом;
+     *  • {@code table} и {@code qualifier} обязательны (при {@code null} — {@link NullPointerException}).
      *
      * @param table     имя таблицы (не {@code null})
      * @param qualifier имя колонки (не {@code null})
@@ -221,6 +242,17 @@ public final class ValueCodecPhoenix implements Decoder {
 
         // Получаем PDataType из локального кэша
         final PDataType<?> t = resolvePType(table, qualifier);
+
+        // Предварительная быстрая валидация длины для фиксированных типов Phoenix (int/long/boolean/...).
+        // Это позволяет рано выявить ситуацию, когда байты принадлежат другому типу (например, VARCHAR),
+        // и избежать "тихих" неверных декодирований. Накладные расходы нулевые на горячем пути.
+        final Integer expectedSize = t.getByteSize();
+        if (expectedSize != null && expectedSize.intValue() != value.length) {
+            throw new IllegalStateException(
+                "Несоответствие длины значения для " + table + "." + qualifier
+                + ": тип=" + t + " ожидает " + expectedSize + " байт(а), получено " + value.length
+            );
+        }
 
         // Преобразуем байты через Phoenix-тип, чтобы сохранить семантику Phoenix; добавляем диагностический контекст
         final Object obj;
@@ -341,7 +373,7 @@ public final class ValueCodecPhoenix implements Decoder {
     /**
      * Канонизирует строковое имя Phoenix‑типа: UPPERCASE (Locale.ROOT), удаление параметров в скобках,
      * унификация массивов к форме "BASE ARRAY", замена подчёркиваний на пробелы и схлопывание пробелов.
-     * Пустая или {@code null} строка даёт {@code VARCHAR}.
+     * Пустая или {@code null} строка даёт {@code VARCHAR}. Все операции — без RegEx и с минимумом аллокаций.
      */
     private static String normalizeTypeName(String typeName) {
         String t = typeName == null ? "" : typeName.trim().toUpperCase(Locale.ROOT);
@@ -383,7 +415,7 @@ public final class ValueCodecPhoenix implements Decoder {
         return t;
     }
 
-    /** Схлопывает последовательности пробелов/табов/переводов строк до одного пробела без использования RegEx. */
+    /** Схлопывает последовательности пробельных символов до одного пробела без RegEx и лишних аллокаций. */
     private static String collapseSpaces(String t) {
         StringBuilder sb = new StringBuilder(t.length());
         boolean space = false;

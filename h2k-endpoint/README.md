@@ -207,16 +207,14 @@ h2k.capacity.hints = TBL_JTI_TRACE_CIS_HISTORY=32,AGG.INC_DOCS_ACT=18
 
 ### Включение репликации нужных CF (в HBase shell)
 
-```
-# HBase shell
+```HBase shell
 # Пример: TBL_JTI_TRACE_CIS_HISTORY, включаем CF 'd'
 disable 'TBL_JTI_TRACE_CIS_HISTORY'
 alter  'TBL_JTI_TRACE_CIS_HISTORY', { NAME => 'd', REPLICATION_SCOPE => 1 }
 enable 'TBL_JTI_TRACE_CIS_HISTORY'
 ```
 
-```
-# HBase shell
+```HBase shell
 # Пример: таблица RECEIPT, включаем 'b' и 'd'
 disable 'RECEIPT'
 alter  'RECEIPT', { NAME => 'b', REPLICATION_SCOPE => 1 }
@@ -424,8 +422,7 @@ Environment="HBASE_OPTS=${HBASE_OPTS} -Dh2k.log.dir=/opt/hbase-default-current/l
 
 1. **Пир виден и включён в HBase.**  
    В HBase shell:
-   ```
-   # HBase shell
+   ```HBase shell
    list_peers
    ```
    Убедитесь, что ваш peer в состоянии **ENABLED**, очереди не растут аномально.

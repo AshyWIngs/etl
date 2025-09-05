@@ -7,6 +7,10 @@ import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -164,5 +168,99 @@ class SchemaRegistryTest {
 
     private static MapRegistryBuilder mapRegistry() {
         return new MapRegistryBuilder();
+    }
+
+    @Test
+    @DisplayName("Relaxed-приоритет: exact > UPPER > lower при одновременном наличии")
+    void relaxedPriorityOrder() {
+        SchemaRegistry r = mapRegistry()
+                .put("DEFAULT:TBL_JTI_TRACE_CIS_HISTORY", "baz", "LOW")     // lower
+                .put("DEFAULT:TBL_JTI_TRACE_CIS_HISTORY", "BAZ", "UP")      // UPPER
+                .put("DEFAULT:TBL_JTI_TRACE_CIS_HISTORY", "BaZ", "EXACT")   // exact
+                .build();
+
+        // exact должен побеждать
+        assertEquals("EXACT", r.columnTypeRelaxed(TBL, "BaZ"));
+
+        // Здесь exact есть для "baz" в lower → по правилу exact > UPPER > lower берём его (LOW)
+        SchemaRegistry r2 = mapRegistry()
+                .put("DEFAULT:TBL_JTI_TRACE_CIS_HISTORY", "baz", "LOW")   // lower (exact для входа "baz")
+                .put("DEFAULT:TBL_JTI_TRACE_CIS_HISTORY", "BAZ", "UP")    // UPPER
+                .build();
+        assertEquals("LOW", r2.columnTypeRelaxed(TBL, "baz"));
+    }
+
+    @Test
+    @DisplayName("hasColumn: NPE на null table/qualifier (fail-fast)")
+    void hasExactNullChecks() {
+        SchemaRegistry r = SchemaRegistry.empty();
+        assertThrows(NullPointerException.class, () -> r.hasColumn(null, "q"));
+        assertThrows(NullPointerException.class, () -> r.hasColumn(TBL, null));
+    }
+
+    @Test
+    @DisplayName("columnTypeOrDefaultRelaxed: при наличии exact (lower) возвращает его (а не default)")
+    void orDefaultRelaxedPrefersUpper() {
+        SchemaRegistry r = mapRegistry()
+                .put("DEFAULT:TBL_JTI_TRACE_CIS_HISTORY", "FOO", "INT")
+                .put("DEFAULT:TBL_JTI_TRACE_CIS_HISTORY", "foo", "BIGINT")
+                .build();
+
+        // В реестре есть exact (lower) для "foo" → вернуть его, а не default
+        assertEquals("BIGINT", r.columnTypeOrDefaultRelaxed(TBL, "foo", "DECIMAL"));
+    }
+
+    @Test
+    @DisplayName("Параллельный relaxed‑поиск: без исключений и с ожидаемыми результатами")
+    void relaxedLookupConcurrencySmoke() throws InterruptedException {
+        // Подготовим реестр с множеством кейсов по регистру
+        MapRegistryBuilder b = mapRegistry();
+        for (int i = 0; i < 100; i++) {
+            String base = "K" + i;
+            b.put(TBL.getNameAsString(), base, "UP_" + i);          // UPPER
+            b.put(TBL.getNameAsString(), base.toLowerCase(), "LO_" + i); // lower
+        }
+        final SchemaRegistry r = b.build();
+
+        final int threads = 8;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch latch = new CountDownLatch(threads);
+        AtomicReference<Throwable> firstError = new AtomicReference<>();
+
+        for (int t = 0; t < threads; t++) {
+            final int offset = t;
+            pool.execute(() -> {
+                try {
+                    for (int j = 0; j < 500; j++) {
+                        int i = (j + offset) % 100;
+                        String qLower = ("K" + i).toLowerCase();
+                        String qUpper = ("K" + i);
+
+                        // relaxed для нижнего регистра → должен выбрать lower-вариант
+                        assertEquals("LO_" + i, r.columnTypeRelaxed(TBL, qLower));
+                        assertTrue(r.hasColumnRelaxed(TBL, qLower));
+
+                        // relaxed для верхнего регистра → exact сразу
+                        assertEquals("UP_" + i, r.columnTypeRelaxed(TBL, qUpper));
+                        assertTrue(r.hasColumnRelaxed(TBL, qUpper));
+                    }
+                } catch (Throwable e) {
+                    firstError.compareAndSet(null, e);
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        latch.await();
+        pool.shutdownNow();
+
+        if (firstError.get() != null) {
+            // Перебрасываем первую ошибку, чтобы тест корректно упал с причиной
+            if (firstError.get() instanceof AssertionError) {
+                throw (AssertionError) firstError.get();
+            }
+            fail(firstError.get());
+        }
     }
 }

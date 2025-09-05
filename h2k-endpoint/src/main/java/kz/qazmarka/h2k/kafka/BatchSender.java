@@ -43,6 +43,7 @@ import org.slf4j.LoggerFactory;
 public final class BatchSender implements AutoCloseable {
     /** Логгер класса. Все сообщения — на русском языке. */
     private static final Logger LOG = LoggerFactory.getLogger(BatchSender.class);
+    /** Сообщение об истечении общего дедлайна ожидания подтверждений (общий таймаут на набор futures). */
     private static final String TIMEOUT_MSG = "Таймаут ожидания подтверждений от Kafka";
 
     /** Сколько отправок накапливать перед ожиданием подтверждений. */
@@ -178,6 +179,8 @@ public final class BatchSender implements AutoCloseable {
      * Исключения в «тихом» режиме не пробрасываются (см. {@link #tryFlush()});
      * для строгой семантики используйте {@link #flush()}.
      *
+     * В случае неуспеха «тихого» авто‑сброса буфер не очищается; повторные авто‑сбросы временно подавляются до успешного {@link #flush()} или {@link #tryFlush()}.
+     *
      * @param futures коллекция futures на подтверждение; null‑элементы пропускаются, пустая коллекция игнорируется
      */
     public void addAll(Collection<? extends Future<RecordMetadata>> futures) {
@@ -191,12 +194,11 @@ public final class BatchSender implements AutoCloseable {
         int remainingToThreshold = initialRemainingForAddAll();
 
         for (Future<RecordMetadata> f : futures) {
-            if (f == null) {
-                continue;
-            }
-            sent.add(f);
-            if (--remainingToThreshold == 0) {
-                remainingToThreshold = autoFlushSuspended ? Integer.MAX_VALUE : tryAutoQuietFlush("addAll/iter");
+            if (f != null) {
+                sent.add(f);
+                if (--remainingToThreshold == 0) {
+                    remainingToThreshold = autoFlushSuspended ? Integer.MAX_VALUE : tryAutoQuietFlush("addAll/iter");
+                }
             }
         }
         // Остаток < awaitEvery оставляем в буфере — поведение идентично множественным add()
@@ -372,29 +374,7 @@ public final class BatchSender implements AutoCloseable {
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
         int ok = 0;
         for (int idx = 0, n = sent.size(); idx < n; idx++) {
-            Future<RecordMetadata> f = sent.get(idx);
-            if (f == null) {
-                continue;
-            }
-            long leftNs = deadlineNs - System.nanoTime();
-            if (leftNs <= 0L) {
-                throw new java.util.concurrent.TimeoutException(TIMEOUT_MSG);
-            }
-            try {
-                f.get(leftNs, TimeUnit.NANOSECONDS);
-                ok++;
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                if (dbg) {
-                    LOG.debug("flushUpToFirstFailure() прерван на индексе {}", ok, ie);
-                }
-                throw ie;
-            } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) {
-                if (dbg) {
-                    LOG.debug("flushUpToFirstFailure() первый сбой на индексе {}", ok, e);
-                }
-                throw e;
-            }
+            ok += awaitWithDebug(sent.get(idx), deadlineNs, dbg, ok);
         }
         return ok;
     }
@@ -404,30 +384,35 @@ public final class BatchSender implements AutoCloseable {
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
         int ok = 0;
         for (Future<RecordMetadata> f : sent) {
-            if (f == null) {
-                continue;
-            }
-            long leftNs = deadlineNs - System.nanoTime();
-            if (leftNs <= 0L) {
-                throw new java.util.concurrent.TimeoutException(TIMEOUT_MSG);
-            }
-            try {
-                f.get(leftNs, TimeUnit.NANOSECONDS);
-                ok++;
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                if (dbg) {
-                    LOG.debug("flushUpToFirstFailure() прерван на индексе {}", ok, ie);
-                }
-                throw ie;
-            } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) {
-                if (dbg) {
-                    LOG.debug("flushUpToFirstFailure() первый сбой на индексе {}", ok, e);
-                }
-                throw e;
-            }
+            ok += awaitWithDebug(f, deadlineNs, dbg, ok);
         }
         return ok;
+    }
+
+    /**
+     * Ожидает один future c логированием причин сбоя (только при dbg=true).
+     * Возвращает 1, если подтверждение получено; 0 — если f == null.
+     */
+    private int awaitWithDebug(Future<RecordMetadata> f, long deadlineNs, boolean dbg, int okSoFar)
+            throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
+        if (f == null) {
+            return 0;
+        }
+        try {
+            awaitOne(f, deadlineNs);
+            return 1;
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            if (dbg) {
+                LOG.debug("flushUpToFirstFailure() прерван на индексе {}", okSoFar, ie);
+            }
+            throw ie;
+        } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) {
+            if (dbg) {
+                LOG.debug("flushUpToFirstFailure() первый сбой на индексе {}", okSoFar, e);
+            }
+            throw e;
+        }
     }
 
     /**

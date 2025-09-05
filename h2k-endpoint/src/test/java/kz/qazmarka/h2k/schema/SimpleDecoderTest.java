@@ -1,25 +1,29 @@
 package kz.qazmarka.h2k.schema;
 
 import org.apache.hadoop.hbase.TableName;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.Arrays;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Юнит‑тесты для {@link SimpleDecoder}.
+ * Консолидированный набор юнит‑тестов для {@link SimpleDecoder}.
  *
- * Назначение:
- *  • Зафиксировать zero‑copy контракт: метод возвращает ту же ссылку на входной byte[].
- *  • Проверить поведение для null и пустых массивов.
- *  • Smoke‑тест потокобезопасности (отсутствие состояния).
+ * Цели:
+ *  1) Позитив: zero‑copy контракт, null/empty, удобные перегрузки.
+ *  2) Негатив: строгий NPE при null table/qualifier во всех перегрузках.
+ *  3) Потокобезопасность: smoke‑тест на отсутствие состояния и аллокаций сверх входных.
  *
- * Технические детали:
- *  • JUnit 5 (Jupiter); совместимо с Java 8 — без использования 'var' и API Java 9+.
- *  • Без файлового ввода/вывода и сетевых зависимостей; тесты быстрые и детерминированные.
+ * Ограничения:
+ *  - JUnit 5 (Jupiter); совместимо с Java 8 — без 'var' и API Java 9+.
+ *  - Без файлового ввода/вывода и сетевых зависимостей; тесты быстрые и детерминированные.
  */
 class SimpleDecoderTest {
 
@@ -27,39 +31,91 @@ class SimpleDecoderTest {
     private static final TableName TBL = TableName.valueOf("DEFAULT", "DUMMY");
     private static final String Q = "q";
 
-    /**
-     * Возвращается та же ссылка (zero-copy), копирования нет.
-     */
-    @Test
-    void returnsSameReference() {
-        byte[] data = new byte[] {1, 2, 3};
-        Object decoded = DEC.decode(TBL, Q, data);
-        assertTrue(decoded instanceof byte[]);
-        assertSame(data, decoded, "Должна вернуться та же ссылка на массив (zero-copy)");
+    // --- Позитивные сценарии
+
+    @Nested
+    @DisplayName("Позитивные сценарии")
+    class Positive {
+
+        /** Возвращается та же ссылка (zero-copy), копирования нет. */
+        @Test
+        void returnsSameReference() {
+            byte[] data = new byte[] {1, 2, 3};
+            Object decoded = DEC.decode(TBL, Q, data);
+            assertTrue(decoded instanceof byte[]);
+            assertSame(data, decoded, "Должна вернуться та же ссылка на массив (zero-copy)");
+        }
+
+        /** Null-вход возвращает null. */
+        @Test
+        void nullReturnsNull() {
+            assertNull(DEC.decode(TBL, Q, null));
+        }
+
+        /** Пустой массив возвращается как есть (без копирования). */
+        @Test
+        void emptyArrayIsNotCopied() {
+            byte[] empty = new byte[0];
+            Object decoded = DEC.decode(TBL, Q, empty);
+            assertSame(empty, decoded);
+        }
+
+        /** Перегрузка с byte[] qualifier: также zero-copy. */
+        @Test
+        void byteQualifierOverloadZeroCopy() {
+            byte[] qual = Q.getBytes(StandardCharsets.UTF_8);
+            byte[] data = new byte[] {4,5,6};
+            Object decoded = DEC.decode(TBL, qual, data);
+            assertSame(data, decoded);
+        }
+
+        /** decodeOrDefault: null → default; not-null → исходный объект (same reference). */
+        @Test
+        void decodeOrDefaultBehavior() {
+            byte[] def = new byte[] {9};
+            assertSame(def, DEC.decodeOrDefault(TBL, Q, null, def));
+            byte[] data = new byte[] {7,7,7};
+            assertSame(data, DEC.decodeOrDefault(TBL, Q, data, def));
+        }
+
+        /** Быстрая перегрузка: длинный qualifier (8КБ) + zero-copy для value */
+        @Test
+        void longQualifierFastOverloadZeroCopy() {
+            byte[] qual = new byte[8 * 1024];
+            Arrays.fill(qual, (byte) 'q');
+            byte[] data = new byte[] {10, 20, 30, 40};
+            Object decoded = DEC.decode(TBL, qual, data);
+            assertSame(data, decoded, "Должна вернуться та же ссылка на массив значения (zero-copy) при длинном qualifier");
+        }
     }
 
-    /**
-     * Null-вход возвращает null.
-     */
-    @Test
-    void nullReturnsNull() {
-        assertNull(DEC.decode(TBL, Q, null));
+    // --- Негативные сценарии
+
+    @Nested
+    @DisplayName("Негативные сценарии")
+    class Negative {
+
+        /** NPE при null table/qualifier в строковой перегрузке. */
+        @Test
+        void npeOnNullArgsStringOverload() {
+            byte[] bytes = new byte[] {1};
+            assertThrows(NullPointerException.class, () -> ((Decoder) DEC).decode(null, Q, bytes));
+            assertThrows(NullPointerException.class, () -> ((Decoder) DEC).decode(TBL, (String) null, bytes));
+        }
+
+        /** NPE при null table/qualifier в перегрузке с byte[] qualifier. */
+        @Test
+        void npeOnNullArgsByteArrayOverload() {
+            byte[] bytes = new byte[] {1};
+            byte[] qual = Q.getBytes(StandardCharsets.UTF_8);
+            assertThrows(NullPointerException.class, () -> DEC.decode(null, qual, bytes));
+            assertThrows(NullPointerException.class, () -> DEC.decode(TBL, (byte[]) null, bytes));
+        }
     }
 
-    /**
-     * Пустой массив возвращается как есть (без копирования).
-     */
-    @Test
-    void emptyArrayIsNotCopied() {
-        byte[] empty = new byte[0];
-        Object decoded = DEC.decode(TBL, Q, empty);
-        assertSame(empty, decoded);
-    }
+    // --- Потокобезопасность
 
-    /**
-     * Потокобезопасность: множество одновременных вызовов не должны падать.
-     * (Никаких аллокаций сверх входных, состояние не хранится.)
-     */
+    /** Потокобезопасность: множество одновременных вызовов не должны падать. */
     @Test
     void threadSafetySmoke() throws InterruptedException {
         int threads = 8;
@@ -81,6 +137,6 @@ class SimpleDecoderTest {
         }
 
         latch.await();
-        pool.shutdown();
+        pool.shutdownNow();
     }
 }

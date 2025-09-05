@@ -57,12 +57,12 @@ public final class H2kConfig {
     private static final String K_PAYLOAD_INCLUDE_META = "h2k.payload.include.meta";
     private static final String K_PAYLOAD_INCLUDE_META_WAL = "h2k.payload.include.meta.wal";
     private static final String K_FILTER_WAL_MIN_TS = "h2k.filter.wal.min.ts";
-    private static final String K_TOPIC_ENSURE = "h2k.topic.ensure";
+    private static final String K_TOPIC_ENSURE = "h2k.ensure.topics";
     private static final String K_TOPIC_PARTITIONS = "h2k.topic.partitions";
-    private static final String K_TOPIC_REPLICATION_FACTOR = "h2k.topic.replication.factor";
+    private static final String K_TOPIC_REPLICATION_FACTOR = "h2k.topic.replication";
     private static final String K_ADMIN_TIMEOUT_MS = "h2k.admin.timeout.ms";
     private static final String K_ADMIN_CLIENT_ID = "h2k.admin.client.id";
-    private static final String K_TOPIC_UNKNOWN_BACKOFF_MS = "h2k.topic.ensure.unknown.backoff.ms";
+    private static final String K_TOPIC_UNKNOWN_BACKOFF_MS = "h2k.ensure.unknown.backoff.ms";
     private static final String K_PRODUCER_AWAIT_EVERY = "h2k.producer.await.every";
     private static final String K_PRODUCER_AWAIT_TIMEOUT_MS = "h2k.producer.await.timeout.ms";
     private static final String K_SALT_MAP = "h2k.salt.map";
@@ -127,6 +127,12 @@ public final class H2kConfig {
          * где TABLE — "namespace:qualifier" или просто "qualifier".
          */
         public static final String CAPACITY_HINT_PREFIX = "h2k.capacity.hint.";
+        /**
+         * CSV с подсказками ёмкости корневого JSON по таблицам.
+         * Формат: h2k.capacity.hints = "TABLE=keys[,NS:TABLE=keys2,...]".
+         * Значение "keys" — ожидаемое число не-null полей (см. README).
+         */
+        public static final String CAPACITY_HINTS = "h2k.capacity.hints";
     }
 
     // ==== Значения по умолчанию (в одном месте) ====
@@ -549,12 +555,28 @@ public final class H2kConfig {
                 .build();
     }
     /**
-     * Парсит h2k.capacity.hint.* в карту { имя_таблицы → ожидаемая_ёмкость }.
+     * Парсит h2k.capacity.hints (CSV) и h2k.capacity.hint.* в карту { имя_таблицы → ожидаемая_ёмкость }.
      * Значения ≤0 игнорируются. Допускаются ключи как по полному имени (ns:qualifier), так и по одному qualifier.
      */
     private static Map<String, Integer> readCapacityHints(Configuration cfg) {
-        final String prefix = Keys.CAPACITY_HINT_PREFIX;
         Map<String, Integer> out = new java.util.HashMap<>();
+
+        // 1) CSV-вариант: h2k.capacity.hints=TABLE=keys[,NS:TABLE=keys2,...]
+        String raw = cfg.get(Keys.CAPACITY_HINTS);
+        if (raw != null && !raw.trim().isEmpty()) {
+            String[] tokens = raw.split(",");
+            for (String t : tokens) {
+                if (t != null) {
+                    String s = t.trim();
+                    if (!s.isEmpty()) {
+                        addCapacityHintCsvToken(out, s);
+                    }
+                }
+            }
+        }
+
+        // 2) Индивидуальные ключи с префиксом h2k.capacity.hint.TABLE = int
+        final String prefix = Keys.CAPACITY_HINT_PREFIX;
         for (Map.Entry<String, String> e : cfg) {
             addCapacityHint(out, e.getKey(), e.getValue(), prefix);
         }
@@ -572,6 +594,24 @@ public final class H2kConfig {
         int parsed = parseIntSafe(val, -1);
         if (parsed > 0) {
             out.put(up(table), parsed);
+        }
+    }
+
+    /**
+     * Разбирает один CSV-токен подсказки ёмкости формата "TABLE=keys" или "NS:TABLE=keys"
+     * и добавляет его в карту при корректном положительном значении keys.
+     */
+    private static void addCapacityHintCsvToken(Map<String, Integer> out, String token) {
+        int eq = token.lastIndexOf('=');
+        if (eq <= 0 || eq >= token.length() - 1) {
+            return; // нет пары key=value
+        }
+        String name = token.substring(0, eq).trim();
+        String val = token.substring(eq + 1).trim();
+        if (name.isEmpty() || val.isEmpty()) return;
+        int parsed = parseIntSafe(val, -1);
+        if (parsed > 0) {
+            out.put(up(name), parsed);
         }
     }
     /**
@@ -765,6 +805,7 @@ public final class H2kConfig {
     }
 
     /**
+     * Для namespace "default" префикс не добавляется (см. правила по h2k.topic.pattern).
      * Формирует имя Kafka‑топика по заданному шаблону {@link #topicPattern} с подстановкой
      * плейсхолдеров и санитизацией по правилам Kafka (замена недопустимых символов на "_",
      * обрезка до {@link #topicMaxLength}).
@@ -774,9 +815,12 @@ public final class H2kConfig {
     public String topicFor(TableName table) {
         String ns = table.getNamespaceAsString();
         String qn = table.getQualifierAsString();
+        // для namespace "default" префикс не пишем
+        String tableAtom = "default".equals(ns) ? qn : (ns + "_" + qn);
+        String nsAtom = "default".equals(ns) ? "" : ns;
         String base = topicPattern
-                .replace(PLACEHOLDER_TABLE, ns + "_" + qn)
-                .replace(PLACEHOLDER_NAMESPACE, ns)
+                .replace(PLACEHOLDER_TABLE, tableAtom)
+                .replace(PLACEHOLDER_NAMESPACE, nsAtom)
                 .replace(PLACEHOLDER_QUALIFIER, qn);
         String sanitized = TOPIC_SANITIZE.matcher(base).replaceAll("_");
         if (sanitized.length() > topicMaxLength) {
