@@ -243,15 +243,15 @@
       include.rowkey    — добавлять rowkey (ниже можно выбрать формат BASE64/HEX)
   -->
   <property>
-    <name>h2k.include.meta</name>
+    <name>h2k.payload.include.meta</name>
     <value>false</value>
   </property>
   <property>
-    <name>h2k.include.meta.wal</name>
+    <name>h2k.payload.include.meta.wal</name>
     <value>false</value>
   </property>
   <property>
-    <name>h2k.include.rowkey</name>
+    <name>h2k.payload.include.rowkey</name>
     <value>false</value>
   </property>
   <property>

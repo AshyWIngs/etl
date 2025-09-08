@@ -37,6 +37,11 @@ add_peer 'h2k_reliable',
       'h2k.schema.path'                     => '/opt/hbase-default-current/conf/schema.json',
       'h2k.json.serialize.nulls'            => 'false',
 
+      # Метаполя в полезной нагрузке
+      'h2k.payload.include.meta'           => 'false',
+      'h2k.payload.include.meta.wal'       => 'false',
+      'h2k.payload.include.rowkey'         => 'false',
+
       # RowKey/соль/подсказки ёмкости (для DEFAULT namespace имя без префикса)
       'h2k.rowkey.encoding'                 => 'BASE64',
       'h2k.salt.map'                        => 'TBL_JTI_TRACE_CIS_HISTORY=1',

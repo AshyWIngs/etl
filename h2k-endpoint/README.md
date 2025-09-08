@@ -58,9 +58,9 @@ mvn -q test -Dtest=Value*Test    # выборочно
 1. Скопируйте JAR на **все RegionServer** в каталог **`/opt/hbase-default-current/lib/`**.  
    Если используете другой путь — добавьте его в `HBASE_CLASSPATH`.
 2. Убедитесь, что на RS установлены зависимости **с `scope=provided`**:
-   - `kafka-clients-2.3.1.jar`  
-   - `lz4-java-1.6.0+.jar`  
-   - `snappy-java-1.1.x+.jar`  (если используете `compression.type=snappy`)
+   - `kafka-clients-2.3.1.jar`  (Для всех peer)
+   - `lz4-java-1.6.0+.jar`      (Только для peer FAST (макс. скорость) и BALANCED (компромисс))
+   - `snappy-java-1.1.x+.jar`   (Только для peer RELIABLE (надёжность), если используете `compression.type=snappy`)
    Проверка:
    ```bash
    hbase classpath | tr ':' '\n' | egrep -i 'kafka-clients|lz4|snappy'
@@ -130,9 +130,9 @@ h2k.topic.pattern=${table}
 | `h2k.decode.mode` | `simple` | enum | KafkaReplicationEndpoint | Режим декодирования: `simple` или `json-phoenix` |
 | `h2k.schema.path` | — | путь | JsonSchemaRegistry | Путь к единственному файлу `schema.json`. Используется только в режиме `json-phoenix`. |
 | `h2k.json.serialize.nulls` | `false` | boolean | Gson в Endpoint | Добавлять ли `null` в JSON |
-| `h2k.include.meta` | `false` | boolean | PayloadBuilder | Добавлять служебные поля (+8 ключей) |
-| `h2k.include.meta.wal` | `false` | boolean | PayloadBuilder | Добавлять WAL‑метаданные (+2 ключа) |
-| `h2k.include.rowkey` | `false` | boolean | PayloadBuilder | Включать rowkey (+1 ключ) |
+| `h2k.payload.include.meta` | `false` | boolean | PayloadBuilder | Добавлять служебные поля (+8 ключей) |
+| `h2k.payload.include.meta.wal` | `false` | boolean | PayloadBuilder | Добавлять WAL‑метаданные (+2 ключа) |
+| `h2k.payload.include.rowkey` | `false` | boolean | PayloadBuilder | Включать rowkey (+1 ключ) |
 | `h2k.rowkey.encoding` | `BASE64` | enum | PayloadBuilder | Формат rowkey: `BASE64` или `HEX` (используется только если `include.rowkey=true`) |
 | `h2k.filter.by.wal.ts` | `false` | boolean | KafkaReplicationEndpoint | Включить фильтрацию по минимальному WAL‑времени |
 | `h2k.wal.min.ts` (мс) | `-1` | миллисекунды epoch | KafkaReplicationEndpoint | Минимальный `timestamp`; применяется при `filter.by.wal.ts=true` |
@@ -181,13 +181,13 @@ h2k.topic.pattern=${table}
 **Как считать hint для таблицы:**  
 Возьмите «типичный максимум не‑`null` полей» в ваших данных **по выбранным CF**, и **если включены мета‑поля**, добавьте:
 
-- если `h2k.include.meta=true` → `+8` ключей: `_table,_namespace,_qualifier,_cf,_cells_total,_cells_cf,event_version,delete`;
-- если `h2k.include.meta.wal=true` → `+2` ключа: `_wal_seq,_wal_write_time`;
-- если `h2k.include.rowkey=true` → `+1` ключ: `rowkey` (`hex` или `base64`).
+- если `h2k.payload.include.meta=true` → `+8` ключей: `_table,_namespace,_qualifier,_cf,_cells_total,_cells_cf,event_version,delete`;
+- если `h2k.payload.include.meta.wal=true` → `+2` ключа: `_wal_seq,_wal_write_time`;
+- если `h2k.payload.include.rowkey=true` → `+1` ключ: `rowkey` (`hex` или `base64`).
 
 **Пример:**  
 Таблица `TBL_JTI_TRACE_CIS_HISTORY` имеет 32 логических поля.  
-При текущих настройках (`h2k.include.meta=false`, `h2k.include.meta.wal=false`, `h2k.include.rowkey=false`) разумный hint — **`32`**.  
+При текущих настройках (`h2k.payload.include.meta=false`, `h2k.payload.include.meta.wal=false`, `h2k.payload.include.rowkey=false`) разумный hint — **`32`**.  
 Если позже включите базовые мета‑поля и rowkey, станет `32 + 8 + 1 = 41`. Для запаса можно округлять вверх до ближайшей «красивой» величины (например, 44).
 
 **Где задавать:**  

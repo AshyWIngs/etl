@@ -251,7 +251,8 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
      * Подбирает начальную ёмкость для {@link LinkedHashMap} под ожидаемое число элементов
      * с учётом коэффициента загрузки 0.75. Эквивалент выражению {@code 1 + ceil(expected/0.75)}
      * (= {@code 1 + ceil(4*expected/3)}) без операций с плавающей точкой.
-     * Минимум — 16; верхний кэп — {@code 1<<30}.
+     * Для неположительных значений {@code expected} возвращает 16 (дефолтную начальную ёмкость);
+     * верхний кэп — {@code 1<<30}.
      *
      * @param expected ожидаемое число пар ключ‑значение
      * @return рекомендуемая начальная ёмкость
@@ -434,10 +435,10 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
     private static WalMeta readWalMeta(WAL.Entry entry) {
         long walSeq = -1L;
         long walWriteTime = -1L;
-        try { walSeq = entry.getKey().getSequenceId(); } catch (NoSuchMethodError | Exception ignore) {
+        try { walSeq = entry.getKey().getSequenceId(); } catch (NoSuchMethodError | AbstractMethodError | IOException ignore) {
             // В HBase 1.4 метод может отсутствовать — безопасно игнорируем
         }
-        try { walWriteTime = entry.getKey().getWriteTime(); } catch (NoSuchMethodError | Exception ignore) {
+        try { walWriteTime = entry.getKey().getWriteTime(); } catch (NoSuchMethodError | AbstractMethodError ignore) {
             // В HBase 1.4 метод может отсутствовать — безопасно игнорируем
         }
         return new WalMeta(walSeq, walWriteTime);
@@ -631,14 +632,19 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
      */
     private byte[] toJsonBytes(Map<String, Object> obj) {
         jsonOut.reset();
-        gson.toJson(obj, jsonWriter);
         try {
-            jsonWriter.flush(); // ByteArrayOutputStream: IO ошибок быть не должно
-        } catch (IOException ioe) {
-            // Невозможный для BAOS сценарий: конвертируем в unchecked без логирования на горячем пути
-            throw new IllegalStateException("JSON flush over BAOS неожиданно завершился IOException", ioe);
+            gson.toJson(obj, jsonWriter);
+            jsonWriter.flush(); // Writer → BAOS
+            return jsonOut.toByteArray();
+        } catch (java.io.IOException ex) {
+            // Редкая ситуация: ошибка при записи/flush в Writer. Не роняем поток, логируем и уходим в безопасный фолбэк.
+            LOG.warn("JSON через Writer не удался ({}), fallback на toJson(obj): {}",
+                    ex.getClass().getSimpleName(), ex.toString());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Stacktrace JSON(Writer) failure:", ex);
+            }
+            return gson.toJson(obj).getBytes(java.nio.charset.StandardCharsets.UTF_8);
         }
-        return jsonOut.toByteArray();
     }
 
 

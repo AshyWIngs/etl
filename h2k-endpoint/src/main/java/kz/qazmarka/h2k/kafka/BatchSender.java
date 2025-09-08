@@ -46,6 +46,7 @@ public final class BatchSender implements AutoCloseable {
     /** Сообщение об истечении общего дедлайна ожидания подтверждений (общий таймаут на набор futures). */
     private static final String TIMEOUT_MSG = "Таймаут ожидания подтверждений от Kafka";
 
+
     /** Сколько отправок накапливать перед ожиданием подтверждений. */
     private final int awaitEvery;
     /** Общий таймаут ожидания подтверждений (на один цикл flush), миллисекунды. */
@@ -211,15 +212,15 @@ public final class BatchSender implements AutoCloseable {
      * @param futures список futures (null или пустой — быстрый выход)
      * @param timeoutMs общий таймаут ожидания в миллисекундах на весь набор
      * @throws InterruptedException если поток прерван (флаг прерывания сохраняется вызывающим кодом)
-     * @throws java.util.concurrent.ExecutionException если одна из отправок завершилась с ошибкой
-     * @throws java.util.concurrent.TimeoutException если общий дедлайн исчерпан до подтверждения всех элементов
+     * @throws java.util.concurrent.ExecutionException при ошибке выполнения
+     * @throws java.util.concurrent.TimeoutException если дедлайн истёк
      */
     private static void waitAll(List<Future<RecordMetadata>> futures, int timeoutMs)
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
         if (futures == null || futures.isEmpty()) {
             return;
         }
-        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
         if (futures instanceof java.util.RandomAccess) {
             waitAllRA(futures, deadline);
         } else {
@@ -264,14 +265,19 @@ public final class BatchSender implements AutoCloseable {
         f.get(leftNs, TimeUnit.NANOSECONDS);
     }
 
+    // rethrowExecutionCause больше не нужен — сохраняем исходные типы исключений.
+
     /**
      * Общая реализация сброса: строгий (с исключениями) или «тихий» (true/false).
+     *
+     * В строгом режиме ошибки отправки приводят к {@link java.util.concurrent.ExecutionException},
+     * таймаут — к {@link java.util.concurrent.TimeoutException}, прерывание — {@link InterruptedException}.
      *
      * @param strict {@code true} — строгая семантика; {@code false} — «тихий» режим
      * @return {@code true} при успехе (в «тихом» режиме)
      * @throws InterruptedException см. {@link #waitAll(List, int)}
-     * @throws java.util.concurrent.ExecutionException см. {@link #waitAll(List, int)}
-     * @throws java.util.concurrent.TimeoutException см. {@link #waitAll(List, int)}
+     * @throws java.util.concurrent.ExecutionException при ошибке выполнения
+     * @throws java.util.concurrent.TimeoutException если дедлайн истёк
      */
     private boolean flushInternal(boolean strict)
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
@@ -283,10 +289,10 @@ public final class BatchSender implements AutoCloseable {
     }
 
     /**
-     * Строгий сброс: ожидает все futures и очищает буфер или пробрасывает исключение при неуспехе.
+     * Строгий сброс: ожидает все futures и очищает буфер либо выбрасывает {@link java.util.concurrent.ExecutionException} или {@link java.util.concurrent.TimeoutException} при неуспехе.
      * @throws InterruptedException при прерывании ожидания
-     * @throws java.util.concurrent.ExecutionException при ошибке отправки
-     * @throws java.util.concurrent.TimeoutException при истечении общего таймаута
+     * @throws java.util.concurrent.ExecutionException при ошибке выполнения
+     * @throws java.util.concurrent.TimeoutException если дедлайн истёк
      */
     private void flushStrictInternal()
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
@@ -419,11 +425,10 @@ public final class BatchSender implements AutoCloseable {
      * Немедленно ожидает подтверждений для накопленных отправок.
      * Объединённый таймаут применяется на весь набор futures.
      *
-     * Семантика ошибок: при первой ошибке отдельного future будет выброшено
-     * соответствующее исключение (обычно {@link java.util.concurrent.ExecutionException}
-     * с исходной причиной внутри). Повторный вызов {@code flush()} дождёт оставшиеся
-     * futures (если буфер не был очищён), то есть можно обрабатывать ошибку снаружи
-     * и затем попытаться завершить ожидание ещё раз.
+     * Семантика ошибок:
+     *  - при первой ошибке — ExecutionException;
+     *  - при таймауте — TimeoutException;
+     *  - при прерывании — InterruptedException (флаг прерывания сохраняется).
      */
     public void flush()
             throws InterruptedException, java.util.concurrent.ExecutionException, java.util.concurrent.TimeoutException {
