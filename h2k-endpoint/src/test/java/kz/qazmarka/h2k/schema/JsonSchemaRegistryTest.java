@@ -1,13 +1,15 @@
 package kz.qazmarka.h2k.schema;
 
-import static org.junit.jupiter.api.Assertions.*;
-
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
 import org.apache.hadoop.hbase.TableName;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -140,8 +142,12 @@ class JsonSchemaRegistryTest {
 
         JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
         TableName tNpe = TableName.valueOf("TBL_NPE");
-        assertThrows(NullPointerException.class, () -> reg.columnType(null, "x"));
-        assertThrows(NullPointerException.class, () -> reg.columnType(tNpe, null));
+        NullPointerException ex1 = assertThrows(NullPointerException.class, () -> reg.columnType(null, "x"));
+        assertTrue(ex1.getMessage() == null || ex1.getMessage().toLowerCase().contains("table"),
+                "Сообщение NPE должно указывать на параметр table");
+        NullPointerException ex2 = assertThrows(NullPointerException.class, () -> reg.columnType(tNpe, null));
+        assertTrue(ex2.getMessage() == null || ex2.getMessage().toLowerCase().contains("qualifier"),
+                "Сообщение NPE должно указывать на параметр qualifier");
     }
 
     /**

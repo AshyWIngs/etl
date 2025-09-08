@@ -1,9 +1,15 @@
 package kz.qazmarka.h2k.util;
 
 import org.apache.hadoop.hbase.util.Bytes;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.Test;
-
-import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Юнит‑тесты для {@link RowKeySlice}.
@@ -175,11 +181,22 @@ class RowKeySliceTest {
     @Test
     void boundsCheck() {
         byte[] a = new byte[] {1,2,3};
-        assertThrows(IllegalArgumentException.class, () -> new RowKeySlice(a, -1, 1));
-        assertThrows(IllegalArgumentException.class, () -> new RowKeySlice(a, 0, 4));
-        assertThrows(IllegalArgumentException.class, () -> new RowKeySlice(a, 3, 1));
+        IllegalArgumentException exNegOff = assertThrows(IllegalArgumentException.class,
+                () -> new RowKeySlice(a, -1, 1));
+        assertNotNull(exNegOff);
+
+        IllegalArgumentException exTooLong = assertThrows(IllegalArgumentException.class,
+                () -> new RowKeySlice(a, 0, 4));
+        assertNotNull(exTooLong);
+
+        IllegalArgumentException exOverflow = assertThrows(IllegalArgumentException.class,
+                () -> new RowKeySlice(a, 3, 1));
+        assertNotNull(exOverflow);
+
         // пустой срез допустим, но null‑массив — нет
-        assertThrows(NullPointerException.class, () -> new RowKeySlice(null, 0, 0));
+        NullPointerException npe = assertThrows(NullPointerException.class,
+                () -> new RowKeySlice(null, 0, 0));
+        assertNotNull(npe);
         // допустим нулевой размер на границе массива
         RowKeySlice emptyTail = new RowKeySlice(a, 3, 0);
         assertTrue(emptyTail.isEmpty());

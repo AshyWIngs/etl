@@ -123,7 +123,7 @@ public final class H2kConfig {
         public static final String SALT_MAP = "h2k.salt.map";
         /**
          * Префикс подсказок ёмкости корневого JSON по таблицам.
-         * Формат ключа: h2k.capacity.hint.&lt;TABLE&gt; = &lt;int&gt;
+         * Формат ключа: {@code h2k.capacity.hint.<TABLE> = <int>}
          * где TABLE — "namespace:qualifier" или просто "qualifier".
          */
         public static final String CAPACITY_HINT_PREFIX = "h2k.capacity.hint.";
@@ -623,7 +623,7 @@ public final class H2kConfig {
         return (v < minVal) ? minVal : v;
     }
 
-    /** Прочитать h2k.topic.config.* → Map&lt;конфиг, значение&gt;. */
+    /** Прочитать h2k.topic.config.* → {@code Map<конфиг, значение>}. */
     private static Map<String, String> readTopicConfigs(Configuration cfg) {
         Map<String, String> out = new HashMap<>();
         final String prefix = Keys.TOPIC_CONFIG_PREFIX;
@@ -898,14 +898,14 @@ public final class H2kConfig {
      * Возвращает количество байт соли для заданной таблицы.
      * Поиск выполняется по полному имени (ns:qualifier), затем по одному qualifier.
      * @param table имя таблицы HBase
-     * @return 0 если соль не используется; &gt;0 — число байт соли
+     * @return 0 если соль не используется; {@code >0} — число байт соли
      */
     public int getSaltBytesFor(TableName table) {
         String full = up(table.getNameAsString()); // NS:QUALIFIER
         Integer v = saltBytesByTable.get(full);
-        if (v != null) return v.intValue();
+        if (v != null) return v; // auto-unboxing
         v = saltBytesByTable.get(up(table.getQualifierAsString()));
-        return v == null ? 0 : v.intValue();
+        return v == null ? 0 : v; // auto-unboxing
     }
 
     /** Удобный булев геттер: используется ли соль для таблицы. */
@@ -926,8 +926,8 @@ public final class H2kConfig {
     public int getCapacityHintFor(TableName table) {
         String full = up(table.getNameAsString()); // NS:QUALIFIER
         Integer v = capacityHintByTable.get(full);
-        if (v != null) return v.intValue();
+        if (v != null) return v; // auto-unboxing
         v = capacityHintByTable.get(up(table.getQualifierAsString()));
-        return v == null ? 0 : v.intValue();
+        return v == null ? 0 : v; // auto-unboxing
     }
 }

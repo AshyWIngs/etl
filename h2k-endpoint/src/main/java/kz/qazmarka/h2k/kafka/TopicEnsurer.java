@@ -164,7 +164,7 @@ public final class TopicEnsurer implements AutoCloseable {
     /**
      * Помечает тему как подтверждённую (существует/успешно создана) и снимает возможный backoff.
      *
-     * <p>Вызов безопасен при повторении; кеш и карта backoff будут приведены к согласованному состоянию.</p>
+     * Вызов безопасен при повторении; кеш и карта backoff будут приведены к согласованному состоянию.
      *
      * @param t имя Kafka‑топика
      */
@@ -176,8 +176,8 @@ public final class TopicEnsurer implements AutoCloseable {
     /**
      * Создаёт экземпляр {@link TopicEnsurer}, если включена опция ensureTopics.
      *
-     * <p>Параметры AdminClient (bootstrap, client.id, request.timeout.ms) берутся из {@link H2kConfig}.
-     * Если bootstrap не задан — возвращает {@code null} и пишет предупреждение.</p>
+     * Параметры AdminClient (bootstrap, client.id, request.timeout.ms) берутся из {@link H2kConfig}.
+     * Если bootstrap не задан — возвращает {@code null} и пишет предупреждение.
      *
      * @param cfg конфигурация H2K
      * @return инициализированный {@code TopicEnsurer} или {@code null}, если ensureTopics=false / отсутствует bootstrap
@@ -243,8 +243,8 @@ public final class TopicEnsurer implements AutoCloseable {
     /**
      * Проверяет существование темы и при отсутствии — пытается создать её (идемпотентно).
      *
-     * <p>Быстрые ветки: пустое/некорректное имя → WARN и выход; кеш ensured; активный backoff.
-     * При UNKNOWN‑ситуациях (таймаут/ACL/сеть) назначает короткий backoff с джиттером.</p>
+     * Быстрые ветки: пустое/некорректное имя → WARN и выход; кеш ensured; активный backoff.
+     * При UNKNOWN‑ситуациях (таймаут/ACL/сеть) назначает короткий backoff с джиттером.
      *
      * @param topic имя Kafka‑топика
      */
@@ -356,34 +356,140 @@ public final class TopicEnsurer implements AutoCloseable {
             createOk.increment();
             markEnsured(t);
         } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            createFail.increment();
-            LOG.warn("Создание Kafka-топика '{}' было прервано", t, ie);
+            onCreateInterrupted(t, ie);
         } catch (java.util.concurrent.ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof org.apache.kafka.common.errors.TopicExistsException) {
-                createRace.increment();
-                markEnsured(t);
-                if (LOG.isDebugEnabled()) LOG.debug("Kafka-топик '{}' уже существует (создан параллельно)", t);
-            } else {
-                createFail.increment();
-                LOG.warn("Не удалось создать Kafka-топик '{}': ошибка выполнения", t, e);
-            }
+            onCreateExecException(t, e);
         } catch (java.util.concurrent.TimeoutException te) {
-            createFail.increment();
-            LOG.warn("Не удалось создать Kafka-топик '{}': таймаут {} мс", t, adminTimeoutMs, te);
+            onCreateTimeout(t, te);
         } catch (RuntimeException re) {
+            onCreateRuntime(t, re);
+        }
+    }
+
+    /**
+     * Назначение
+     *  - Обработка прерывания при создании темы: восстанавливает флаг прерывания,
+     *    инкрементирует метрику неуспеха и пишет краткий WARN (полная трассировка — только в DEBUG).
+     *
+     * Контракт
+     *  - Не бросает исключений.
+     *  - Всегда вызывает Thread.currentThread().interrupt() для корректной сигнализации наверх.
+     *
+     * Параметры
+     *  - t — имя Kafka-топика.
+     *  - ie — перехваченное InterruptedException.
+     *
+     * Исключения
+     *  - Нет.
+     *
+     * Замечания по производительности
+     *  - Без аллокаций на горячем пути; дополнительная активность только при включённом DEBUG-логировании.
+     */
+    private void onCreateInterrupted(String t, InterruptedException ie) {
+        Thread.currentThread().interrupt();
+        createFail.increment();
+        LOG.warn("Создание Kafka-топика '{}' было прервано", t);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Трассировка прерывания при создании темы '{}'", t, ie);
+        }
+    }
+
+    /**
+     * Назначение
+     *  - Обработка ошибок выполнения при создании темы.
+     *    TopicExists → фиксируем гонку и помечаем тему как подтверждённую;
+     *    прочие ошибки → увеличиваем метрику и логируем кратко.
+     *
+     * Контракт
+     *  - Не бросает исключений.
+     *  - Идемпотентен относительно повторных вызовов.
+     *
+     * Параметры
+     *  - t — имя Kafka-топика.
+     *  - e — ExecutionException из AdminClient.
+     *
+     * Исключения
+     *  - Нет.
+     *
+     * Замечания по производительности
+     *  - Формирует краткое сообщение в WARN без stacktrace; полная трассировка — только в DEBUG.
+     */
+    private void onCreateExecException(String t, java.util.concurrent.ExecutionException e) {
+        Throwable cause = e.getCause();
+        if (cause instanceof org.apache.kafka.common.errors.TopicExistsException) {
+            createRace.increment();
+            markEnsured(t);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Kafka-топик '{}' уже существует (создан параллельно)", t);
+            }
+        } else {
             createFail.increment();
-            LOG.warn("Не удалось создать Kafka-топик '{}' (runtime)", t, re);
+            LOG.warn("Не удалось создать Kafka-топик '{}': {}: {}",
+                    t,
+                    (cause == null ? e.getClass().getSimpleName() : cause.getClass().getSimpleName()),
+                    (cause == null ? e.getMessage() : cause.getMessage()));
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Трассировка ошибки создания темы '{}'", t, e);
+            }
+        }
+    }
+
+    /**
+     * Назначение
+     *  - Обработка таймаута создания темы с записью краткого WARN и DEBUG-трассировки.
+     *
+     * Контракт
+     *  - Не бросает исключений.
+     *
+     * Параметры
+     *  - t — имя Kafka-топика.
+     *  - te — TimeoutException из AdminClient.
+     *
+     * Исключения
+     *  - Нет.
+     *
+     * Замечания по производительности
+     *  - Минимальные аллокации; детальная трассировка только при DEBUG.
+     */
+    private void onCreateTimeout(String t, java.util.concurrent.TimeoutException te) {
+        createFail.increment();
+        LOG.warn("Не удалось создать Kafka-топик '{}': таймаут {} мс", t, adminTimeoutMs);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Трассировка таймаута создания темы '{}'", t, te);
+        }
+    }
+
+    /**
+     * Назначение
+     *  - Унифицированная обработка непроверяемых исключений при создании темы.
+     *
+     * Контракт
+     *  - Не бросает исключений.
+     *
+     * Параметры
+     *  - t — имя Kafka-топика.
+     *  - re — перехваченное RuntimeException.
+     *
+     * Исключения
+     *  - Нет.
+     *
+     * Замечания по производительности
+     *  - В WARN пишется только краткое сообщение; stacktrace уходит в DEBUG.
+     */
+    private void onCreateRuntime(String t, RuntimeException re) {
+        createFail.increment();
+        LOG.warn("Не удалось создать Kafka-топик '{}' (runtime): {}", t, re.getMessage());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Трассировка runtime при создании темы '{}'", t, re);
         }
     }
 
     /**
      * Убеждается, что тема существует, и возвращает итог.
      *
-     * <p>Возвращает {@code true}, если тема подтверждена (была ранее/создана сейчас/подтверждена describeTopics).
+     * Возвращает {@code true}, если тема подтверждена (была ранее/создана сейчас/подтверждена describeTopics).
      * Возвращает {@code false}, если ensure отключён, имя пустое/некорректное, действует backoff либо произошла ошибка.
-     * Метод никогда не бросает исключений.</p>
+     * Метод никогда не бросает исключений.
      *
      * @param topic имя Kafka‑топика
      * @return {@code true}, если тема гарантированно существует; иначе {@code false}
@@ -403,8 +509,8 @@ public final class TopicEnsurer implements AutoCloseable {
     /**
      * Пакетная проверка/создание тем одним/двумя сетевыми вызовами.
      *
-     * <p>Нормализует имена (trim/валидация), исключает уже подтверждённые и попавшие в backoff,
-     * затем вызывает describeTopics и createTopics для отсутствующих.</p>
+     * Нормализует имена (trim/валидация), исключает уже подтверждённые и попавшие в backoff,
+     * затем вызывает describeTopics и createTopics для отсутствующих.
      *
      * @param topics коллекция имён Kafka‑топиков
      */
@@ -463,8 +569,8 @@ public final class TopicEnsurer implements AutoCloseable {
     /**
      * Обрабатывает результат describeTopics по одной теме.
      *
-     * <p>UnknownTopic → добавляет в {@code missing}; Timeout/Execution(не UnknownTopic)/Interrupted → планирует backoff,
-     * ведёт DEBUG‑лог и инкрементирует метрики.</p>
+     * UnknownTopic → добавляет в {@code missing}; Timeout/Execution (не UnknownTopic)/Interrupted → планирует backoff,
+     * ведёт DEBUG‑лог и инкрементирует метрики.
      *
      * @param fmap   карта topic → future TopicDescription
      * @param t      имя Kafka‑топика
@@ -710,8 +816,8 @@ public final class TopicEnsurer implements AutoCloseable {
     /**
      * Создаёт одну тему и логирует факт/применённые конфиги.
      *
-     * <p>Бросает {@link InterruptedException}, {@link java.util.concurrent.ExecutionException},
-     * {@link java.util.concurrent.TimeoutException}; вызывающая сторона отвечает за перевод в метрики/лог.</p>
+     * Бросает {@link InterruptedException}, {@link java.util.concurrent.ExecutionException},
+     * {@link java.util.concurrent.TimeoutException}; вызывающая сторона отвечает за перевод в метрики/лог.
      *
      * @param topic имя Kafka‑топика
      * @throws InterruptedException если поток прерван

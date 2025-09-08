@@ -38,7 +38,7 @@ import org.apache.phoenix.schema.types.PhoenixArray;
  *
  * Назначение
  *  • Поддерживает семантику Phoenix для широкого набора типов (UNSIGNED‑типы, TIMESTAMP/DATE/TIME, ARRAY и т.п.).
- *  • Унифицирует результат: TIMESTAMP/DATE/TIME → epoch millis (long); любой Phoenix ARRAY → {@code List&lt;Object&gt;};
+ *  • Унифицирует результат: TIMESTAMP/DATE/TIME → epoch millis (long); любой Phoenix ARRAY → {@code List<Object>};
  *    VARBINARY/BINARY → {@code byte[]} как есть; прочие типы — как вернул {@code PDataType}.
  *
  * Строгая диагностика/исключения
@@ -217,7 +217,7 @@ public final class ValueCodecPhoenix implements Decoder {
      *
      * Унификация результата
      *  • TIMESTAMP/DATE/TIME → миллисекунды epoch (long);
-     *  • любой Phoenix ARRAY → {@code List&lt;Object&gt;} (без копии для Object[], минимальная коробка для примитивов);
+     *  • любой Phoenix ARRAY → {@code List<Object>} (без копии для Object[], минимальная коробка для примитивов);
      *  • VARBINARY/BINARY → {@code byte[]} как есть;
      *  • прочие типы возвращаются как есть (строки/числа/Boolean), как их выдал {@link PDataType}.
      *
@@ -247,7 +247,7 @@ public final class ValueCodecPhoenix implements Decoder {
         // Это позволяет рано выявить ситуацию, когда байты принадлежат другому типу (например, VARCHAR),
         // и избежать "тихих" неверных декодирований. Накладные расходы нулевые на горячем пути.
         final Integer expectedSize = t.getByteSize();
-        if (expectedSize != null && expectedSize.intValue() != value.length) {
+        if (expectedSize != null && expectedSize != value.length) { // auto-unboxing, избыток intValue() не нужен
             throw new IllegalStateException(
                 "Несоответствие длины значения для " + table + "." + qualifier
                 + ": тип=" + t + " ожидает " + expectedSize + " байт(а), получено " + value.length

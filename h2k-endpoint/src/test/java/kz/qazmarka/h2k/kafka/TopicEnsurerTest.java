@@ -1,22 +1,33 @@
 package kz.qazmarka.h2k.kafka;
 
-import org.apache.kafka.clients.admin.NewTopic;
-import org.apache.kafka.clients.admin.TopicDescription;
-import org.apache.kafka.common.KafkaFuture;
-import org.apache.kafka.common.TopicPartitionInfo;
-import org.apache.kafka.common.errors.TopicExistsException;
-import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
-import org.apache.kafka.common.internals.KafkaFutureImpl;
-import org.apache.kafka.common.Node;
-import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Test;
-import static org.junit.jupiter.api.Assertions.*;
-
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.admin.TopicDescription;
+import org.apache.kafka.common.KafkaFuture;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.TopicPartitionInfo;
+import org.apache.kafka.common.errors.TopicExistsException;
+import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
+import org.apache.kafka.common.internals.KafkaFutureImpl;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
 
 /**
  * Набор юнит‑тестов для {@link TopicEnsurer}.
@@ -110,8 +121,8 @@ class TopicEnsurerTest {
      * Тестовая реализация «админа» поверх JDK Proxy.
      *
      * Поддерживает приватный интерфейс {@code TopicEnsurer$TopicAdmin} с методами:
-     *  • {@code describeTopics(Set&lt;String&gt;)} → {@code Map&lt;String, KafkaFuture&lt;TopicDescription&gt;&gt;}
-     *  • {@code createTopics(List&lt;NewTopic&gt;)} → {@code Map&lt;String, KafkaFuture&lt;Void&gt;&gt;}
+     *  • {@code describeTopics(Set<String>)} → {@code Map<String, KafkaFuture<TopicDescription>>}
+     *  • {@code createTopics(List<NewTopic>)} → {@code Map<String, KafkaFuture<Void>>}
      *  • {@code createTopic(NewTopic, long timeoutMs)} → синхронный путь (OK/исключение)
      *  • {@code close(Duration)} → no‑op
      *

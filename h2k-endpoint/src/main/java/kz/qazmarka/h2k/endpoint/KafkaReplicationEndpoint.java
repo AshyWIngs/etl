@@ -630,15 +630,15 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
      * выполняет безопасный фолбэк через строковое представление.
      */
     private byte[] toJsonBytes(Map<String, Object> obj) {
+        jsonOut.reset();
+        gson.toJson(obj, jsonWriter);
         try {
-            jsonOut.reset();
-            gson.toJson(obj, jsonWriter);
-            jsonWriter.flush();
-            return jsonOut.toByteArray();
-        } catch (Exception ex) {
-            // Фолбэк: через промежуточную строку (не должно происходить)
-            return gson.toJson(obj).getBytes(StandardCharsets.UTF_8);
+            jsonWriter.flush(); // ByteArrayOutputStream: IO ошибок быть не должно
+        } catch (IOException ioe) {
+            // Невозможный для BAOS сценарий: конвертируем в unchecked без логирования на горячем пути
+            throw new IllegalStateException("JSON flush over BAOS неожиданно завершился IOException", ioe);
         }
+        return jsonOut.toByteArray();
     }
 
 

@@ -1,17 +1,21 @@
 package kz.qazmarka.h2k.kafka;
 
-import org.apache.kafka.clients.producer.RecordMetadata;
-import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Test;
-
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
 
-import static org.junit.jupiter.api.Assertions.*;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
 
 /**
  * Юнит‑тесты для {@link BatchSender}.
@@ -105,7 +109,8 @@ final class BatchSenderTest {
         BatchSender sender = new BatchSender(1, 50, true, false);
         sender.add(never()); // дедлайн 50 мс на весь набор (один элемент)
 
-        assertThrows(TimeoutException.class, sender::flush);
+        TimeoutException te = assertThrows(TimeoutException.class, sender::flush);
+        assertNotNull(te, "Ожидался TimeoutException");
         assertTrue(sender.hasPending()); // буфер не очищается
     }
 
@@ -219,7 +224,10 @@ final class BatchSenderTest {
         sender.add(fail("boom-on-close"));
         sender.add(never()); // чтобы не было случайного успешного завершения
         assertTrue(sender.hasPending());
-        assertThrows(ExecutionException.class, sender::close);
+        ExecutionException ex = assertThrows(ExecutionException.class, sender::close);
+        assertNotNull(ex);
+        assertTrue(ex.getCause() instanceof RuntimeException);
+        assertEquals("boom-on-close", ex.getCause().getMessage());
     }
 
     @Test
@@ -271,7 +279,8 @@ final class BatchSenderTest {
         BatchSender sender = new BatchSender(10, 50, true, false); // 50 мс общий дедлайн
         sender.add(never());
         sender.add(never());
-        assertThrows(TimeoutException.class, sender::flush);
+        TimeoutException te2 = assertThrows(TimeoutException.class, sender::flush);
+        assertNotNull(te2, "Ожидался TimeoutException");
         assertEquals(2, sender.getPendingCount(), "Буфер не очищается при таймауте");
     }
 }

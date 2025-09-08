@@ -1,10 +1,5 @@
 package kz.qazmarka.h2k.schema;
 
-import org.apache.hadoop.hbase.TableName;
-import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Test;
-
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -12,7 +7,17 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static org.junit.jupiter.api.Assertions.*;
+import org.apache.hadoop.hbase.TableName;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
 
 /**
  * Юнит-тесты для интерфейса {@link SchemaRegistry} (дефолт-методы).
@@ -113,19 +118,46 @@ class SchemaRegistryTest {
     @DisplayName("NPE: все default-методы валидируют аргументы (fail-fast)")
     void nullChecks() {
         SchemaRegistry r = SchemaRegistry.empty();
-        assertThrows(NullPointerException.class, () -> r.columnTypeOrDefault(null, "q", "V"));
-        assertThrows(NullPointerException.class, () -> r.columnTypeOrDefault(TBL, null, "V"));
-        assertThrows(NullPointerException.class, () -> r.columnTypeOrDefault(TBL, "q", null));
 
-        assertThrows(NullPointerException.class, () -> r.columnTypeOrDefaultRelaxed(null, "q", "V"));
-        assertThrows(NullPointerException.class, () -> r.columnTypeOrDefaultRelaxed(TBL, null, "V"));
-        assertThrows(NullPointerException.class, () -> r.columnTypeOrDefaultRelaxed(TBL, "q", null));
+        NullPointerException e1 = assertThrows(NullPointerException.class,
+                () -> r.columnTypeOrDefault(null, "q", "V"));
+        assertNotNull(e1.getMessage());
 
-        assertThrows(NullPointerException.class, () -> r.columnTypeRelaxed(null, "q"));
-        assertThrows(NullPointerException.class, () -> r.columnTypeRelaxed(TBL, null));
+        NullPointerException e2 = assertThrows(NullPointerException.class,
+                () -> r.columnTypeOrDefault(TBL, null, "V"));
+        assertNotNull(e2.getMessage());
 
-        assertThrows(NullPointerException.class, () -> r.hasColumnRelaxed(null, "q"));
-        assertThrows(NullPointerException.class, () -> r.hasColumnRelaxed(TBL, null));
+        NullPointerException e3 = assertThrows(NullPointerException.class,
+                () -> r.columnTypeOrDefault(TBL, "q", null));
+        assertNotNull(e3.getMessage());
+
+        NullPointerException e4 = assertThrows(NullPointerException.class,
+                () -> r.columnTypeOrDefaultRelaxed(null, "q", "V"));
+        assertNotNull(e4.getMessage());
+
+        NullPointerException e5 = assertThrows(NullPointerException.class,
+                () -> r.columnTypeOrDefaultRelaxed(TBL, null, "V"));
+        assertNotNull(e5.getMessage());
+
+        NullPointerException e6 = assertThrows(NullPointerException.class,
+                () -> r.columnTypeOrDefaultRelaxed(TBL, "q", null));
+        assertNotNull(e6.getMessage());
+
+        NullPointerException e7 = assertThrows(NullPointerException.class,
+                () -> r.columnTypeRelaxed(null, "q"));
+        assertNotNull(e7.getMessage());
+
+        NullPointerException e8 = assertThrows(NullPointerException.class,
+                () -> r.columnTypeRelaxed(TBL, null));
+        assertNotNull(e8.getMessage());
+
+        NullPointerException e9 = assertThrows(NullPointerException.class,
+                () -> r.hasColumnRelaxed(null, "q"));
+        assertNotNull(e9.getMessage());
+
+        NullPointerException e10 = assertThrows(NullPointerException.class,
+                () -> r.hasColumnRelaxed(TBL, null));
+        assertNotNull(e10.getMessage());
     }
 
     /* ======================== вспомогательная in-memory реализация ======================== */
@@ -194,8 +226,10 @@ class SchemaRegistryTest {
     @DisplayName("hasColumn: NPE на null table/qualifier (fail-fast)")
     void hasExactNullChecks() {
         SchemaRegistry r = SchemaRegistry.empty();
-        assertThrows(NullPointerException.class, () -> r.hasColumn(null, "q"));
-        assertThrows(NullPointerException.class, () -> r.hasColumn(TBL, null));
+        NullPointerException he1 = assertThrows(NullPointerException.class, () -> r.hasColumn(null, "q"));
+        assertNotNull(he1.getMessage());
+        NullPointerException he2 = assertThrows(NullPointerException.class, () -> r.hasColumn(TBL, null));
+        assertNotNull(he2.getMessage());
     }
 
     @Test
@@ -262,5 +296,13 @@ class SchemaRegistryTest {
             }
             fail(firstError.get());
         }
+    }
+    @Test
+    @DisplayName("Smoke: quietLogging() is referenced explicitly (harmless)")
+    void _quietLogging_isReferenced_smoke() {
+        // Повторный вызов безвреден: метод идемпотентен (устанавливает системное свойство).
+        quietLogging();
+        // Минимальная проверка: системное свойство действительно установлено ожидаемым образом
+        assertEquals("target", System.getProperty("h2k.log.dir"));
     }
 }

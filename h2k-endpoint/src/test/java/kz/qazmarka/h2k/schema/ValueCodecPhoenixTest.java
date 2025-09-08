@@ -1,38 +1,39 @@
 package kz.qazmarka.h2k.schema;
 
-import org.apache.hadoop.hbase.TableName;
-import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Nested;
-import org.junit.jupiter.api.Test;
-
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
-import java.util.List;
-
-import org.apache.phoenix.schema.types.PTimestamp;
-import org.apache.phoenix.schema.types.PDate;
-import org.apache.phoenix.schema.types.PTime;
-import org.apache.phoenix.schema.types.PVarbinary;
-
-import org.apache.log4j.Logger;
-import org.apache.log4j.AppenderSkeleton;
-import org.apache.log4j.spi.LoggingEvent;
-import org.apache.log4j.Level;
-
-import java.sql.Timestamp;
 import java.sql.Date;
 import java.sql.Time;
+import java.sql.Timestamp;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.ArrayList;
 
-import static org.junit.jupiter.api.Assertions.*;
+import org.apache.hadoop.hbase.TableName;
+import org.apache.log4j.AppenderSkeleton;
+import org.apache.log4j.Level;
+import org.apache.log4j.Logger;
+import org.apache.log4j.spi.LoggingEvent;
+import org.apache.phoenix.schema.types.PDate;
+import org.apache.phoenix.schema.types.PTime;
+import org.apache.phoenix.schema.types.PTimestamp;
+import org.apache.phoenix.schema.types.PVarbinary;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
 
 /**
  * Консолидированный набор юнит-тестов для {@link ValueCodecPhoenix}.
@@ -53,7 +54,7 @@ class ValueCodecPhoenixTest {
 
     /** Простой фейковый реестр типов: отдаёт типы по имени колонки, null — если неизвестно. */
     static final class FakeRegistry implements SchemaRegistry {
-        private final java.util.Map<String, String> map = new java.util.HashMap<String, String>();
+        private final java.util.Map<String, String> map = new java.util.HashMap<>();
 
         FakeRegistry with(String qualifier, String type) {
             map.put(qualifier, type);
@@ -108,8 +109,10 @@ class ValueCodecPhoenixTest {
             ValueCodecPhoenix vc = new ValueCodecPhoenix(new FakeRegistry().with("A", "VARCHAR"));
             byte[] bytes = "x".getBytes(StandardCharsets.UTF_8);
 
-            assertThrows(NullPointerException.class, () -> vc.decode(null, "A", bytes));
-            assertThrows(NullPointerException.class, () -> ((Decoder) vc).decode(TBL, (String) null, bytes));
+            NullPointerException e1 = assertThrows(NullPointerException.class, () -> vc.decode(null, "A", bytes));
+            NullPointerException e2 = assertThrows(NullPointerException.class, () -> ((Decoder) vc).decode(TBL, (String) null, bytes));
+            assertNotNull(e1);
+            assertNotNull(e2);
         }
 
         @Test
@@ -334,7 +337,7 @@ class ValueCodecPhoenixTest {
 
                 ExecutorService pool = Executors.newFixedThreadPool(8);
                 try {
-                    List<Callable<Boolean>> tasks = new ArrayList<Callable<Boolean>>();
+                    List<Callable<Boolean>> tasks = new ArrayList<>();
                     for (int i = 0; i < 8; i++) {
                         tasks.add(() -> {
                             for (int j = 0; j < 100; j++) {
@@ -359,5 +362,14 @@ class ValueCodecPhoenixTest {
             }
             assertTrue(app.warns.get() <= 1, "В многопоточном сценарии WARN также должен сработать не более одного раза");
         }
+    }
+    @Test
+    @DisplayName("Anchors to mark nested test classes as used")
+    void anchors() {
+        Class<?>[] refs = {
+                Positive.class, Negative.class, NormalizeTypeName.class, ArrayConversion.class,
+                TemporalPositive.class, BinaryPositive.class, DecimalNegative.class, WarnOnce.class, Concurrency.class
+        };
+        assertNotNull(refs);
     }
 }

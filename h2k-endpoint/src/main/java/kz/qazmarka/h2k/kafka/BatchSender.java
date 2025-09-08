@@ -90,8 +90,8 @@ public final class BatchSender implements AutoCloseable {
     }
 
     /**
-     * @param awaitEvery     сколько отправок копить перед ожиданием подтверждений (&gt; 0)
-     * @param awaitTimeoutMs общий таймаут ожидания подтверждений на один цикл flush, миллисекунды (&gt; 0)
+     * @param awaitEvery     сколько отправок копить перед ожиданием подтверждений ({@code > 0})
+     * @param awaitTimeoutMs общий таймаут ожидания подтверждений на один цикл flush, миллисекунды ({@code > 0})
      * @param enableCounters включить лёгкие диагностические счётчики (по умолчанию false)
      * @param debugOnFailure логировать причины неуспеха в DEBUG (по умолчанию false)
      * @throws IllegalArgumentException если параметры некорректны

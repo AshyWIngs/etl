@@ -1,13 +1,17 @@
 package kz.qazmarka.h2k.schema;
 
-import org.junit.jupiter.api.Test;
-
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 
 import org.apache.hadoop.hbase.TableName;
-
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import org.junit.jupiter.api.Test;
 
 /**
  * Юнит‑тесты контракта интерфейса {@link Decoder}.
@@ -154,12 +158,22 @@ class DecoderTest {
         Decoder d = new EchoDecoder();
         byte[] bytes = new byte[] {1};
 
-        assertThrows(NullPointerException.class, () -> ((Decoder) d).decode(null, "q", bytes));
-        assertThrows(NullPointerException.class, () -> ((Decoder) d).decode(TBL, (String) null, bytes));
+        NullPointerException ex1 = assertThrows(NullPointerException.class, () -> d.decode(null, "q", bytes));
+        assertTrue(ex1.getMessage() == null || ex1.getMessage().toLowerCase().contains("table"),
+                "Сообщение NPE должно указывать на параметр table");
+
+        NullPointerException ex2 = assertThrows(NullPointerException.class, () -> d.decode(TBL, (String) null, bytes));
+        assertTrue(ex2.getMessage() == null || ex2.getMessage().toLowerCase().contains("qualifier"),
+                "Сообщение NPE должно указывать на параметр qualifier");
 
         byte[] qual = "q".getBytes(StandardCharsets.UTF_8);
-        assertThrows(NullPointerException.class, () -> d.decode(null, qual, bytes));
-        assertThrows(NullPointerException.class, () -> d.decode(TBL, (byte[]) null, bytes));
+        NullPointerException ex3 = assertThrows(NullPointerException.class, () -> d.decode(null, qual, bytes));
+        assertTrue(ex3.getMessage() == null || ex3.getMessage().toLowerCase().contains("table"),
+                "Сообщение NPE должно указывать на параметр table");
+
+        NullPointerException ex4 = assertThrows(NullPointerException.class, () -> d.decode(TBL, (byte[]) null, bytes));
+        assertTrue(ex4.getMessage() == null || ex4.getMessage().toLowerCase().contains("qualifier"),
+                "Сообщение NPE должно указывать на параметр qualifier");
     }
 
     // -------- Typed API (Decoder.Typed) — объединено сюда из DecoderTypedSliceTest --------
