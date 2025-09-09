@@ -1,0 +1,43 @@
+# --- Логи (файлы и папки) ---
+logs/**
+!logs/.gitkeep
+*.log
+
+# --- IDE/редакторы ---
+.vscode/
+.idea/
+*.iml
+*.code-workspace
+.classpath
+.project
+.settings/
+
+# --- Мусор ОС ---
+.DS_Store
+**/.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# --- Конфиг/секреты окружения ---
+.env
+!.env.example
+.envrc
+*.env.local
+*.secrets
+*.key
+*.pem
+
+# === Maven / сборка ===
+target/
+# В редких случаях META-INF лежит в корне — игнорируем.
+META-INF/
+pom.xml.versionsBackup
+dependency-reduced-pom.xml
+release.properties
+pom.xml.releaseBackup
+pom.xml.tag
+
+# Отчёты тестов (если выкладывать не планируешь)
+surefire-reports/
+failsafe-reports/
