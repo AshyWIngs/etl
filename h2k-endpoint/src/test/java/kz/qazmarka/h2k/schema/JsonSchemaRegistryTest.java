@@ -6,7 +6,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 import org.apache.hadoop.hbase.TableName;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -15,23 +17,32 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Набор быстрых unit‑тестов для {@link JsonSchemaRegistry}.
+ * Набор быстрых unit-тестов для {@link JsonSchemaRegistry}.
  *
  * Цели:
- *  • Подтвердить корректный разбор minimal JSON‑схемы и работу алиасов имён таблиц/колонок
- *    (полное имя с namespace, короткое имя без namespace, регистронезависимость qualifier).
- *  • Убедиться, что типы Phoenix массивов (например, {@code "VARCHAR ARRAY"}) распознаются без предупреждений
- *    и возвращаются как есть.
- *  • Проверить, что {@link JsonSchemaRegistry#refresh()} заменяет снимок схемы и инвалидирует внутренний кэш.
- *  • Зафиксировать стабильное поведение при пустой/битой схеме (реестр остаётся пустым, ошибок на уровне теста нет).
+ *  • Подтвердить корректный разбор минимальной JSON-схемы и работу алиасов имён таблиц/колонок
+ *    (полное имя с namespace, короткое имя без namespace; регистр qualifier игнорируется).
+ *  • Убедиться, что типы Phoenix массивов (например, {@code "VARCHAR ARRAY"}) распознаются
+ *    и возвращаются без преобразований.
+ *  • Проверить, что {@link JsonSchemaRegistry#refresh()} перечитывает файл, заменяет снимок
+ *    и инвалидирует внутренние кэши (после refresh() видны изменения типов/PK).
+ *  • Зафиксировать стабильное поведение при пустой или битой схеме: реестр остаётся рабочим,
+ *    а методы возвращают {@code null}/пустые значения вместо выброса исключений наружу.
  *
- * Технические детали:
- *  • Все тесты самодостаточные: исходный JSON пишется в файл во временной директории через {@link TempDir},
+ * Технические примечания:
+ *  • Тесты самодостаточны: исходный JSON пишется во временный файл через {@link org.junit.jupiter.api.io.TempDir},
  *    путь передаётся в конструктор {@link JsonSchemaRegistry}.
- *  • Никаких внешних ресурсов и сети; выполнение занимает миллисекунды, GC‑нагрузка минимальна.
- *  • Логи парсинга в тестах не проверяются: функционально нас интересуют возвращаемые типы/nullable‑поведение.
+ *  • Внешние ресурсы/сеть не используются; выполнение занимает миллисекунды.
+ *  • Логи парсинга не проверяются — валидируется только функциональный контракт API.
+ *
+ * @see JsonSchemaRegistry
+ * @see SchemaRegistry
  */
 class JsonSchemaRegistryTest {
+
+    private static void write(Path f, String json) throws IOException {
+        Files.write(f, json.getBytes(StandardCharsets.UTF_8));
+    }
 
     /**
      * Проверяет разбор простой схемы и работу алиасов имён:
@@ -49,7 +60,7 @@ class JsonSchemaRegistryTest {
                 "  }\n" +
                 "}";
         Path f = dir.resolve("schema.json");
-        Files.write(f, json.getBytes(StandardCharsets.UTF_8));
+        write(f, json);
 
         JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
 
@@ -76,7 +87,7 @@ class JsonSchemaRegistryTest {
                 "  \"TBL_B\": {\"columns\": {\"tags\": \"VARCHAR ARRAY\"}}\n" +
                 "}";
         Path f = dir.resolve("schema.json");
-        Files.write(f, json.getBytes(StandardCharsets.UTF_8));
+        write(f, json);
 
         JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
         TableName t = TableName.valueOf("TBL_B");
@@ -94,18 +105,18 @@ class JsonSchemaRegistryTest {
     @DisplayName("refresh(): заменяет снимок схемы и очищает кэш — новые типы становятся видны")
     void refreshReplacesSnapshot(@TempDir Path dir) throws IOException {
         Path f = dir.resolve("schema.json");
-        Files.write(f, ("{\n" +
+        write(f, "{\n" +
                 "  \"TBL_C\": {\"columns\": {\"x\": \"INT\"}}\n" +
-                "}").getBytes(StandardCharsets.UTF_8));
+                "}");
 
         JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
         TableName t = TableName.valueOf("TBL_C");
         assertEquals("INT", reg.columnType(t, "x"));
 
         // Обновляем файл и вызываем refresh()
-        Files.write(f, ("{\n" +
+        write(f, "{\n" +
                 "  \"TBL_C\": {\"columns\": {\"x\": \"BIGINT\", \"y\": \"VARCHAR\"}}\n" +
-                "}").getBytes(StandardCharsets.UTF_8));
+                "}");
         reg.refresh();
 
         assertEquals("BIGINT", reg.columnType(t, "x"));
@@ -123,7 +134,7 @@ class JsonSchemaRegistryTest {
     void emptyOrBrokenSchema(@TempDir Path dir) throws IOException {
         Path f = dir.resolve("schema.json");
         // Пишем «битый» JSON
-        Files.write(f, "{".getBytes(StandardCharsets.UTF_8));
+        write(f, "{");
 
         JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
         assertNull(reg.columnType(TableName.valueOf("ANY"), "col"));
@@ -136,9 +147,9 @@ class JsonSchemaRegistryTest {
     @DisplayName("Fail-fast: NPE на null table/qualifier")
     void npeOnNullArgs(@TempDir Path dir) throws IOException {
         Path f = dir.resolve("schema.json");
-        Files.write(f, ("{\n" +
+        write(f, "{\n" +
                 "  \"TBL_NPE\": {\"columns\": {\"x\": \"VARCHAR\"}}\n" +
-                "}").getBytes(StandardCharsets.UTF_8));
+                "}");
 
         JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
         TableName tNpe = TableName.valueOf("TBL_NPE");
@@ -164,7 +175,7 @@ class JsonSchemaRegistryTest {
      * Поддержка Unicode-имён таблиц/колонок (русский/казахский): регистр qualifier игнорируется.
      */
     @Test
-    @DisplayName("ASCII: имена таблиц и колонок — латиницей (значения могут быть Unicode)")
+    @DisplayName("Латиница: имена таблиц и колонок — латиницей (значения могут быть Unicode)")
     void unicodeNamesSupported(@TempDir Path dir) throws IOException {
         String json = "{\n" +
                 "  \"DEFAULT:ZAKAZY\": {\n" +
@@ -172,7 +183,7 @@ class JsonSchemaRegistryTest {
                 "  }\n" +
                 "}";
         Path f = dir.resolve("schema.json");
-        Files.write(f, json.getBytes(StandardCharsets.UTF_8));
+        write(f, json);
 
         JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
         // короткое имя таблицы без DEFAULT
@@ -198,7 +209,7 @@ class JsonSchemaRegistryTest {
                 "  \"TBL_SYNONYMS\": {\"columns\": {\"a\": \"CHARACTER VARYING ARRAY\", \"b\": \"STRING ARRAY\"}}\n" +
                 "}";
         Path f = dir.resolve("schema.json");
-        Files.write(f, json.getBytes(StandardCharsets.UTF_8));
+        write(f, json);
 
         JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
         TableName t = TableName.valueOf("TBL_SYNONYMS");
@@ -213,9 +224,9 @@ class JsonSchemaRegistryTest {
     @DisplayName("refresh(): удаление колонки делает columnType(...)==null")
     void refreshRemovesColumn(@TempDir Path dir) throws IOException {
         Path f = dir.resolve("schema.json");
-        Files.write(f, ("{\n" +
+        write(f, "{\n" +
                 "  \"TBL_D\": {\"columns\": {\"keep\": \"INT\", \"drop\": \"VARCHAR\"}}\n" +
-                "}").getBytes(StandardCharsets.UTF_8));
+                "}");
 
         JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
         TableName t = TableName.valueOf("TBL_D");
@@ -223,12 +234,126 @@ class JsonSchemaRegistryTest {
         assertEquals("VARCHAR", reg.columnType(t, "drop"));
 
         // Обновляем файл: колонку drop удаляем
-        Files.write(f, ("{\n" +
+        write(f, "{\n" +
                 "  \"TBL_D\": {\"columns\": {\"keep\": \"INT\"}}\n" +
-                "}").getBytes(StandardCharsets.UTF_8));
+                "}");
         reg.refresh();
 
         assertEquals("INT", reg.columnType(t, "keep"));
         assertNull(reg.columnType(t, "drop"));
+    }
+
+    /**
+     * primaryKeyColumns: базовый сценарий — возвращает PK в порядке следования.
+     * Поддерживаются полное и короткое имя таблицы, регистр qualifier не влияет.
+     */
+    @Test
+    @DisplayName("primaryKeyColumns: базовый сценарий — ['c','t','opd'] в порядке следования")
+    void primaryKeyColumnsBasic(@TempDir Path dir) throws IOException {
+        Path f = dir.resolve("schema.json");
+        write(f, "{\n" +
+                "  \"DEFAULT:TBL_PK\": {\n" +
+                "    \"columns\": {\"c\":\"VARCHAR\",\"t\":\"UNSIGNED_TINYINT\",\"opd\":\"TIMESTAMP\",\"x\":\"INT\"},\n" +
+                "    \"PK\": [\"c\",\"t\",\"opd\"]\n" +
+                "  }\n" +
+                "}");
+        JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
+        // короткое имя без namespace должно работать
+        TableName tShort = TableName.valueOf("TBL_PK");
+        assertArrayEquals(new String[]{"c","t","opd"}, reg.primaryKeyColumns(tShort));
+        // полное имя тоже
+        TableName tFull = TableName.valueOf("DEFAULT:TBL_PK");
+        assertArrayEquals(new String[]{"c","t","opd"}, reg.primaryKeyColumns(tFull));
+    }
+
+    /**
+     * primaryKeyColumns: отсутствие описания PK в схеме — должен возвращаться пустой массив.
+     */
+    @Test
+    @DisplayName("primaryKeyColumns: отсутствует в схеме → пустой массив (не null)")
+    void primaryKeyColumnsAbsentReturnsEmpty(@TempDir Path dir) throws IOException {
+        Path f = dir.resolve("schema.json");
+        write(f, "{\n" +
+                "  \"TBL_NO_PK\": {\"columns\": {\"a\": \"INT\", \"b\": \"VARCHAR\"}}\n" +
+                "}");
+        JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
+        assertArrayEquals(new String[0], reg.primaryKeyColumns(TableName.valueOf("TBL_NO_PK")));
+    }
+
+    /**
+     * primaryKeyColumns: поведение refresh() — изменения PK должны подхватываться.
+     */
+    @Test
+    @DisplayName("primaryKeyColumns + refresh(): PK меняется после перечитывания схемы")
+    void primaryKeyColumnsRefresh(@TempDir Path dir) throws IOException {
+        Path f = dir.resolve("schema.json");
+        write(f, "{\n" +
+                "  \"TBL_REFRESH_PK\": {\n" +
+                "    \"columns\": {\"c\":\"VARCHAR\",\"t\":\"UNSIGNED_TINYINT\",\"opd\":\"TIMESTAMP\",\"x\":\"INT\"},\n" +
+                "    \"PK\": [\"c\",\"t\",\"opd\"]\n" +
+                "  }\n" +
+                "}");
+        JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
+        TableName t = TableName.valueOf("TBL_REFRESH_PK");
+        assertArrayEquals(new String[]{"c","t","opd"}, reg.primaryKeyColumns(t));
+
+        // меняем PK и вызываем refresh()
+        write(f, "{\n" +
+                "  \"TBL_REFRESH_PK\": {\n" +
+                "    \"columns\": {\"c\":\"VARCHAR\",\"t\":\"UNSIGNED_TINYINT\",\"opd\":\"TIMESTAMP\",\"x\":\"INT\"},\n" +
+                "    \"PK\": [\"c\",\"opd\"]\n" +
+                "  }\n" +
+                "}");
+        reg.refresh();
+        assertArrayEquals(new String[]{"c","opd"}, reg.primaryKeyColumns(t));
+    }
+
+    /**
+     * Fail-fast контракт: primaryKeyColumns(table) бросает NPE при null table.
+     */
+    @Test
+    @DisplayName("Fail-fast: NPE на null table в primaryKeyColumns(...)")
+    void primaryKeyColumnsNpeOnNull() {
+        JsonSchemaRegistry reg = new JsonSchemaRegistry("/path/not/existing/schema.json");
+        NullPointerException npe = assertThrows(NullPointerException.class, () -> reg.primaryKeyColumns(null));
+        assertTrue(npe.getMessage() == null || npe.getMessage().toLowerCase().contains("table"), "Сообщение NPE должно указывать на параметр table");
+    }
+
+    @Test
+    @DisplayName("primaryKeyColumns: неизвестная таблица → пустой массив (не null)")
+    void primaryKeyColumnsUnknownTableReturnsEmpty(@TempDir Path dir) throws IOException {
+        Path f = dir.resolve("schema.json");
+        write(f, "{\n" +
+                "  \"TBL_KNOWN\": {\n" +
+                "    \"columns\": {\"c\":\"VARCHAR\",\"t\":\"UNSIGNED_TINYINT\",\"opd\":\"TIMESTAMP\"},\n" +
+                "    \"PK\": [\"c\",\"t\",\"opd\"]\n" +
+                "  }\n" +
+                "}");
+        JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
+
+        // неизвестная таблица должна давать пустой, но НЕ null
+        String[] pkUnknown = reg.primaryKeyColumns(TableName.valueOf("NOT_EXISTS"));
+        assertNotNull(pkUnknown);
+        assertEquals(0, pkUnknown.length, "Для неизвестной таблицы должен возвращаться пустой массив, не null");
+    }
+
+    @Test
+    @DisplayName("refresh(): при битой схеме предыдущий снимок сохраняется (не падаем)")
+    void refreshWithBrokenSchemaKeepsPrevious(@TempDir Path dir) throws IOException {
+        Path f = dir.resolve("schema.json");
+        write(f, "{\n" +
+                "  \"TBL_SAFE\": {\"columns\": {\"x\":\"INT\"}}\n" +
+                "}");
+        JsonSchemaRegistry reg = new JsonSchemaRegistry(f.toString());
+        TableName t = TableName.valueOf("TBL_SAFE");
+        assertEquals("INT", reg.columnType(t, "x"));
+
+        // Портим JSON и вызываем refresh()
+        write(f, "{");
+        reg.refresh();
+
+        // Ожидаем, что старый снимок остался рабочим (если это твой контракт)
+        assertEquals("INT", reg.columnType(t, "x"),
+                "При некорректной схеме на refresh() ожидается сохранение предыдущего снимка");
     }
 }

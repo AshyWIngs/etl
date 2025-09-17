@@ -20,7 +20,8 @@ enable 'TBL_JTI_TRACE_CIS_HISTORY'
 # enable 'DOCUMENTS'
 
 # --- Добавление peer со сбалансированным профилем ---
-#  acks=all, idempotence=true, max.in.flight=3 — компромисс скорость/надёжность.
+#  acks=all, idempotence=true, max.in.flight=5 — компромисс скорость/надёжность.
+#  При idempotence=true: max.in.flight ≤ 5, acks=all и retries > 0 — обязательные условия сохранения порядка и идемпотентности.
 #  Чуть больший linger и batch.size для лучшей утилизации сети/CPU.
 add_peer 'h2k_balanced',
   {
@@ -30,11 +31,11 @@ add_peer 'h2k_balanced',
       'h2k.kafka.bootstrap.servers'         => '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
       # client.id не задаём — Endpoint сам сгенерирует уникальный id per-host (hostname/UUID)
       'h2k.topic.pattern'                   => '${table}',              # ${table}|${namespace}|${qualifier}
-      'h2k.cf.list'                         => 'd',                     # можно CSV: 'b,d'
+      'h2k.cf.list'                         => 'd',                     # можно CSV: 'b,d'; PK из rowkey инъектируются в payload — в CF добавлять не нужно
 
-      # Декодирование
       'h2k.decode.mode'                     => 'json-phoenix',          # 'simple' | 'json-phoenix'
-      'h2k.schema.path'                     => '/opt/hbase-default-current/conf/schema.json',
+      # TIMESTAMP/DATE/TIME -> epoch millis; любой ARRAY -> JSON‑массив
+      'h2k.schema.path'                     => '/opt/hbase-default-current/conf/schema.json', # schema.json содержит колонки и PK
       'h2k.json.serialize.nulls'            => 'false',
 
       # Метаполя в полезной нагрузке
@@ -43,6 +44,7 @@ add_peer 'h2k_balanced',
       'h2k.payload.include.rowkey'         => 'false',
 
 
+      # Подсказка ёмкости считает ВСЕ ключи в payload (включая PK). Для TBL_JTI_TRACE_CIS_HISTORY это 32.
       # RowKey/соль/подсказки ёмкости (для DEFAULT namespace имя без префикса)
       'h2k.rowkey.encoding'                 => 'BASE64',
       'h2k.salt.map'                        => 'TBL_JTI_TRACE_CIS_HISTORY=1',
@@ -56,16 +58,20 @@ add_peer 'h2k_balanced',
       'h2k.producer.batch.debug.on.failure' => 'false',
 
       # --- Профиль BALANCED: компромисс скорость/надёжность ---
+      # --- Профиль BALANCED (чуть быстрее): linger.ms=100, batch.size=524288; порядок и идемпотентность сохранены ---
       'h2k.producer.enable.idempotence'     => 'true',
       'h2k.producer.acks'                   => 'all',
-      'h2k.producer.max.in.flight'          => '3',          # 2..5 допустимо; >1 может нарушать порядок при ретраях
+      'h2k.producer.max.in.flight'          => '5',          # при idempotence=true порядок сохраняется per‑partition; ≤5 обязательно, 3–5 даёт лучший throughput
       'h2k.producer.retries'                => '2147483647',
-      'h2k.producer.request.timeout.ms'     => '60000',
+      'h2k.producer.retry.backoff.ms'       => '100',
+      'h2k.producer.reconnect.backoff.ms'   => '100',
+      'h2k.producer.reconnect.backoff.max.ms' => '10000',
+      'h2k.producer.request.timeout.ms'     => '120000',
       'h2k.producer.delivery.timeout.ms'    => '300000',
 
       # Батчинг/сжатие
-      'h2k.producer.linger.ms'              => '100',
-      'h2k.producer.batch.size'             => '131072',
+      'h2k.producer.linger.ms'              => '100',   # чуть быстрее: больше батчинг без потери данных (acks=all + idempotence)
+      'h2k.producer.batch.size'             => '524288',   # 512 KiB батч — выше пропускная способность
       'h2k.producer.compression.type'       => 'lz4',
 
       # Буферы/размеры (выравниваем с fast-профилем по умолчанию)
@@ -88,8 +94,8 @@ show_peer_tableCFs 'h2k_balanced'  # опционально: покажет фи
 
 # --- Быстрые подсказки по тюнингу (balanced) ---
 # Пики задержек:
-#  - Увеличьте 'h2k.producer.linger.ms' (до 150–200) и/или 'h2k.producer.batch.size' (до 262144) для лучшей утилизации сети/CPU.
-#  - Переключите 'h2k.producer.compression.type' на 'lz4' (макс. throughput) или 'snappy' (экономия CPU).
+#  - Увеличьте 'h2k.producer.linger.ms' (до 150–200) и/или 'h2k.producer.batch.size' (до 524288) для лучшей утилизации сети/CPU (если хватает памяти).
+#  - 'h2k.producer.compression.type': 'lz4' — максимум throughput; 'snappy' — экономнее по CPU; 'zstd' — лучшее сжатие при большей задержке.
 #
 # Ошибки брокера (NOT_LEADER_FOR_PARTITION / UNKNOWN_TOPIC_OR_PARTITION / TIMEOUT):
 #  - Проверьте, что топик создан и распределён по брокерам; выровняйте лидеров разделов.
@@ -105,7 +111,7 @@ show_peer_tableCFs 'h2k_balanced'  # опционально: покажет фи
 #  - При необходимости используйте более агрессивное сжатие (lz4) или уменьшайте размер отдельных колонок в источнике.
 #
 # Порядок доставки:
-#  - В этом профиле 'max.in.flight=3' -> возможна перестановка при ретраях. Для строгого порядка установите 'max.in.flight=1'.
+#  - С idempotence=true порядок внутри раздела сохраняется при max.in.flight ≤ 5. Для максимально строгого порядка используйте 'max.in.flight=1' (ниже throughput).
 #
 # Наблюдаемость:
 #  - Включите DEBUG для 'kz.qazmarka.h2k.endpoint' при первичном пуске.

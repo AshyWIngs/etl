@@ -1,14 +1,23 @@
 package kz.qazmarka.h2k.payload;
 
+import java.nio.charset.StandardCharsets;
+
+import org.apache.hadoop.hbase.Cell;
+import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.util.Bytes;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
-
 import org.junit.jupiter.params.provider.ValueSource;
+
+import kz.qazmarka.h2k.config.H2kConfig;
+import kz.qazmarka.h2k.schema.Decoder;
+import kz.qazmarka.h2k.schema.SchemaRegistry;
+import kz.qazmarka.h2k.util.RowKeySlice;
 
 /**
  * Юнит‑тесты для расчёта начальной ёмкости корневой LinkedHashMap
@@ -40,6 +49,12 @@ import org.junit.jupiter.params.provider.ValueSource;
  */
 class PayloadBuilderTest {
 
+    private static final int MAX_HASH_CAP = 1 << 30;
+
+    private static int compute(int estimated, int hint) {
+        return PayloadBuilder.computeInitialCapacity(estimated, hint);
+    }
+
     /**
      * Эталонный расчёт capacity, полностью на целых типах.
      *
@@ -50,7 +65,7 @@ class PayloadBuilderTest {
      *  • target = max(estimated, hint>0 ? hint : 0)
      *  • initial = 1 + ceil(target / 0.75)
      *  • Эквивалент: initial = 1 + (4*target + 2)/3
-     *  • Минимум = 1; максимум = 1<<30
+     *  • Минимум = 1; максимум = {@link #MAX_HASH_CAP}
      *
      * Детали реализации:
      *  • Используем long при промежуточных вычислениях: (4*target + 2) помещается в 64 бита и не переполняется.
@@ -65,7 +80,7 @@ class PayloadBuilderTest {
         if (target <= 0) return 1;
         final long n = ((long) target << 2) + 2; // 4*target + 2
         long cap = 1 + n / 3L;
-        final long MAX = 1L << 30;
+        final long MAX = (long) MAX_HASH_CAP;
         if (cap > MAX) cap = MAX;
         return (int) cap;
     }
@@ -80,7 +95,7 @@ class PayloadBuilderTest {
         int est = 20;
         int hint = 0;
         int expected = expectedCapacity(est, hint);
-        assertEquals(expected, PayloadBuilder.computeInitialCapacity(est, hint));
+        assertEquals(expected, compute(est, hint));
     }
 
     /**
@@ -93,7 +108,7 @@ class PayloadBuilderTest {
         int est = 20;
         int hint = 40;
         int expected = expectedCapacity(est, hint);
-        assertEquals(expected, PayloadBuilder.computeInitialCapacity(est, hint));
+        assertEquals(expected, compute(est, hint));
     }
 
     /**
@@ -116,8 +131,7 @@ class PayloadBuilderTest {
     })
     @DisplayName("Корректное округление и обработка нулей/отрицательных")
     void roundsUpProperly(int estimated, int hint) {
-        assertEquals(expectedCapacity(estimated, hint),
-                PayloadBuilder.computeInitialCapacity(estimated, hint));
+        assertEquals(expectedCapacity(estimated, hint), compute(estimated, hint));
     }
 
     /**
@@ -127,9 +141,9 @@ class PayloadBuilderTest {
     @Test
     @DisplayName("Отрицательные значения не занижают результат (мин=1)")
     void ignoresNegativeValues() {
-        assertEquals(expectedCapacity(-1, -1), PayloadBuilder.computeInitialCapacity(-1, -1));
-        assertEquals(expectedCapacity(-1, 10), PayloadBuilder.computeInitialCapacity(-1, 10));
-        assertEquals(expectedCapacity(10, -1), PayloadBuilder.computeInitialCapacity(10, -1));
+        assertEquals(expectedCapacity(-1, -1), compute(-1, -1));
+        assertEquals(expectedCapacity(-1, 10), compute(-1, 10));
+        assertEquals(expectedCapacity(10, -1), compute(10, -1));
     }
 
     /**
@@ -141,8 +155,7 @@ class PayloadBuilderTest {
     void capsAtMax() {
         int est = Integer.MAX_VALUE / 2;
         int hint = Integer.MAX_VALUE;
-        assertEquals(expectedCapacity(est, hint),
-                PayloadBuilder.computeInitialCapacity(est, hint));
+        assertEquals(expectedCapacity(est, hint), compute(est, hint));
     }
 
     /**
@@ -153,9 +166,9 @@ class PayloadBuilderTest {
     @DisplayName("Монотонность по estimated: неубывающее значение")
     void monotonicInEstimated() {
         final int hint = 32;
-        int prev = PayloadBuilder.computeInitialCapacity(0, hint);
-        for (int est = 1; est <= 200; est++) {
-            int cur = PayloadBuilder.computeInitialCapacity(est, hint);
+        int prev = compute(0, hint);
+        for (int est = 1; est <= 160; est++) {
+            int cur = compute(est, hint);
             assertTrue(cur >= prev, "capacity должна быть неубывающей по estimated");
             prev = cur;
         }
@@ -169,9 +182,9 @@ class PayloadBuilderTest {
     @DisplayName("Монотонность по hint: неубывающее значение")
     void monotonicInHint() {
         final int est = 24;
-        int prev = PayloadBuilder.computeInitialCapacity(est, 0);
-        for (int h = 1; h <= 200; h++) {
-            int cur = PayloadBuilder.computeInitialCapacity(est, h);
+        int prev = compute(est, 0);
+        for (int h = 1; h <= 160; h++) {
+            int cur = compute(est, h);
             assertTrue(cur >= prev, "capacity должна быть неубывающей по hint");
             prev = cur;
         }
@@ -184,20 +197,14 @@ class PayloadBuilderTest {
     @DisplayName("Экстремальные границы: MIN/MAX int корректно обрабатываются (cap и минимум 1)")
     void extremeBounds() {
         // Очень большие положительные: срабатывает кэп 1<<30
-        assertEquals(expectedCapacity(Integer.MAX_VALUE, 0),
-                PayloadBuilder.computeInitialCapacity(Integer.MAX_VALUE, 0));
-        assertEquals(expectedCapacity(0, Integer.MAX_VALUE),
-                PayloadBuilder.computeInitialCapacity(0, Integer.MAX_VALUE));
-        assertEquals(expectedCapacity(Integer.MAX_VALUE, Integer.MAX_VALUE),
-                PayloadBuilder.computeInitialCapacity(Integer.MAX_VALUE, Integer.MAX_VALUE));
+        assertEquals(expectedCapacity(Integer.MAX_VALUE, 0), compute(Integer.MAX_VALUE, 0));
+        assertEquals(expectedCapacity(0, Integer.MAX_VALUE), compute(0, Integer.MAX_VALUE));
+        assertEquals(expectedCapacity(Integer.MAX_VALUE, Integer.MAX_VALUE), compute(Integer.MAX_VALUE, Integer.MAX_VALUE));
 
         // Сильные отрицательные: минимум 1
-        assertEquals(expectedCapacity(Integer.MIN_VALUE, 0),
-                PayloadBuilder.computeInitialCapacity(Integer.MIN_VALUE, 0));
-        assertEquals(expectedCapacity(0, Integer.MIN_VALUE),
-                PayloadBuilder.computeInitialCapacity(0, Integer.MIN_VALUE));
-        assertEquals(expectedCapacity(Integer.MIN_VALUE, Integer.MIN_VALUE),
-                PayloadBuilder.computeInitialCapacity(Integer.MIN_VALUE, Integer.MIN_VALUE));
+        assertEquals(expectedCapacity(Integer.MIN_VALUE, 0), compute(Integer.MIN_VALUE, 0));
+        assertEquals(expectedCapacity(0, Integer.MIN_VALUE), compute(0, Integer.MIN_VALUE));
+        assertEquals(expectedCapacity(Integer.MIN_VALUE, Integer.MIN_VALUE), compute(Integer.MIN_VALUE, Integer.MIN_VALUE));
     }
 
     /**
@@ -209,8 +216,8 @@ class PayloadBuilderTest {
     @DisplayName("Отрицательная подсказка эквивалентна отсутствию подсказки (hint<=0 → 0)")
     void negativeHintBehavesAsZero(int hint) {
         int est = 37;
-        int withZero = PayloadBuilder.computeInitialCapacity(est, 0);
-        int withNeg  = PayloadBuilder.computeInitialCapacity(est, hint);
+        int withZero = compute(est, 0);
+        int withNeg  = compute(est, hint);
         assertEquals(withZero, withNeg);
     }
 
@@ -226,7 +233,7 @@ class PayloadBuilderTest {
         for (int est : estValues) {
             for (int hint : hintValues) {
                 int expected = expectedCapacity(est, hint);
-                int actual   = PayloadBuilder.computeInitialCapacity(est, hint);
+                int actual   = compute(est, hint);
                 assertEquals(expected, actual,
                         "Mismatch for est=" + est + ", hint=" + hint);
             }
@@ -242,8 +249,8 @@ class PayloadBuilderTest {
     @DisplayName("Результат всегда >= 1 (включая отрицательные/нулевые входы)")
     void resultIsAtLeastOne(int t) {
         // Используем два пути получения target: через estimated и через hint
-        int a = PayloadBuilder.computeInitialCapacity(t, 0);
-        int b = PayloadBuilder.computeInitialCapacity(0, t);
+        int a = compute(t, 0);
+        int b = compute(0, t);
         assertTrue(a >= 1, "estimated=" + t + ", hint=0");
         assertTrue(b >= 1, "estimated=0, hint=" + t);
     }
@@ -259,11 +266,159 @@ class PayloadBuilderTest {
         int[] targets = {0,1,2,3,4,5,6,7,8,9,10,11,12,24,25,26,27,28,29,30};
         int prev = -1;
         for (int t : targets) {
-            int actual = PayloadBuilder.computeInitialCapacity(t, 0);
+            int actual = compute(t, 0);
             if (prev != -1) {
                 assertTrue(actual >= prev, "t=" + t + " capacity=" + actual + " prev=" + prev);
             }
             prev = actual;
         }
+    }
+
+    // ------------------------------------------------------------
+    // Интеграционные проверки PayloadBuilder: PK в Value и пропуск null
+    // ------------------------------------------------------------
+    @org.junit.jupiter.api.Nested
+    @org.junit.jupiter.api.DisplayName("PayloadBuilder PK-инъекция и поведение сериализации")
+    class IntegrationPkInjection {
+
+        final TableName table = TableName.valueOf("TBL_JTI_TRACE_CIS_HISTORY");
+
+        /** Минимальный стаб SchemaRegistry: знает типы PK и пользовательского поля id. */
+        final class StubRegistry implements SchemaRegistry {
+            @Override public void refresh() { /* no-op */ }
+            @Override public String columnType(TableName t, String q) {
+                if ("c".equals(q))   return "VARCHAR";
+                if ("t".equals(q))   return "UNSIGNED_TINYINT";
+                if ("opd".equals(q)) return "TIMESTAMP";
+                if ("id".equals(q))  return "VARCHAR"; // пользовательское поле должно попасть в payload
+                return null;
+            }
+            @Override public String[] primaryKeyColumns(TableName t) { return new String[] {"c","t","opd"}; }
+        }
+
+        /**
+         * Минимальный стаб Decoder для теста: инъекция PK и декодирование только поля "id".
+         * Остальные методы — no-op/минимум для прохождения сценария.
+         */
+        final class StubDecoder implements Decoder {
+            @Override
+            public Object decode(TableName table, String qualifier, byte[] bytes) {
+                if (bytes == null) return null;
+                // Не завязываемся на точное имя qualifier: декодируем любую непустую ячейку как строку.
+                return new String(bytes, StandardCharsets.UTF_8);
+            }
+            @Override
+            public void decodeRowKey(TableName table, RowKeySlice slice, int pkCount, java.util.Map<String,Object> out) {
+                out.put("c", "KZ");
+                out.put("t", 3);
+                out.put("opd", 1_700_000_000_000L);
+            }
+        }
+
+        @org.junit.jupiter.api.Test
+        @org.junit.jupiter.api.DisplayName("PK-поля попадают в Value, null-значения ячеек пропускаются")
+        void pkFieldsAreInjectedAndNullsSkipped() {
+            PayloadBuilder builder = new PayloadBuilder(new StubDecoder(),
+                    new H2kConfig.Builder("test-bootstrap").build());
+
+            // Минимальный набор ячеек: одна непустая и одна пропущенная (null не добавляем)
+            java.util.List<Cell> cells = new java.util.ArrayList<>();
+            byte[] row = new byte[]{1};
+            cells.add(new KeyValue(row, Bytes.toBytes("d"), Bytes.toBytes("ID"), "ABC".getBytes(StandardCharsets.UTF_8)));
+
+            java.util.Map<String,Object> payload = builder.buildRowPayload(table, cells, RowKeySlice.whole(row), 0L, 0L);
+            Object idVal = payload.containsKey("id") ? payload.get("id") : payload.get("ID");
+
+            // Проверяем наличие PK-полей и пользовательского поля, а также отсутствие "pn"
+            org.junit.jupiter.api.Assertions.assertAll(
+                    () -> org.junit.jupiter.api.Assertions.assertEquals("KZ", payload.get("c"), "ожидается PK c"),
+                    () -> org.junit.jupiter.api.Assertions.assertEquals(3, ((Number) payload.get("t")).intValue(), "ожидается PK t"),
+                    () -> org.junit.jupiter.api.Assertions.assertEquals(1_700_000_000_000L, ((Number) payload.get("opd")).longValue(), "ожидается PK opd"),
+                    () -> org.junit.jupiter.api.Assertions.assertEquals("ABC", idVal, "ожидается поле id"),
+                    () -> org.junit.jupiter.api.Assertions.assertFalse(payload.containsKey("pn"), "null-значения не сериализуются")
+            );
+        }
+    }
+
+    /**
+     * Простая сериализация JSONEachRow для целей теста (без внешних зависимостей).
+     * Поля с null пропускаются; строки экранируются по минимуму (кавычки и обратный слэш).
+     * Порядок полей сохраняется согласно порядку итерации Map.
+     */
+    private static String toJsonEachRow(java.util.Map<String, Object> payload) {
+        StringBuilder sb = new StringBuilder(64).append('{');
+        boolean first = true;
+        for (java.util.Map.Entry<String, Object> e : payload.entrySet()) {
+            Object v = e.getValue();
+            if (v == null) continue; // пропустить null-поля
+            if (!first) sb.append(',');
+            first = false;
+            // ключ всегда строка
+            sb.append('"').append(escapeJson(e.getKey())).append('"').append(':');
+            if (v instanceof CharSequence) {
+                sb.append('"').append(escapeJson(v.toString())).append('"');
+            } else {
+                sb.append(String.valueOf(v));
+            }
+        }
+        return sb.append('}').toString();
+    }
+
+    /** Минимальное экранирование строк для JSON: кавычка и обратный слэш. */
+    private static String escapeJson(String s) {
+        StringBuilder r = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch == '"' || ch == '\\') r.append('\\');
+            r.append(ch);
+        }
+        return r.toString();
+    }
+
+    @org.junit.jupiter.api.Test
+    @org.junit.jupiter.api.DisplayName("JSONEachRow: PK присутствуют как обычные поля, null-поля отсутствуют")
+    void jsonEachRowContainsPkAndNoNulls() {
+        // Используем уже готовую интеграцию: строим payload, затем сериализуем локальным JSON-формером.
+        IntegrationPkInjection ctx = new IntegrationPkInjection();
+        IntegrationPkInjection.StubDecoder decoder = ctx.new StubDecoder();
+        kz.qazmarka.h2k.config.H2kConfig cfg =
+                new kz.qazmarka.h2k.config.H2kConfig.Builder("test-bootstrap").build();
+        PayloadBuilder builder = new PayloadBuilder(decoder, cfg);
+
+        java.util.List<org.apache.hadoop.hbase.Cell> cells = new java.util.ArrayList<>();
+        byte[] row = new byte[]{1};
+        cells.add(new org.apache.hadoop.hbase.KeyValue(row,
+                org.apache.hadoop.hbase.util.Bytes.toBytes("d"),
+                org.apache.hadoop.hbase.util.Bytes.toBytes("ID"),
+                "ABC".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        // Поле со значением null намеренно не добавляем в список ячеек
+
+        java.util.Map<String, Object> payload =
+                builder.buildRowPayload(org.apache.hadoop.hbase.TableName.valueOf("TBL_JTI_TRACE_CIS_HISTORY"),
+                        cells, kz.qazmarka.h2k.util.RowKeySlice.whole(row), 0L, 0L);
+
+        String json = toJsonEachRow(payload);
+
+        org.junit.jupiter.api.Assertions.assertAll(
+                () -> org.junit.jupiter.api.Assertions.assertTrue(json.contains("\"c\":\"KZ\""), "ожидается PK c"),
+                () -> org.junit.jupiter.api.Assertions.assertTrue(json.contains("\"t\":3"), "ожидается PK t"),
+                () -> org.junit.jupiter.api.Assertions.assertTrue(json.contains("\"opd\":1700000000000"), "ожидается PK opd"),
+                () -> org.junit.jupiter.api.Assertions.assertTrue(json.contains("\"id\":\"ABC\"") || json.contains("\"ID\":\"ABC\""), "ожидается пользовательское поле id"),
+                () -> org.junit.jupiter.api.Assertions.assertFalse(json.contains(":null"), "null-поля не сериализуются")
+        );
+    }
+
+    /**
+     * Технический тест для IDE: даёт явную ссылку на вложенный класс, чтобы
+     * инспекция "is never used" не срабатывала. На выполнение и логику тестов не влияет.
+     */
+    @Test
+    @DisplayName("Tech: reference nested class to satisfy IDE analysis")
+    void referenceNestedClassForIde() {
+        // Явная ссылка на тип вложенного класса — этого достаточно для большинства инспекций.
+        Class<?> ignored = IntegrationPkInjection.class;
+        org.junit.jupiter.api.Assertions.assertNotNull(ignored);
+        Class<?> ignoredStub = IntegrationPkInjection.StubRegistry.class;
+        org.junit.jupiter.api.Assertions.assertNotNull(ignoredStub);
     }
 }

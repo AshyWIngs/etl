@@ -30,12 +30,15 @@ add_peer 'h2k_reliable',
       'h2k.kafka.bootstrap.servers'         => '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
       # client.id не задаём — Endpoint сам сгенерирует уникальный id per-host (hostname/UUID)
       'h2k.topic.pattern'                   => '${table}',              # ${table}|${namespace}|${qualifier}
-      'h2k.cf.list'                         => 'd',                     # можно CSV: 'b,d'
+      'h2k.cf.list'                         => 'd',                     # только нужные CF; PK из rowkey автоматически инъектируются в payload и в CF добавлять не нужно; можно CSV: 'b,d'
 
       # Декодирование
       'h2k.decode.mode'                     => 'json-phoenix',          # 'simple' | 'json-phoenix'
       'h2k.schema.path'                     => '/opt/hbase-default-current/conf/schema.json',
+      # schema.json содержит и колонки, и PK (primaryKey)
       'h2k.json.serialize.nulls'            => 'false',
+      # Декодирование Phoenix унифицировано:
+      #   TIMESTAMP/DATE/TIME -> epoch millis (long); любой ARRAY -> JSON-массив
 
       # Метаполя в полезной нагрузке
       'h2k.payload.include.meta'           => 'false',

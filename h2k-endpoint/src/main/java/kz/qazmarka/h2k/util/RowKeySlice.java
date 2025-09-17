@@ -1,11 +1,9 @@
 package kz.qazmarka.h2k.util;
 
-import java.util.Objects;
-
 import org.apache.hadoop.hbase.util.Bytes;
 
 /**
- * Нуллекопийный срез rowkey.
+ * Некопирующий срез rowkey.
  *
  * Назначение:
  *  - хранит ссылку на исходный массив байт, смещение и длину;
@@ -24,9 +22,9 @@ import org.apache.hadoop.hbase.util.Bytes;
  *  - для долговременного хранения используйте {@link #toByteArray()}.
  *
  * Контракт равенства/хеша:
- *  - {@link #hashCode()} совместим с {@code org.apache.hadoop.hbase.util.Bytes#hashCode(byte[], int, int)};
+ *  - {@link #hashCode()} совместим с {@link Bytes#hashCode(byte[], int, int)};
  *  - {@link #equals(Object)} сравнивает содержимое срезов (быстрый отсев по хешу и длине,
- *    затем помасковое сравнение байтов); корректен даже при редких коллизиях хеша.
+ *    затем побайтовое сравнение); корректен даже при редких коллизиях хеша.
  *
  * Потокобезопасность: неизменяемость делает класс безопасным для публикации между потоками,
  * при условии, что исходный массив не модифицируется внешним кодом.
@@ -60,6 +58,8 @@ public final class RowKeySlice {
     /**
      * Возвращает общий пустой срез (без аллокаций).
      * Полезно там, где ожидается «отсутствие ключа», но нужен объект.
+     *
+     * @return общий пустой срез (singleton), не создаёт новых объектов
      */
     public static RowKeySlice empty() { return EMPTY_SLICE; }
 
@@ -95,13 +95,14 @@ public final class RowKeySlice {
      * @param offset смещение начала среза в массиве
      * @param length длина среза
      * @throws NullPointerException если {@code array == null}
-     * @throws IllegalArgumentException если выход за границы массива
+     * @throws IndexOutOfBoundsException если выход за границы массива
      */
     public RowKeySlice(byte[] array, int offset, int length) {
-        Objects.requireNonNull(array, "array");
-        if (offset < 0 || length < 0 || offset + length > array.length) {
-            throw new IllegalArgumentException(
-                "offset/length out of bounds: offset=" + offset + ", length=" + length + ", array.length=" + array.length);
+        if (array == null) {
+            throw new NullPointerException("Аргумент 'array' (исходный байтовый массив) не может быть null");
+        }
+        if (offset < 0 || length < 0 || offset > array.length || length > array.length - offset) {
+            throw new IndexOutOfBoundsException("Выход за границы массива: offset=" + offset + ", length=" + length + ", array.length=" + array.length);
         }
         this.array = array;
         this.offset = offset;
@@ -111,9 +112,11 @@ public final class RowKeySlice {
 
     /**
      * Возвращает ССЫЛКУ на исходный массив rowkey (без копирования).
-     * <strong>ВАЖНО:</strong> возвращаемый массив нельзя модифицировать — это приведёт к нарушению
+     * ВАЖНО: возвращаемый массив нельзя модифицировать — это приведёт к нарушению
      * инвариантов (предвычисленный хеш останется старым). Метод предназначен для низкоуровневых
      * сценариев, где нужна совместимость с нативными API.
+     *
+     * @return исходный массив байт, принадлежащий этому срезу (не копия)
      */
     public byte[] getArray() { return array; }
 
@@ -168,6 +171,8 @@ public final class RowKeySlice {
      * Краткое диагностическое представление: длина, смещение, хеш (hex) и предпросмотр
      * первых байт rowkey в шестнадцатеричном виде, ограниченный {@link #PREVIEW_MAX} байт.
      * Формат предпросмотра: `[xx xx ..]`, где `..` означает усечение.
+     *
+     * @return человекочитаемая строка с основными параметрами и hex‑предпросмотром
      */
     @Override
     public String toString() {

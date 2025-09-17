@@ -2,9 +2,11 @@ package kz.qazmarka.h2k.schema;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
-import java.util.Objects;
+import java.util.Map;
 
 import org.apache.hadoop.hbase.TableName;
+
+import kz.qazmarka.h2k.util.RowKeySlice;
 
 /**
  * Унифицированный интерфейс декодирования значений ячеек (Cell value bytes)
@@ -14,10 +16,12 @@ import org.apache.hadoop.hbase.TableName;
  *  - предоставить общий контракт для схематических декодеров (Simple/Phoenix и т.д.);
  *  - поддержать как «медленный совместимый путь» (через строковый qualifier),
  *    так и «быстрый путь без аллокаций» (через срезы byte[]).
+ *  - обеспечить декодирование составного {@code rowkey} в именованные поля значения
+ *    для таблиц с составным PK; см. {@link #decodeRowKey(TableName, RowKeySlice, int, Map)}.
  *
  * Производительность
  *  - для горячего пути используйте перегрузку с срезами байтов
- *    {@link #decode(org.apache.hadoop.hbase.TableName, byte[], int, int, byte[], int, int)} —
+ *    {@link #decode(TableName, byte[], int, int, byte[], int, int)} —
  *    она позволяет не создавать промежуточные строки/копии;
  *  - дефолтная реализация «быстрой» перегрузки намеренно делает безопасные копии/преобразования,
  *    сохраняя прежнюю семантику и изоляцию от внешних модификаций массивов; конкретные реализации
@@ -37,8 +41,15 @@ import org.apache.hadoop.hbase.TableName;
  *    вернуть {@code null} либо бросить непроверяемое исключение с коротким контекстом
  *    (таблица, колонка, длина/префикс значения) для диагностики.
  *
- * Замечание по стилю
- *  - Javadoc без HTML‑тегов ради единообразия по проекту.
+ * Контракты
+ *  - строгая проверка фиксированных типов/размеров для Phoenix-типов — обязанность реализации
+ *    «Phoenix-кодека»; при несоответствии следует бросать {@link IllegalStateException}
+ *    с диагностикой на русском;
+ *  - все ссылочные аргументы считаются обязательными; при {@code null} — {@link NullPointerException};
+ *  - отсутствует I/O и избыточные аллокации на горячем пути; при необходимости конкретные реализации
+ *    могут переопределять дефолтные методы для нулевых аллокаций.
+ *  - имена полей PK сохраняются такими, как заданы в схеме (переименование, например в {@code *_ms}, на уровне интерфейса не производится);
+ *  - нормализация временных типов Phoenix (TIMESTAMP/DATE/TIME → миллисекунды эпохи) выполняется конкретной реализацией декодера; в стандартной поставке это делает {@code ValueCodecPhoenix}.
  */
 @FunctionalInterface
 public interface Decoder {
@@ -67,21 +78,39 @@ public interface Decoder {
      * могут переопределить метод для нулевых аллокаций (не строить String для qualifier и не копировать value),
      * если это безопасно для их контракта и вызывающая сторона не мутирует массив.
      *
+     * Предусловия к параметрам-срезам:
+     *  — {@code qual != null} и диапазон {@code [qOff, qOff+qLen)} должен полностью попадать в {@code qual.length};
+     *  — если {@code value != null}, то диапазон {@code [vOff, vOff+vLen)} должен полностью попадать в {@code value.length};
+     *    при {@code value == null} параметры {@code vOff}/{@code vLen} игнорируются.
+     *
      * @param table  имя таблицы
      * @param qual   массив байт qualifier, не {@code null}
-     * @param qOff   смещение qualifier в массиве
-     * @param qLen   длина qualifier
-     * @param value  массив байт значения, допускается {@code null}
-     * @param vOff   смещение значения в массиве
-     * @param vLen   длина значения
+     * @param qOff   смещение qualifier в массиве (≥ 0)
+     * @param qLen   длина qualifier (≥ 0)
+     * @param value  массив байт значения; допускается {@code null}
+     * @param vOff   смещение значения в массиве (≥ 0, если {@code value != null})
+     * @param vLen   длина значения (≥ 0, если {@code value != null})
      * @return декодированное значение или {@code null}
+     * @throws NullPointerException     если {@code table} или {@code qual} равны {@code null}
+     * @throws IndexOutOfBoundsException если любой из срезов выходит за границы соответствующего массива
      */
     default Object decode(TableName table,
                           byte[] qual, int qOff, int qLen,
                           byte[] value, int vOff, int vLen) {
-        Objects.requireNonNull(table, "table");
+        if (table == null) {
+            throw new NullPointerException("Аргумент 'table' (имя таблицы) не может быть null");
+        }
+        // Предусловия к срезам (ручные проверки совместимые с Java 8)
         if (qual == null) {
-            throw new NullPointerException("qualifier");
+            throw new NullPointerException("Аргумент 'qualifier' (имя колонки) не может быть null");
+        }
+        if (qOff < 0 || qLen < 0 || qOff > qual.length - qLen) {
+            throw new IndexOutOfBoundsException(
+                    "срез qualifier вне границ массива: off=" + qOff + " len=" + qLen + " cap=" + qual.length);
+        }
+        if (value != null && (vOff < 0 || vLen < 0 || vOff > value.length - vLen)) {
+            throw new IndexOutOfBoundsException(
+                    "срез value вне границ массива: off=" + vOff + " len=" + vLen + " cap=" + value.length);
         }
         final String qualifier;
         if (qOff == 0 && qLen == qual.length) {
@@ -104,18 +133,27 @@ public interface Decoder {
     }
 
     /**
-     * Удобная перегрузка с целыми массивами qualifier/value.
-     * Делегирует на «быструю» перегрузку с оффсетами. Семантика копирования value по умолчанию
+     * Удобная перегрузка с целыми массивами {@code qualifier}/{@code value}.
+     * Делегирует на «быструю» перегрузку с оффсетами. Семантика копирования {@code value} по умолчанию
      * сохраняется в вызываемой перегрузке.
      *
-     * @param table имя таблицы
+     * Предусловия:
+     *  — {@code table} и {@code qual} обязательны и не могут быть {@code null};
+     *  — {@code value} допускается быть {@code null}.
+     *
+     * @param table имя таблицы, не {@code null}
      * @param qual  массив байт qualifier, не {@code null}
-     * @param value массив байт значения (допускается {@code null})
+     * @param value массив байт значения; допускается {@code null}
      * @return декодированное значение или {@code null}
+     * @throws NullPointerException если {@code table} или {@code qual} равны {@code null}
      */
     default Object decode(TableName table, byte[] qual, byte[] value) {
-        Objects.requireNonNull(table, "table");
-        Objects.requireNonNull(qual, "qualifier");
+        if (table == null) {
+            throw new NullPointerException("Аргумент 'table' (имя таблицы) не может быть null");
+        }
+        if (qual == null) {
+            throw new NullPointerException("Аргумент 'qualifier' (имя колонки) не может быть null");
+        }
         int qLen = qual.length;
         int vLen = (value == null ? 0 : value.length);
         return decode(table, qual, 0, qLen, value, 0, vLen);
@@ -152,6 +190,14 @@ public interface Decoder {
         /**
          * Быстрая типобезопасная перегрузка (нулевые аллокации при корректной реализации).
          *
+         * Предусловия:
+         *  — если {@code qual != null}, диапазон {@code [qOff, qOff + qLen)} обязан полностью
+         *    находиться в пределах {@code qual.length};
+         *  — если {@code value != null}, диапазон {@code [vOff, vOff + vLen)} обязан полностью
+         *    находиться в пределах {@code value.length}.
+         *  Валидация диапазонов может не выполняться реализацией — ответственность вызывающей стороны;
+         *  при нарушении возможен {@link IndexOutOfBoundsException}.
+         *
          * @param table имя таблицы
          * @param qual  массив байт qualifier (или {@code null})
          * @param qOff  смещение qualifier
@@ -160,6 +206,7 @@ public interface Decoder {
          * @param vOff  смещение значения
          * @param vLen  длина значения
          * @return декодированное значение типа {@code T} или {@code null}
+         * @throws IndexOutOfBoundsException если указанные срезы выходят за границы соответствующих массивов
          */
         T decode(TableName table,
                  byte[] qual, int qOff, int qLen,
@@ -168,7 +215,7 @@ public interface Decoder {
         /**
          * Компактный срез массива байт (массив + смещение + длина).
          * Уменьшает количество параметров в сигнатурах и облегчает статический анализ.
-         * Валидность границ не проверяется — ответственность вызывающей стороны.
+         * Валидность границ **не** проверяется на уровне фабрик — ответственность вызывающей стороны.
          */
         final class Slice {
             /** Исходный массив (допускается {@code null}). */
@@ -205,7 +252,7 @@ public interface Decoder {
         /**
          * Удобная обёртка с дефолтом и компактной сигнатурой (2 среза вместо 6 параметров).
          * Для максимальной производительности возможно прямое обращение к
-         * {@link #decode(org.apache.hadoop.hbase.TableName, byte[], int, int, byte[], int, int)}.
+         * {@link #decode(TableName, byte[], int, int, byte[], int, int)}.
          *
          * @param table        имя таблицы
          * @param qual         срез qualifier (или {@code null})
@@ -228,5 +275,28 @@ public interface Decoder {
             T v = decode(table, qa, qo, ql, va, vo, vl);
             return (v != null) ? v : defaultValue;
         }
+    }
+    /**
+     * Декодирует составной {@code rowkey} в именованные поля значения.
+     * Реализация по умолчанию — no-op (для простых декодеров, которые не знают о составе PK).
+     *
+     * Контракт:
+     * - Метод не бросает исключения; при отсутствии описания PK или невозможности декодирования — ничего не делает.
+     * - Реализация, понимающая схему Phoenix, обязана учитывать соль ({@code saltBytes}) и корректно сдвигать/обрезать ключ.
+     * Имена ключей PK помещаются в {@code out} без переименования (сохраняются исходные имена из схемы).
+     * Если PK-колонка имеет временной тип Phoenix, нормализация значения (например, в миллисекунды эпохи) выполняется реализацией декодера (в стандартной реализации — {@code ValueCodecPhoenix}).
+     *
+     * — Коллекция {@code out} не очищается реализацией; записи добавляются/переопределяются по месту.
+     *
+     * @param table     таблица, для которой декодируется ключ
+     * @param rk        срез бинарного {@code rowkey}
+     * @param saltBytes число байт соли Phoenix в начале ключа (0, если соли нет)
+     * @param out       карта для помещения полей PK (например, {@code c}, {@code t}, {@code opd})
+     */
+    default void decodeRowKey(TableName table,
+                              RowKeySlice rk,
+                              int saltBytes,
+                              Map<String, Object> out) {
+        // no-op по умолчанию
     }
 }

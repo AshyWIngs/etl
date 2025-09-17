@@ -20,7 +20,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>kz.qazmarka</groupId>
   <artifactId>h2k-endpoint</artifactId>
-  <version>0.0.1</version>
+  <version>0.0.5</version>
   <name>HBase 1.4.13 -> Kafka 2.3.1 ReplicationEndpoint</name>
 
   <properties>
@@ -36,6 +36,8 @@
 
     <!-- Логирование через SLF4J API; бэкенд выбирается окружением (log4j2/logback/slf4j-simple в dev) -->
     <slf4j.version>1.7.36</slf4j.version>
+    <!-- Версия Gson: фиксируем отдельно для IDE/compile; на рантайме библиотека берётся из окружения (scope=provided) -->
+    <gson.version>2.2.4</gson.version>
 
     <!-- lz4-java нужна только если на брокере включён compression.type=lz4; помечаем provided -->
     <lz4.version>1.6.0</lz4.version>
@@ -60,7 +62,7 @@
       <dependency>
         <groupId>com.google.code.gson</groupId>
         <artifactId>gson</artifactId>
-        <version>2.10.1</version>
+        <version>${gson.version}</version>
       </dependency>
       <dependency>
         <groupId>org.lz4</groupId>
@@ -157,6 +159,12 @@
           <scope>runtime</scope>
         </dependency>
       </dependencies>
+    </profile>
+    <profile>
+      <id>phoenix-4.15</id>
+      <properties>
+        <phoenix.version>4.15.0-HBase-1.4</phoenix.version>
+      </properties>
     </profile>
   </profiles>
 
@@ -257,7 +265,7 @@
       <artifactId>lz4-java</artifactId>
       <scope>provided</scope>
     </dependency>
-    <!-- Gson для сборки JSON-пейлоада. provided: чтобы не тащить внутрь JAR. -->
+    <!-- Gson для сборки JSON-пейлоада. scope=provided: доступен на compile и test, не включается в JAR, на рантайме берём из окружения. -->
     <dependency>
       <groupId>com.google.code.gson</groupId>
       <artifactId>gson</artifactId>
@@ -322,6 +330,15 @@
                   <excludes>
                     <exclude>log4j:log4j</exclude>
                     <exclude>org.slf4j:slf4j-log4j12</exclude>
+                    <!-- Запрещаем прямую зависимость на gson новее 2.2.4 -->
+                    <exclude>com.google.code.gson:gson:[2.2.5,)</exclude>
+                    <exclude>org.apache.zookeeper:zookeeper:[3.5,)</exclude>
+                    <exclude>io.netty:netty-all:[4.1.9,)</exclude>
+                    <exclude>com.google.guava:guava:(12.0.1,)</exclude>
+                    <exclude>org.slf4j:slf4j-api:[1.8,)</exclude>
+                    <exclude>org.apache.kafka:kafka-clients:(2.3.1,)</exclude>
+                    <exclude>org.apache.phoenix:phoenix-core:[0,4.14.2-HBase-1.4)</exclude>
+                    <exclude>org.apache.phoenix:phoenix-core:[4.16,)</exclude>
                   </excludes>
                 </bannedDependencies>
                 <!-- Не включаем dependencyConvergence сознательно: нам нужен тонкий JAR без жёсткой унификации всего дерева. -->

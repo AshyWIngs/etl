@@ -11,6 +11,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.Test;
 
+import kz.qazmarka.h2k.schema.SchemaRegistry;
+
 /**
  * Юнит‑тесты для {@link RowKeySlice}.
  *
@@ -201,5 +203,68 @@ class RowKeySliceTest {
         RowKeySlice emptyTail = new RowKeySlice(a, 3, 0);
         assertTrue(emptyTail.isEmpty());
         assertEquals(0, emptyTail.getLength());
+    }
+
+    /**
+     * Тест‑двойник реестра: считает вызовы {@link #refresh()} и хранит простую
+     * карту типов по имени колонки. Используется для проверки того, что
+     * {@code refresh()} вызывается и что поиск по имени чувствителен к регистру
+     * в «точном» режиме (без расслабленной логики).
+     */
+    private static final class CountingRegistry implements SchemaRegistry {
+        final java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.Map<String, String> cols = new java.util.HashMap<>();
+
+        @Override
+        public void refresh() {
+            calls.incrementAndGet();
+        }
+
+        @Override
+        public String columnType(org.apache.hadoop.hbase.TableName table, String qualifier) {
+            return cols.get(qualifier);
+        }
+
+        @Override
+        public String[] primaryKeyColumns(org.apache.hadoop.hbase.TableName table) {
+            return new String[0];
+        }
+    }
+
+    /**
+     * refresh(): проверяем, что вызовы не теряются и считаются корректно.
+     */
+    @org.junit.jupiter.api.Test
+    void refreshIncrementsCounter() {
+        CountingRegistry r = new CountingRegistry();
+        r.refresh();
+        r.refresh();
+        r.refresh();
+        org.junit.jupiter.api.Assertions.assertEquals(3, r.calls.get(),
+                "refresh() должен инкрементировать счётчик каждый вызов");
+    }
+
+    /**
+     * Чувствительность к регистру для точного поиска: наличие только в Upper/Lower
+     * не должно находиться по другому регистру. Набор проверок оформлен как
+     * мини‑параметризация через assertAll.
+     */
+    @org.junit.jupiter.api.Test
+    void exactLookupIsCaseSensitive_matrix() {
+        CountingRegistry r = new CountingRegistry();
+        r.cols.put("FOO", "INT");
+        r.cols.put("bar", "VARCHAR");
+        org.apache.hadoop.hbase.TableName tbl = org.apache.hadoop.hbase.TableName.valueOf("T");
+
+        org.junit.jupiter.api.Assertions.assertAll(
+                () -> org.junit.jupiter.api.Assertions.assertEquals("INT", r.columnType(tbl, "FOO"),
+                        "Должны находить точное совпадение в верхнем регистре"),
+                () -> org.junit.jupiter.api.Assertions.assertNull(r.columnType(tbl, "foo"),
+                        "Нельзя находить через иной регистр, если нет relaxed‑логики"),
+                () -> org.junit.jupiter.api.Assertions.assertEquals("VARCHAR", r.columnType(tbl, "bar"),
+                        "Должны находить точное совпадение в нижнем регистре"),
+                () -> org.junit.jupiter.api.Assertions.assertNull(r.columnType(tbl, "BAR"),
+                        "Нельзя находить через иной регистр, если нет relaxed‑логики")
+        );
     }
 }

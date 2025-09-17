@@ -1,17 +1,26 @@
 package kz.qazmarka.h2k.endpoint;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStreamWriter;
 import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Future;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Cell;
+import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.replication.BaseReplicationEndpoint;
 import org.apache.hadoop.hbase.replication.ReplicationEndpoint;
@@ -28,6 +37,7 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 
 import kz.qazmarka.h2k.config.H2kConfig;
+import kz.qazmarka.h2k.config.H2kConfig.Keys;
 import kz.qazmarka.h2k.kafka.BatchSender;
 import kz.qazmarka.h2k.kafka.TopicEnsurer;
 import kz.qazmarka.h2k.payload.PayloadBuilder;
@@ -49,6 +59,8 @@ import kz.qazmarka.h2k.util.RowKeySlice;
  *  - Горячий путь максимально прямолинейный: группировка по rowkey → сборка JSON → send в Kafka.
  *  - Все тяжёлые инициализации выполняются один раз в init()/doStart(): GSON, декодер, конфиг, KafkaProducer.
  *  - Класс используется из потока репликации HBase, дополнительных потоков не создаёт.
+ *  - JSON кодируется без промежуточной строки, переиспользуются {@code jsonOut}/{@code jsonWriter}
+ *    (поток один — синхронизация не требуется).
  *
  * Логирование
  *  - INFO: только существенные ошибки и факты остановки/старта.
@@ -64,35 +76,7 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
     /** Логгер класса. Все сообщения — на русском языке. */
     private static final Logger LOG = LoggerFactory.getLogger(KafkaReplicationEndpoint.class);
 
-    /**
-     * Однократный флаг, предотвращающий повторный вывод параметров файлового логгера при старте.
-     * Нужен, чтобы даже при повторных инициализациях компонента (например, рестарт пира)
-     * в лог попадала ровно одна строка с итоговой конфигурацией ротации логов.
-     */
-    private static final java.util.concurrent.atomic.AtomicBoolean LOG_FILE_CFG_ONCE = new java.util.concurrent.atomic.AtomicBoolean(false);
 
-    /**
-     * Печатает один INFO-лог с путём файла и параметрами ротации.
-     * Источник значений — системные свойства (см. {@code log4j.properties} / {@code hbase-env.sh}).
-     * Метод безопасен к отсутствию конкретной реализации логгера: читаются только системные свойства
-     * и нет зависимости от внутренних API Log4j.
-     *
-     * @implNote Вызов выполняется один раз за процесс при помощи {@link java.util.concurrent.atomic.AtomicBoolean}.
-     */
-    private static void logFileAppenderConfigOnce() {
-        if (LOG_FILE_CFG_ONCE.compareAndSet(false, true)) {
-            final String dir = java.lang.System.getProperty("h2k.log.dir",
-                    java.lang.System.getProperty("hbase.log.dir", "."));
-            final String file = java.lang.System.getProperty("h2k.log.file", dir + "/h2k-endpoint.log");
-            final String maxFileSize = java.lang.System.getProperty("h2k.log.maxFileSize", "10MB");
-            final String maxBackupIndex = java.lang.System.getProperty("h2k.log.maxBackupIndex", "10");
-            final String immediate = java.lang.System.getProperty("h2k.log.immediateFlush", "false");
-            final String buffered = java.lang.System.getProperty("h2k.log.bufferedIO", "true");
-            final String bufSize = java.lang.System.getProperty("h2k.log.buffer.size", "8192");
-            LOG.info("Лог-файл h2k: {} (MaxFileSize={}, MaxBackupIndex={}, ImmediateFlush={}, BufferedIO={}, BufferSize={})",
-                    file, maxFileSize, maxBackupIndex, immediate, buffered, bufSize);
-        }
-    }
 
     // ==== Дефолты локального класса ====
     /** Значение по умолчанию для режима декодирования значений. */
@@ -106,9 +90,9 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
     /** Экземпляр Gson для сериализации payload в JSON (disableHtmlEscaping, опциональная сериализация null). */
     private Gson gson;
     /** Буфер для кодирования JSON без промежуточной строки (уменьшаем аллокации на горячем пути). */
-    private final java.io.ByteArrayOutputStream jsonOut = new java.io.ByteArrayOutputStream(4096);
+    private final ByteArrayOutputStream jsonOut = new ByteArrayOutputStream(4096);
     /** Переиспользуемый writer поверх {@link #jsonOut}. Поток репликации один, поэтому синхронизация не требуется. */
-    private final java.io.OutputStreamWriter jsonWriter = new java.io.OutputStreamWriter(jsonOut, StandardCharsets.UTF_8);
+    private final OutputStreamWriter jsonWriter = new OutputStreamWriter(jsonOut, StandardCharsets.UTF_8);
 
     // вынесенная конфигурация и сервисы
     /** Иммутабельный снимок настроек h2k.* с предвычисленными флагами для горячего пути. */
@@ -117,13 +101,15 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
     private PayloadBuilder payload;
     /** Сервис проверки/создания топиков Kafka; может быть null, если ensureTopics=false. */
     private TopicEnsurer topicEnsurer;
-    /** Последний успешно проверенный/созданный топик для подавления повторных ensure в рамках потока. */
-    private String lastEnsuredTopic;
+    /** Множество топиков, успешно проверенных/созданных за время жизни пира (для подавления повторных ensure).
+     *  При ошибке ensure топик удаляется из множества, чтобы повторить попытку при следующем обращении. */
+    private final Set<String> ensuredTopics = new HashSet<>(8);
     /** Кэш соответствий таблица -> топик для устранения повторных вычислений topicPattern.
      *  TableName имеет стабильные equals/hashCode, кэш корректен на время жизни пира.
      */
-    private final java.util.Map<TableName, String> topicCache = new java.util.HashMap<>(8);
-    /** Кэшированный набор CF (в байтах) для фильтрации по WAL-timestamp; вычисляется один раз из конфигурации и не меняется на время жизни пира. */
+    private final Map<TableName, String> topicCache = new HashMap<>(8);
+    /** Кэшированный набор CF (в байтах) для фильтрации по WAL-timestamp; вычисляется один раз из конфигурации и не меняется
+     * на время жизни пира (иммутабельный слепок). Поток один, доп. синхронизация не требуется. */
     private byte[][] cfFamiliesBytesCached;
 
     /**
@@ -156,7 +142,7 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
         // Сводка по карте «соли» rowkey (h2k.salt.map) — только на DEBUG, чтобы не шуметь
         try {
             if (LOG.isDebugEnabled()) {
-                Map<String, Integer> saltMap = h2k.getSaltBytesByTable();
+                final Map<String, Integer> saltMap = h2k.getSaltBytesByTable();
                 if (saltMap == null || saltMap.isEmpty()) {
                     LOG.debug("Соль rowkey не задана (h2k.salt.map).");
                 } else {
@@ -172,7 +158,7 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
         this.topicEnsurer = TopicEnsurer.createIfEnabled(h2k);
 
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Инициализация завершена: topicPattern={}, cf(s)={}, ensureTopics={}, filterByWalTs={}, includeRowKey={}, rowkeyEncoding={}, includeMeta={}, includeMetaWal={}, batchCountersEnabled={}, batchDebugOnFailure={}",
+            LOG.debug("Инициализация завершена: шаблон_топика={}, cf_список={}, проверять_топики={}, фильтр_WAL_ts={}, включать_rowkey={}, кодировка_rowkey={}, включать_meta={}, включать_meta_WAL={}, счетчики_батчей={}, debug_батчей_при_ошибке={}",
                     h2k.getTopicPattern(),
                     h2k.getCfNamesCsv(),
                     h2k.isEnsureTopics(), h2k.isFilterByWalTs(), h2k.isIncludeRowKey(), h2k.getRowkeyEncoding(), h2k.isIncludeMeta(), h2k.isIncludeMetaWal(),
@@ -188,9 +174,9 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
      * @throws IOException если параметр {@code h2k.kafka.bootstrap.servers} не задан
      */
     private static String readBootstrapOrThrow(Configuration cfg) throws IOException {
-        final String bootstrap = cfg.get(kz.qazmarka.h2k.config.H2kConfig.Keys.BOOTSTRAP, "").trim();
+        final String bootstrap = cfg.get(Keys.BOOTSTRAP, "").trim();
         if (bootstrap.isEmpty()) {
-            throw new IOException("Отсутствует обязательный параметр конфигурации: " + kz.qazmarka.h2k.config.H2kConfig.Keys.BOOTSTRAP);
+            throw new IOException("Отсутствует обязательный параметр конфигурации: " + Keys.BOOTSTRAP);
         }
         return bootstrap;
     }
@@ -198,16 +184,17 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
     /**
      * Создаёт и настраивает {@link Gson} с учётом флага сериализации {@code null}‑полей.
      * HTML‑escaping отключён для компактности и читаемости JSON.
+     * На DEBUG выводится итоговый флаг serializeNulls.
      *
      * @param cfg HBase‑конфигурация (читается флаг {@code h2k.json.serialize.nulls})
      * @return готовый экземпляр {@link Gson}
      */
     private static Gson buildGson(Configuration cfg) {
-        boolean serializeNulls = cfg.getBoolean(kz.qazmarka.h2k.config.H2kConfig.Keys.JSON_SERIALIZE_NULLS, false);
+        boolean serializeNulls = cfg.getBoolean(Keys.JSON_SERIALIZE_NULLS, false);
         GsonBuilder gb = new GsonBuilder().disableHtmlEscaping();
         if (serializeNulls) gb.serializeNulls();
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Gson: serializeNulls={}", serializeNulls);
+            LOG.debug("Настройки Gson: serializeNulls={}", serializeNulls);
         }
         return gb.create();
     }
@@ -223,9 +210,9 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
      * @return выбранный декодер
      */
     private Decoder chooseDecoder(Configuration cfg) {
-        String mode = cfg.get(kz.qazmarka.h2k.config.H2kConfig.Keys.DECODE_MODE, DEFAULT_DECODE_MODE);
+        String mode = cfg.get(Keys.DECODE_MODE, DEFAULT_DECODE_MODE);
         if ("json-phoenix".equalsIgnoreCase(mode)) {
-            String schemaPath = cfg.get(kz.qazmarka.h2k.config.H2kConfig.Keys.SCHEMA_PATH);
+            String schemaPath = cfg.get(Keys.SCHEMA_PATH);
             if (schemaPath == null || schemaPath.trim().isEmpty()) {
                 throw new IllegalStateException(
                     "Включён режим json-phoenix, но не задан обязательный параметр h2k.schema.path");
@@ -250,7 +237,7 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
     /**
      * Подбирает начальную ёмкость для {@link LinkedHashMap} под ожидаемое число элементов
      * с учётом коэффициента загрузки 0.75. Эквивалент выражению {@code 1 + ceil(expected/0.75)}
-     * (= {@code 1 + ceil(4*expected/3)}) без операций с плавающей точкой.
+     * (= {@code 1 + ceil(4*expected/3)}) без операций с плавающей точкой, чтобы исключить double/ceil на горячем пути.
      * Для неположительных значений {@code expected} возвращает 16 (дефолтную начальную ёмкость);
      * верхний кэп — {@code 1<<30}.
      *
@@ -278,7 +265,7 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
         Properties props = ProducerPropsFactory.build(cfg, bootstrap);
 
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Kafka producer: client.id={}, bootstrap={}, acks={}, compression={}, linger.ms={}, batch.size={}, idempotence={}",
+            LOG.debug("Kafka‑producer: client.id={}, брокеры={}, acks={}, компрессия={}, linger.ms={}, batch.size={}, идемпотентность={}",
                     props.get(ProducerConfig.CLIENT_ID_CONFIG),
                     props.get(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG),
                     props.get(ProducerConfig.ACKS_CONFIG),
@@ -312,6 +299,11 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
             final byte[][] cfFamilies = doFilter ? cfFamiliesBytesCached : null;
             final long minTs = doFilter ? h2k.getWalMinTs() : -1L;
 
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Репликация: записей={}, awaitEvery={}, awaitTimeoutMs={}, фильтр по WAL-ts={}, включать WAL‑мета={}",
+                        entries.size(), awaitEvery, awaitTimeoutMs, doFilter, includeWalMeta);
+            }
+
             try (BatchSender sender = new BatchSender(
                     awaitEvery,
                     awaitTimeoutMs,
@@ -326,20 +318,20 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
 
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
-            LOG.warn("replicate(): поток был прерван; попробуем ещё раз", ie);
+            LOG.warn("Репликация: поток прерван; запросим повтор партии", ie);
             return false;
         } catch (java.util.concurrent.ExecutionException ee) {
-            LOG.error("replicate(): ошибка при ожидании подтверждений Kafka", ee);
+            LOG.error("Репликация: ошибка при ожидании подтверждений Kafka", ee);
             return false;
         } catch (java.util.concurrent.TimeoutException te) {
-            LOG.error("replicate(): таймаут ожидания подтверждений Kafka", te);
+            LOG.error("Репликация: таймаут ожидания подтверждений Kafka", te);
             return false;
         } catch (org.apache.kafka.common.KafkaException ke) {
-            LOG.error("replicate(): ошибка продьюсера Kafka", ke);
+            LOG.error("Репликация: ошибка продьюсера Kafka", ke);
             return false;
         } catch (Exception e) {
             // сюда могут попасть исключения из try-with-resources (sender.close())
-            LOG.error("replicate(): непредвиденная ошибка", e);
+            LOG.error("Репликация: непредвиденная ошибка", e);
             return false;
         }
     }
@@ -365,14 +357,25 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
         String topic = topicCache.computeIfAbsent(table, h2k::topicFor);
         WalMeta wm = includeWalMeta ? readWalMeta(entry) : WalMeta.EMPTY;
         ensureTopicSafely(topic);
+        int rowsSent = 0;
+        int cellsSent = 0;
         for (Map.Entry<RowKeySlice, List<Cell>> rowEntry : filteredRows(entry, doFilter, cfFamilies, minTs)) {
             sendRow(topic, table, wm, rowEntry, sender);
+            rowsSent++;
+            cellsSent += rowEntry.getValue().size();
+        }
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Репликация: запись WAL обработана: таблица={}, топик={}, строк отправлено={}, ячеек отправлено={}, фильтр={}, ensure-включён={}",
+                    table, topic, rowsSent, cellsSent, doFilter, topicEnsurer != null);
         }
     }
 
     /**
-     * Возвращает только те строки, которые проходят фильтр по WAL‑timestamp для целевого CF.
-     * Если фильтр выключен, возвращает «живой» view исходной мапы без копирования.
+     * Возвращает только те строки, которые проходят фильтр по WAL-timestamp для целевого CF.
+     * Если фильтр выключен, возвращается «живой» view {@code byRow.entrySet()} без копирования —
+     * итерировать результат следует немедленно (в текущем потоке), не кэшировать и не передавать за пределы вызова.
+     *
+     * @implNote Возвращаемый «живой» view не должен кэшироваться и использоваться после возврата из метода.
      *
      * @param entry     запись WAL
      * @param doFilter  флаг включения фильтрации
@@ -390,17 +393,17 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
             return byRow.entrySet();
         }
         // Ленивая аллокация результата — создаём список только если нашлись подходящие строки
-        java.util.List<Map.Entry<RowKeySlice, List<Cell>>> out = null;
+        List<Map.Entry<RowKeySlice, List<Cell>>> out = null;
         for (Map.Entry<RowKeySlice, List<Cell>> e : byRow.entrySet()) {
             if (passWalTsFilter(e.getValue(), cfFamilies, minTs)) {
                 if (out == null) {
                     // типичный порядок — небольшое число строк попадает под фильтр
-                    out = new java.util.ArrayList<>(Math.min(byRow.size(), 16));
+                    out = new ArrayList<>(Math.min(byRow.size(), 16));
                 }
                 out.add(e);
             }
         }
-        return (out != null) ? out : java.util.Collections.<Map.Entry<RowKeySlice, List<Cell>>>emptyList();
+        return (out != null) ? out : Collections.<Map.Entry<RowKeySlice, List<Cell>>>emptyList();
     }
 
     /**
@@ -426,21 +429,23 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
     }
 
     /**
-     * Читает {@code sequenceId} и {@code writeTime} из ключа {@link WAL.Entry}, если методы доступны в данной версии HBase.
-     * При отсутствии методов возвращает {@code -1} для обоих значений.
+     * Читает {@code sequenceId} и {@code writeTime} из ключа {@link WAL.Entry}.
+     * Для HBase 1.4.13:
+     *  - {@code getSequenceId()} объявляет {@link java.io.IOException} — перехватываем и возвращаем {@code -1};
+     *  - {@code getWriteTime()} не объявляет checked‑исключений — читаем напрямую без try/catch.
      *
      * @param entry запись WAL
      * @return контейнер с метаданными WAL
      */
     private static WalMeta readWalMeta(WAL.Entry entry) {
         long walSeq = -1L;
-        long walWriteTime = -1L;
-        try { walSeq = entry.getKey().getSequenceId(); } catch (NoSuchMethodError | AbstractMethodError | IOException ignore) {
-            // В HBase 1.4 метод может отсутствовать — безопасно игнорируем
+        try {
+            walSeq = entry.getKey().getSequenceId();
+        } catch (IOException e) {
+            // Для некоторых сборок 1.4.13 метод объявляет IOException — считаем метаданные недоступными
+            // и оставляем значение -1 без логирования (это не ошибка для функциональности).
         }
-        try { walWriteTime = entry.getKey().getWriteTime(); } catch (NoSuchMethodError | AbstractMethodError ignore) {
-            // В HBase 1.4 метод может отсутствовать — безопасно игнорируем
-        }
+        final long walWriteTime = entry.getKey().getWriteTime();
         return new WalMeta(walSeq, walWriteTime);
     }
 
@@ -475,12 +480,12 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
      * @param minTs  минимально допустимый timestamp (включительно)
      * @return {@code true}, если найдена хотя бы одна ячейка из {@code cf0} с {@code ts >= minTs}
      */
-    private static boolean passWalTsFilter1(java.util.List<org.apache.hadoop.hbase.Cell> cells,
+    private static boolean passWalTsFilter1(List<Cell> cells,
                                             byte[] cf0,
                                             long minTs) {
-        for (org.apache.hadoop.hbase.Cell c : cells) {
+        for (Cell c : cells) {
             if (c.getTimestamp() >= minTs &&
-                org.apache.hadoop.hbase.CellUtil.matchingFamily(c, cf0)) {
+                CellUtil.matchingFamily(c, cf0)) {
                 return true;
             }
         }
@@ -496,14 +501,14 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
      * @param minTs минимально допустимый timestamp (включительно)
      * @return {@code true}, если найдена ячейка из {@code cf0} или {@code cf1} с {@code ts >= minTs}
      */
-    private static boolean passWalTsFilter2(java.util.List<org.apache.hadoop.hbase.Cell> cells,
+    private static boolean passWalTsFilter2(List<Cell> cells,
                                             byte[] cf0,
                                             byte[] cf1,
                                             long minTs) {
-        for (org.apache.hadoop.hbase.Cell c : cells) {
+        for (Cell c : cells) {
             if (c.getTimestamp() >= minTs &&
-                (org.apache.hadoop.hbase.CellUtil.matchingFamily(c, cf0) ||
-                 org.apache.hadoop.hbase.CellUtil.matchingFamily(c, cf1))) {
+                (CellUtil.matchingFamily(c, cf0) ||
+                 CellUtil.matchingFamily(c, cf1))) {
                 return true;
             }
         }
@@ -519,14 +524,14 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
      * @param minTs       минимально допустимый timestamp (включительно)
      * @return {@code true}, если хотя бы одна ячейка удовлетворяет условию
      */
-    private static boolean passWalTsFilterN(java.util.List<org.apache.hadoop.hbase.Cell> cells,
+    private static boolean passWalTsFilterN(List<Cell> cells,
                                             byte[][] cfFamilies,
                                             long minTs) {
-        for (org.apache.hadoop.hbase.Cell c : cells) {
+        for (Cell c : cells) {
             final long ts = c.getTimestamp();
             if (ts >= minTs) {
                 for (byte[] cf : cfFamilies) {
-                    if (org.apache.hadoop.hbase.CellUtil.matchingFamily(c, cf)) {
+                    if (CellUtil.matchingFamily(c, cf)) {
                         return true;
                     }
                 }
@@ -538,22 +543,24 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
     /**
      * Безопасно проверяет/создаёт топик в Kafka через {@link TopicEnsurer}.
      * Любые ошибки логируются и не прерывают репликацию. Для снижения накладных расходов
-     * кэшируется последний успешно проверенный топик в поле {@code lastEnsuredTopic}.
+     * используется кэш множества уже успешно проверенных/созданных топиков ({@code ensuredTopics}).
+     * Повторные вызовы для одного и того же топика пропускаются, пока предыдущая проверка считалась успешной.
      *
      * @param topic имя топика, который требуется гарантировать
      */
     private void ensureTopicSafely(String topic) {
         if (topicEnsurer == null) return;
-        // Если тот же самый топик уже успешно проверяли/создавали, подавляем повтор
-        if (topic.equals(lastEnsuredTopic)) return;
+        // Если этот топик уже успешно проверяли/создавали ранее — повторять не нужно
+        if (!ensuredTopics.add(topic)) return;
         try {
             topicEnsurer.ensureTopic(topic);
-            lastEnsuredTopic = topic; // кэшируем успешную проверку
         } catch (Exception e) {
-            LOG.warn("Не удалось проверить/создать топик '{}': {}. Продолжаю без прерывания репликации", topic, e.toString());
+            LOG.warn("Проверка/создание топика '{}' не выполнена: {}. Репликацию не прерываю", topic, e.toString());
             if (LOG.isDebugEnabled()) {
                 LOG.debug("Трассировка ошибки ensureTopic()", e);
             }
+            // В случае ошибки убираем из кеша, чтобы попытаться снова при следующем обращении
+            ensuredTopics.remove(topic);
         }
     }
 
@@ -578,6 +585,10 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
      */
     private Map<RowKeySlice, List<Cell>> groupByRow(WAL.Entry entry) {
         final List<Cell> cells = entry.getEdit().getCells();
+        if (cells == null || cells.isEmpty()) {
+            // Страховка от «странных» оберток/тестов: возвращаем пустую мапу без NPE.
+            return Collections.emptyMap();
+        }
         final Map<RowKeySlice, List<Cell>> byRow = new LinkedHashMap<>(capacityFor(cells.size()));
 
         // Микро‑оптимизация: в WAL ячейки обычно идут батчами по одному rowkey.
@@ -599,7 +610,7 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
             } else {
                 // Новая строка — единожды создаём ключ‑срез и список
                 RowKeySlice key = new RowKeySlice(arr, off, len);
-                currentList = byRow.computeIfAbsent(key, k -> new java.util.ArrayList<>(8));
+                currentList = byRow.computeIfAbsent(key, k -> new ArrayList<>(8));
                 currentList.add(c);
 
                 // Обновляем маркеры «последней» строки
@@ -636,28 +647,26 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
             gson.toJson(obj, jsonWriter);
             jsonWriter.flush(); // Writer → BAOS
             return jsonOut.toByteArray();
-        } catch (java.io.IOException ex) {
+        } catch (IOException ex) {
             // Редкая ситуация: ошибка при записи/flush в Writer. Не роняем поток, логируем и уходим в безопасный фолбэк.
-            LOG.warn("JSON через Writer не удался ({}), fallback на toJson(obj): {}",
+            LOG.warn("Сериализация JSON через Writer не удалась ({}), переключаюсь на безопасный фолбэк toJson(obj): {}",
                     ex.getClass().getSimpleName(), ex.toString());
             if (LOG.isDebugEnabled()) {
-                LOG.debug("Stacktrace JSON(Writer) failure:", ex);
+                LOG.debug("Трассировка ошибки сериализации JSON через Writer:", ex);
             }
-            return gson.toJson(obj).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            return gson.toJson(obj).getBytes(StandardCharsets.UTF_8);
         }
     }
 
-
-    /**
-     * В HBase 1.4 {@code Context} не предоставляет getPeerUUID(), возвращаем null (допустимо для данного API).
+    /** В HBase 1.4 {@code Context} не предоставляет getPeerUUID(); сигнатура метода требуется API базового класса.
+     *  Для совместимости с этой версией возвращаем {@code null} (допустимое значение для данного API).
      */
     @Override public UUID getPeerUUID() { return null; }
     /**
-     * Сообщает фреймворку об успешном старте эндпоинта и единожды логирует параметры файлового логгера.
+     * Сообщает фреймворку об успешном старте эндпоинта.
      */
     @Override
     protected void doStart() {
-        logFileAppenderConfigOnce();
         notifyStarted();
     }
     /**
@@ -728,13 +737,13 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
                         ? (DEFAULT_CLIENT_ID + '-' + UUID.randomUUID())
                         : (DEFAULT_CLIENT_ID + '-' + host);
                 props.put(ProducerConfig.CLIENT_ID_CONFIG, cfg.get("h2k.producer.client.id", fallback));
-            } catch (java.net.UnknownHostException ignore) {
+            } catch (UnknownHostException ignore) {
                 String fallback = DEFAULT_CLIENT_ID + '-' + UUID.randomUUID();
                 props.put(ProducerConfig.CLIENT_ID_CONFIG, cfg.get("h2k.producer.client.id", fallback));
             }
 
             // pass‑through: любые h2k.producer.* → «настоящие» ключи продьюсера, если не заданы выше
-            final String prefix = kz.qazmarka.h2k.config.H2kConfig.Keys.PRODUCER_PREFIX;
+            final String prefix = Keys.PRODUCER_PREFIX;
             final int prefixLen = prefix.length();
             for (Map.Entry<String, String> e : cfg) {
                 final String k = e.getKey();

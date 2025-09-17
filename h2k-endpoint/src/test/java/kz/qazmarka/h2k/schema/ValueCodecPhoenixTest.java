@@ -25,6 +25,7 @@ import org.apache.phoenix.schema.types.PDate;
 import org.apache.phoenix.schema.types.PTime;
 import org.apache.phoenix.schema.types.PTimestamp;
 import org.apache.phoenix.schema.types.PVarbinary;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -34,6 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 
 /**
  * Консолидированный набор юнит-тестов для {@link ValueCodecPhoenix}.
@@ -363,12 +365,97 @@ class ValueCodecPhoenixTest {
             assertTrue(app.warns.get() <= 1, "В многопоточном сценарии WARN также должен сработать не более одного раза");
         }
     }
+    @Nested
+    @DisplayName("Инварианты: унификация возвращаемых типов")
+    class Invariants {
+
+        @Test
+        @DisplayName("TIMESTAMP/DATE/TIME → Long epochMillis")
+        void temporal_return_long_epoch_millis() {
+            long ts = 1_725_000_000_000L;
+            byte[] tsRaw = PTimestamp.INSTANCE.toBytes(new Timestamp(ts));
+
+            long midnight = ts - (ts % 86_400_000L);
+            byte[] dRaw = PDate.INSTANCE.toBytes(new Date(midnight));
+
+            long tOfDay = (12 * 60 * 60 + 34 * 60 + 56) * 1000L + 789;
+            byte[] timeRaw = PTime.INSTANCE.toBytes(new Time(tOfDay));
+
+            ValueCodecPhoenix vc = new ValueCodecPhoenix(new FakeRegistry()
+                    .with("TS", "TIMESTAMP")
+                    .with("D", "DATE")
+                    .with("T", "TIME"));
+
+            Object tsOut = vc.decode(TBL, "TS", tsRaw);
+            Object dOut = vc.decode(TBL, "D", dRaw);
+            Object tOut = vc.decode(TBL, "T", timeRaw);
+
+            assertAll(
+                    () -> { assertTrue(tsOut instanceof Long, "TIMESTAMP должен возвращать Long"); assertEquals(ts, ((Long) tsOut).longValue()); },
+                    () -> { assertTrue(dOut instanceof Long, "DATE должен возвращать Long"); assertEquals(midnight, ((Long) dOut).longValue()); },
+                    () -> { assertTrue(tOut instanceof Long, "TIME должен возвращать Long"); assertEquals(tOfDay, ((Long) tOut).longValue()); }
+            );
+        }
+
+        @Test
+        @DisplayName("ARRAY → List<Object> для разных входов")
+        void arrays_become_list() {
+            try {
+                Method m = ValueCodecPhoenix.class.getDeclaredMethod("toListFromRawArray", Object.class);
+                m.setAccessible(true);
+
+                assertAll(
+                        () -> assertEquals(Arrays.asList("a", "b"), invokeList(m, new Object[]{"a", "b"})),
+                        () -> assertEquals(Arrays.asList(1, 2), invokeList(m, new int[]{1, 2})),
+                        () -> assertEquals(Arrays.asList((short) 1, (short) 2), invokeList(m, new short[]{1, 2})),
+                        () -> assertEquals(Arrays.asList('x', 'y'), invokeList(m, new char[]{'x', 'y'})),
+                        () -> assertEquals(Arrays.asList(1L, 2L, 3L), invokeList(m, new long[]{1, 2, 3})),
+                        () -> assertEquals(Arrays.asList(1.0, 2.5), invokeList(m, new double[]{1.0, 2.5})),
+                        () -> assertEquals(Arrays.asList(true, false), invokeList(m, new boolean[]{true, false}))
+                );
+            } catch (NoSuchMethodException e) {
+                throw new AssertionError("Ошибка при тестировании arrays_become_list", e);
+            }
+        }
+
+        @SuppressWarnings("unchecked")
+        private List<Object> invokeList(Method m, Object array) {
+            try {
+                return (List<Object>) m.invoke(null, array);
+            } catch (IllegalAccessException | InvocationTargetException e) {
+                throw new AssertionError("Ошибка вызова toListFromRawArray через рефлексию", e);
+            }
+        }
+
+        @Test
+        @DisplayName("Фиксированные размеры: строгая проверка длины (1/2/4/8)")
+        void fixed_width_strict_lengths() {
+            java.util.Map<String, Integer> types = new java.util.LinkedHashMap<>();
+            types.put("UNSIGNED_TINYINT", 1);
+            types.put("UNSIGNED_SMALLINT", 2);
+            types.put("UNSIGNED_INT", 4);
+            types.put("UNSIGNED_LONG", 8);
+
+            assertAll(types.entrySet().stream()
+                    .map(e -> (Executable) () -> {
+                        String q = "Q" + e.getValue();
+                        byte[] wrong = new byte[e.getValue() + 1];
+                        ValueCodecPhoenix vc = new ValueCodecPhoenix(new FakeRegistry().with(q, e.getKey()));
+                        IllegalStateException ex = assertThrows(IllegalStateException.class, () -> vc.decode(TBL, q, wrong));
+                        assertTrue(ex.getMessage().contains(String.valueOf(e.getValue())),
+                                "Диагностика должна содержать ожидаемую длину: " + ex.getMessage());
+                    })
+                    .toArray(Executable[]::new));
+        }
+    }
+
     @Test
     @DisplayName("Anchors to mark nested test classes as used")
     void anchors() {
         Class<?>[] refs = {
                 Positive.class, Negative.class, NormalizeTypeName.class, ArrayConversion.class,
-                TemporalPositive.class, BinaryPositive.class, DecimalNegative.class, WarnOnce.class, Concurrency.class
+                TemporalPositive.class, BinaryPositive.class, DecimalNegative.class, WarnOnce.class, Concurrency.class,
+                Invariants.class
         };
         assertNotNull(refs);
     }

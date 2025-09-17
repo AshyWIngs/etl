@@ -1,13 +1,22 @@
 package kz.qazmarka.h2k.schema;
 
+import java.lang.reflect.Array;
+import java.sql.Date;
 import java.sql.SQLException;
+import java.sql.Time;
+import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.function.UnaryOperator;
 
 import org.apache.hadoop.hbase.TableName;
 import org.apache.phoenix.schema.types.PBinary;
@@ -32,41 +41,52 @@ import org.apache.phoenix.schema.types.PVarbinary;
 import org.apache.phoenix.schema.types.PVarchar;
 import org.apache.phoenix.schema.types.PVarcharArray;
 import org.apache.phoenix.schema.types.PhoenixArray;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import kz.qazmarka.h2k.util.RowKeySlice;
 
 /**
- * ValueCodecPhoenix — декодер значений колонок через Phoenix {@link PDataType}, опираясь на {@link SchemaRegistry}.
+ * Кодек Phoenix для скалярных (и некоторых массивных) типов.
+ *
+ * Строгие правила
+ * - Фиксированные типы требуют строго заданной длины: {@code UNSIGNED_INT} = 4 байта,
+ *   {@code UNSIGNED_TINYINT} = 1 байт, {@code UNSIGNED_SMALLINT} = 2 байта и т.п.
+ * - При несоответствии длины/типа выбрасывается {@link IllegalStateException} с диагностикой на русском.
+ * - Временные типы декодируются по правилам Phoenix 4.14/4.15 (мс с эпохи для {@code TIMESTAMP/DATE/TIME}).
  *
  * Назначение
- *  • Поддерживает семантику Phoenix для широкого набора типов (UNSIGNED‑типы, TIMESTAMP/DATE/TIME, ARRAY и т.п.).
- *  • Унифицирует результат: TIMESTAMP/DATE/TIME → epoch millis (long); любой Phoenix ARRAY → {@code List<Object>};
- *    VARBINARY/BINARY → {@code byte[]} как есть; прочие типы — как вернул {@code PDataType}.
+ * - Декодер значений колонок через Phoenix {@link PDataType}, опираясь на {@link SchemaRegistry}.
+ * - Поддерживает семантику Phoenix для широкого набора типов (UNSIGNED‑типы, TIMESTAMP/DATE/TIME, ARRAY и т.п.).
+ * - Унифицирует результат: TIMESTAMP/DATE/TIME → epoch millis (long); любой Phoenix ARRAY → {@code List<Object>};
+ *   VARBINARY/BINARY → {@code byte[]} как есть; прочие типы — как вернул {@code PDataType}.
  *
- * Строгая диагностика/исключения
- *  • Если тип колонки известен (получен из {@link SchemaRegistry}), но байты не соответствуют формату,
- *    метод {@link #decode(TableName, String, byte[])} выбрасывает {@link IllegalStateException} с контекстом
- *    (таблица, колонка, тип). Это позволяет рано обнаруживать «битые» данные и ошибки конфигурации.
- *  • Для фиксированных типов дополнительно проверяется длина байтового представления (getByteSize); при расхождении выбрасывается IllegalStateException.
- *  • Входные {@code table} и {@code qualifier} обязательны: при {@code null} выбрасывается {@link NullPointerException}.
- *  • Если тип колонки в реестре неизвестен, декодер один раз пишет WARN и использует {@code VARCHAR} как дефолт.
- *  • Для массивов с неизвестным типом (не распознанным реестром/словариём) будет использован дефолтный VARCHAR; это, как правило, приведёт к ошибке декодирования, которая будет выброшена как IllegalStateException (с контекстом).
+ * Диагностика и исключения
+ * - Если тип колонки известен (получен из {@link SchemaRegistry}), но байты не соответствуют формату,
+ *   метод {@link #decode(TableName, String, byte[])} выбрасывает {@link IllegalStateException} с контекстом
+ *   (таблица, колонка, тип).
+ * - Для фиксированных типов дополнительно проверяется длина байтового представления ({@code getByteSize}).
+ * - Входные {@code table} и {@code qualifier} обязательны: при {@code null} выбрасывается {@link NullPointerException}.
+ * - Если тип колонки в реестре неизвестен, декодер один раз пишет WARN и использует {@code VARCHAR} как дефолт.
+ * - Для массивов с неизвестным типом будет использован дефолтный {@code VARCHAR}; как правило, это приведёт к ошибке
+ *   декодирования, которая будет выброшена как {@link IllegalStateException}.
  *
  * Производительность и GC
- *  • Двухуровневый кэш соответствий (table → qualifier → {@code PDataType}) минимизирует промахи в словарь типов
- *    и аллокации на «горячем пути».
- *  • Нормализация строкового имени типа выполняется ровно один раз на колонку (при первом доступе).
- *  • Конвертация массивов делает минимум аллокаций: {@code Object[]} не копируются, примитивы боксируются линейно.
- *  • В редких ветках (ошибки/неизвестные типы) формируются диагностические строки — это не влияет на быстрый путь.
+ * - Двухуровневый кэш соответствий (table → qualifier → {@code PDataType}) минимизирует промахи и аллокации.
+ * - Нормализация строкового имени типа выполняется один раз на колонку (при первом доступе).
+ * - Конвертация массивов делает минимум аллокаций: {@code Object[]} не копируются, примитивы боксируются линейно.
+ * - Диагностические строки формируются только в редких ветках (ошибки/неизвестные типы).
  *
  * Логи
- *  • При неизвестном типе в реестре один раз для конкретной колонки пишет WARN и использует VARCHAR по умолчанию.
- *  • Повторные промахи фиксируются в DEBUG (если включён).
+ * - При неизвестном типе в реестре один раз для конкретной колонки пишется WARN и используется {@code VARCHAR}.
+ * - Повторные промахи фиксируются на уровне DEBUG (если включён).
  *
  * Потокобезопасность
- *  • Класс использует только потокобезопасные структуры и безопасен для многопоточности в RegionServer.
+ * - Используются потокобезопасные структуры; класс безопасен для многопоточности в RegionServer.
  */
 public final class ValueCodecPhoenix implements Decoder {
     /** Логгер класса; все сообщения — на русском языке. */
-    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(ValueCodecPhoenix.class);
+    private static final Logger LOG = LoggerFactory.getLogger(ValueCodecPhoenix.class);
 
     /** Каноническое имя строкового типа Phoenix, используемое как дефолт. */
     private static final String T_VARCHAR = "VARCHAR";
@@ -85,7 +105,7 @@ public final class ValueCodecPhoenix implements Decoder {
     /**
      * Набор колонок, для которых уже был выведен WARN об неизвестном типе в реестре — чтобы не зашумлять логи.
      */
-    private final java.util.Set<ColKey> unknownTypeWarned = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Set<ColKey> unknownTypeWarned = ConcurrentHashMap.newKeySet();
 
     /**
      * Быстрый словарь соответствий: каноническое строковое имя Phoenix‑типа → экземпляр {@link PDataType}.
@@ -135,14 +155,24 @@ public final class ValueCodecPhoenix implements Decoder {
         m.put("BINARY VARYING", PVarbinary.INSTANCE);    // ANSI-форма VARBINARY
         m.put("LONG", PLong.INSTANCE);     // синоним BIGINT
         m.put("BOOL", PBoolean.INSTANCE);  // синоним BOOLEAN
-        TYPE_MAP = java.util.Collections.unmodifiableMap(m);
+        TYPE_MAP = Collections.unmodifiableMap(m);
+    }
+
+    /** Таблица нормализации временных типов → epoch millis (long). */
+    private static final Map<Class<?>, UnaryOperator<Object>> TEMP_NORMALIZERS;
+    static {
+        Map<Class<?>, UnaryOperator<Object>> m2 = new HashMap<>(4);
+        m2.put(Timestamp.class, v -> ((Timestamp) v).getTime());
+        m2.put(Date.class,      v -> ((Date) v).getTime());
+        m2.put(Time.class,      v -> ((Time) v).getTime());
+        TEMP_NORMALIZERS = Collections.unmodifiableMap(m2);
     }
 
     /**
      * @param registry реализация реестра типов Phoenix для колонок; не должна быть {@code null}
      */
     public ValueCodecPhoenix(SchemaRegistry registry) {
-        this.registry = registry;
+        this.registry = Objects.requireNonNull(registry, "registry");
     }
 
     /**
@@ -168,7 +198,7 @@ public final class ValueCodecPhoenix implements Decoder {
             // Неизвестный тип — предупредим один раз для этой колонки, дальше молчим (DEBUG)
             final ColKey warnKey = new ColKey(table, q); // создаём только в редкой ветке
             if (unknownTypeWarned.add(warnKey)) {
-                LOG.warn("Неизвестный тип Phoenix в реестре: {}.{} -> '{}' (нормализовано '{}'). Использую VARCHAR по умолчанию.",
+                LOG.warn("Неизвестный тип Phoenix в реестре для колонки {}.{} -> '{}' (нормализовано '{}'). Будет использован VARCHAR по умолчанию.",
                          table.getNameAsString(), q, raw, norm);
             } else if (LOG.isDebugEnabled()) {
                 LOG.debug("Повтор неизвестного типа Phoenix: {}.{} -> '{}' (нормализовано '{}')",
@@ -235,8 +265,8 @@ public final class ValueCodecPhoenix implements Decoder {
      */
     @Override
     public Object decode(TableName table, String qualifier, byte[] value) {
-        java.util.Objects.requireNonNull(table, "table");
-        java.util.Objects.requireNonNull(qualifier, "qualifier");
+        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(qualifier, "qualifier");
 
         if (value == null) return null;
 
@@ -263,9 +293,9 @@ public final class ValueCodecPhoenix implements Decoder {
         }
 
         // Единая нормализация времени: TIMESTAMP/DATE/TIME -> epoch millis
-        if (obj instanceof java.sql.Timestamp) return ((java.sql.Timestamp) obj).getTime();
-        if (obj instanceof java.sql.Date)      return ((java.sql.Date) obj).getTime();
-        if (obj instanceof java.sql.Time)      return ((java.sql.Time) obj).getTime();
+        if (obj instanceof Timestamp) return ((Timestamp) obj).getTime();
+        if (obj instanceof Date)      return ((Date) obj).getTime();
+        if (obj instanceof Time)      return ((Time) obj).getTime();
 
         // Массивы Phoenix конвертируем в List для удобства сериализации
         if (obj instanceof PhoenixArray) {
@@ -278,7 +308,7 @@ public final class ValueCodecPhoenix implements Decoder {
      * Безопасно извлекает массив из {@link PhoenixArray} и конвертирует его в {@code List<Object>}.
      * Любой {@link SQLException} заворачивается в {@link IllegalStateException} с контекстом.
      */
-    private static java.util.List<Object> toListFromPhoenixArray(PhoenixArray pa, TableName table, String qualifier) {
+    private static List<Object> toListFromPhoenixArray(PhoenixArray pa, TableName table, String qualifier) {
         try {
             Object raw = pa.getArray();
             return toListFromRawArray(raw);
@@ -291,7 +321,7 @@ public final class ValueCodecPhoenix implements Decoder {
      * Универсальная конвертация массивов (как объектных, так и примитивных) в {@code List<Object>} с минимальными
      * аллокациями. Для Object[] используется {@link Arrays#asList(Object[])}, для примитивов — коробка значений.
      */
-    private static java.util.List<Object> toListFromRawArray(Object raw) {
+    private static List<Object> toListFromRawArray(Object raw) {
         if (raw instanceof Object[]) {
             return Arrays.asList((Object[]) raw);
         }
@@ -304,67 +334,67 @@ public final class ValueCodecPhoenix implements Decoder {
         if (raw instanceof boolean[]) return boxBooleanArray((boolean[]) raw);
         if (raw instanceof char[])    return boxCharArray((char[]) raw);
         // Фоллбек: на случай экзотических типов — отражение
-        int n = java.lang.reflect.Array.getLength(raw);
-        if (n == 0) return java.util.Collections.emptyList();
+        int n = Array.getLength(raw);
+        if (n == 0) return Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
-            list.add(java.lang.reflect.Array.get(raw, i));
+            list.add(Array.get(raw, i));
         }
         return list;
     }
 
     /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
-    private static java.util.List<Object> boxIntArray(int[] a) {
-        if (a.length == 0) return java.util.Collections.emptyList();
+    private static List<Object> boxIntArray(int[] a) {
+        if (a.length == 0) return Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (int v : a) list.add(v);
         return list;
     }
     /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
-    private static java.util.List<Object> boxLongArray(long[] a) {
-        if (a.length == 0) return java.util.Collections.emptyList();
+    private static List<Object> boxLongArray(long[] a) {
+        if (a.length == 0) return Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (long v : a) list.add(v);
         return list;
     }
     /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
-    private static java.util.List<Object> boxDoubleArray(double[] a) {
-        if (a.length == 0) return java.util.Collections.emptyList();
+    private static List<Object> boxDoubleArray(double[] a) {
+        if (a.length == 0) return Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (double v : a) list.add(v);
         return list;
     }
     /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
-    private static java.util.List<Object> boxFloatArray(float[] a) {
-        if (a.length == 0) return java.util.Collections.emptyList();
+    private static List<Object> boxFloatArray(float[] a) {
+        if (a.length == 0) return Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (float v : a) list.add(v);
         return list;
     }
     /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
-    private static java.util.List<Object> boxShortArray(short[] a) {
-        if (a.length == 0) return java.util.Collections.emptyList();
+    private static List<Object> boxShortArray(short[] a) {
+        if (a.length == 0) return Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (short v : a) list.add(v);
         return list;
     }
     /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
-    private static java.util.List<Object> boxByteArray(byte[] a) {
-        if (a.length == 0) return java.util.Collections.emptyList();
+    private static List<Object> boxByteArray(byte[] a) {
+        if (a.length == 0) return Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (byte v : a) list.add(v);
         return list;
     }
     /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
-    private static java.util.List<Object> boxBooleanArray(boolean[] a) {
-        if (a.length == 0) return java.util.Collections.emptyList();
+    private static List<Object> boxBooleanArray(boolean[] a) {
+        if (a.length == 0) return Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (boolean v : a) list.add(v);
         return list;
     }
     /** Быстрая коробка примитивного массива в {@code List<Object>} без лишних аллокаций. */
-    private static java.util.List<Object> boxCharArray(char[] a) {
-        if (a.length == 0) return java.util.Collections.emptyList();
+    private static List<Object> boxCharArray(char[] a) {
+        if (a.length == 0) return Collections.emptyList();
         ArrayList<Object> list = new ArrayList<>(a.length);
         for (char v : a) list.add(v);
         return list;
@@ -429,5 +459,228 @@ public final class ValueCodecPhoenix implements Decoder {
             }
         }
         return sb.toString();
+    }
+    /**
+     * Равенство кодеков определяется ссылочной идентичностью реестра типов.
+     * Считаем два экземпляра эквивалентными только если это один и тот же класс
+     * и оба указывают на один и тот же {@code registry} (по ссылке).
+     *
+     * @param o другой объект для сравнения
+     * @return {@code true}, если {@code this == o} или оба экземпляра одного класса с тем же {@code registry}
+     */
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || o.getClass() != ValueCodecPhoenix.class) return false;
+        ValueCodecPhoenix other = (ValueCodecPhoenix) o;
+        // Эквивалентность кодеков определяем по ссылочной идентичности реестра
+        return this.registry == other.registry;
+    }
+
+    /**
+     * Хеш-код согласован с {@link #equals(Object)}: вычисляется на основе ссылочной
+     * идентичности {@code registry}. Это гарантирует, что равные объекты имеют одинаковый хеш.
+     *
+     * @return хеш-код текущего экземпляра
+     */
+    @Override
+    public int hashCode() {
+        // Хеш-функция согласована с equals: опираемся на идентичность реестра
+        return System.identityHashCode(this.registry);
+    }
+
+    /**
+     * Декодирует составной Phoenix rowkey в поля PK (согласно {@link SchemaRegistry#primaryKeyColumns(TableName)}).
+     *
+     * Правила:
+     *  • учитывает соль (saltBytes) — пропускает префикс в начале ключа;
+     *  • для fixed-size типов (у которых {@code PDataType#getByteSize() != null}) берёт ровно указанное число байт;
+     *  • для var-size типов ищет разделитель {@code 0x00} c учётом экранирования Phoenix ({@code 0xFF 0x00} и {@code 0xFF 0xFF});
+     *  • для последнего PK-поля var-size допустимо отсутствие завершающего {@code 0x00} — берём «хвост»;
+     *  • преобразование байтов в объекты — через {@link PDataType#toObject(byte[], int, int)}; далее унификация времени
+     *    (TIMESTAMP/DATE/TIME → epoch millis) — как в {@link #decode(TableName, String, byte[])}.
+     *
+     * Контракт:
+     *  • метод безопасен (не бросает исключения); при невозможности корректно разобрать сегмент — прерывает разбор и возвращает управление;
+     *  • ключи кладутся в {@code out} под исходными именами PK из схемы (без суффикса *_ms).
+     */
+    @Override
+    public void decodeRowKey(TableName table,
+                             RowKeySlice rk,
+                             int saltBytes,
+                             Map<String, Object> out) {
+        if (table == null || rk == null || out == null) return;
+
+        final String[] pk = registry.primaryKeyColumns(table);
+        if (pk == null || pk.length == 0) return;
+
+        final byte[] a = rk.getArray();
+        int pos = rk.getOffset() + Math.max(0, saltBytes);
+        final int end = rk.getOffset() + rk.getLength();
+        if (pos > end) return;
+
+        int added = 0;
+        for (int i = 0; i < pk.length; i++) {
+            final String col = pk[i];
+            if (col == null) return;
+
+            final PDataType<?> t = resolvePType(table, col);
+            final boolean isLast = (i == pk.length - 1);
+            final ValSeg vs = parsePkValue(t, a, pos, end, isLast);
+            if (!vs.ok) return;
+            pos = vs.nextPos;
+            out.put(col, vs.val);
+            added++;
+        }
+        if (pk.length > 0 && added == 0) {
+            warnPkNotDecodedOnce(table, pk);
+        }
+    }
+
+    /** Небольшой контейнер результата чтения сегмента из rowkey. */
+    private static final class Seg {
+        final int off;
+        final int len;
+        final int nextPos;
+        final boolean ok;
+        private Seg(int off, int len, int nextPos, boolean ok) {
+            this.off = off; this.len = len; this.nextPos = nextPos; this.ok = ok;
+        }
+        static Seg bad() { return new Seg(0, 0, 0, false); }
+        static Seg of(int off, int len, int nextPos) { return new Seg(off, len, nextPos, true); }
+    }
+
+    /** Результат парсинга PK-поля: нормализованное значение + следующая позиция. */
+    private static final class ValSeg {
+        final Object val;
+        final int nextPos;
+        final boolean ok;
+        private ValSeg(Object val, int nextPos, boolean ok) { this.val = val; this.nextPos = nextPos; this.ok = ok; }
+        static ValSeg bad() { return new ValSeg(null, 0, false); }
+        static ValSeg of(Object v, int p) { return new ValSeg(v, p, true); }
+    }
+
+    /** Разбирает очередное PK‑поле: выбирает сегмент (fixed/var), преобразует байты и нормализует время. */
+    private ValSeg parsePkValue(PDataType<?> t,
+                                byte[] a, int pos, int end, boolean isLast) {
+        final Integer fixed = t.getByteSize();
+        final Seg seg = (fixed != null)
+                ? readFixedSegment(pos, end, fixed)
+                : readVarSegment(a, pos, end, isLast);
+        if (!seg.ok) return ValSeg.bad();
+        final Object valueObj = convertBytesToObject(t, a, seg.off, seg.len, fixed == null);
+        if (valueObj == null) return ValSeg.bad();
+        final Object normalized = normalizeTemporal(valueObj);
+        return ValSeg.of(normalized, seg.nextPos);
+    }
+
+    /** Читает фиксированный сегмент фиксированной длины. */
+    private static Seg readFixedSegment(int pos, int end, int fixed) {
+        if (pos + fixed > end) return Seg.bad();
+        return Seg.of(pos, fixed, pos + fixed);
+    }
+
+    /** Читает var-size сегмент: ищет 0x00 с учётом экранирования; для последнего поля допускает «хвост». */
+    private static Seg readVarSegment(byte[] a, int pos, int end, boolean isLast) {
+        if (isLast) {
+            int len = Math.max(0, end - pos);
+            return Seg.of(pos, len, end);
+        }
+        int sep = findUnescapedSeparator(a, pos, end);
+        if (sep < 0) return Seg.bad();
+        int len = sep - pos;
+        return Seg.of(pos, len, sep + 1);
+    }
+
+    /** Преобразует байты сегмента в объект Phoenix-типа; для var-size снимает экранирование. */
+    private Object convertBytesToObject(PDataType<?> t,
+                                        byte[] a, int off, int len, boolean needUnescape) {
+        try {
+            if (needUnescape) {
+                byte[] de = unescapePhoenix(a, off, len);
+                return t.toObject(de, 0, de.length);
+            }
+            return t.toObject(a, off, len);
+        } catch (RuntimeException e) {
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("PK: ошибка преобразования сегмента через Phoenix (type={})", t, e);
+            }
+            return null;
+        }
+    }
+
+    /** Нормализует временные типы к миллисекундам эпохи без цепочки instanceof: таблица преобразований. */
+    private static Object normalizeTemporal(Object valueObj) {
+        if (valueObj == null) return null;
+        UnaryOperator<Object> f = TEMP_NORMALIZERS.get(valueObj.getClass());
+        return (f != null) ? f.apply(valueObj) : valueObj;
+    }
+
+    /** Ищет неэкранированный разделитель 0x00 в диапазоне [from; end); возвращает индекс или -1. */
+    private static int findUnescapedSeparator(byte[] a, int from, int end) {
+        int i = from;
+        while (i < end) {
+            int b = a[i] & 0xFF;
+            if (b == 0x00) {
+                // 0x00 считается разделителем, если он не «сбежавший» байт после 0xFF
+                // (то есть предыдущий байт не был 0xFF, который экранировал 0x00)
+                if (i == from) return i;     // начинается с 0x00 → пустое значение
+                if ((a[i - 1] & 0xFF) != 0xFF) return i;
+            }
+            i++;
+        }
+        return -1;
+    }
+
+    /**
+     * Снимает экранирование Phoenix внутри сегмента var-size:
+     *  FF 00 → 00, FF FF → FF; прочие FF X → FF X (без изменений).
+     *  Возвращает новый массив строго нужного размера; для пустых сегментов — {@code new byte[0]}.
+     */
+    private static byte[] unescapePhoenix(byte[] a, int off, int len) {
+        if (len <= 0) return new byte[0];
+        byte[] r = new byte[len];
+        int w = 0;
+        int i = off;
+        int end = off + len;
+        while (i < end) {
+            int b = a[i] & 0xFF;
+            if (b == 0xFF && i + 1 < end) {
+                int n = a[i + 1] & 0xFF;
+                switch (n) {
+                    case 0x00:
+                        r[w++] = 0x00;
+                        i += 2;
+                        break;
+                    case 0xFF:
+                        r[w++] = (byte) 0xFF;
+                        i += 2;
+                        break;
+                    default:
+                        r[w++] = a[i];
+                        i += 1;
+                        break;
+                }
+            } else {
+                r[w++] = a[i];
+                i += 1;
+            }
+        }
+        if (w == r.length) return r;
+        byte[] shrunk = new byte[w];
+        System.arraycopy(r, 0, shrunk, 0, w);
+        return shrunk;
+    }
+
+    /** Warn-once: если PK объявлены, но ни одно поле не было добавлено в out. */
+    private static final Set<String> PK_WARNED =
+        Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+    private static void warnPkNotDecodedOnce(TableName table, String[] pk) {
+        final String t = table.getNameWithNamespaceInclAsString();
+        if (PK_WARNED.add(t) && LOG.isWarnEnabled()) {
+            LOG.warn("PK из rowkey не декодированы для таблицы {}. Объявлены в schema.json: {}. " +
+                     "Проверьте корректность rowkey и настроек соли/типов.", t, Arrays.toString(pk));
+        }
     }
 }

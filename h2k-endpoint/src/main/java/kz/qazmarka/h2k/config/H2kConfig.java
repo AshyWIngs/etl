@@ -1,13 +1,17 @@
 package kz.qazmarka.h2k.config;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.HashMap;
-import java.util.Locale;
 import java.util.Map;
-import java.util.regex.Pattern;
+import java.util.Properties;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.TableName;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import kz.qazmarka.h2k.util.Parsers;
 
 /**
  * Иммутабельная конфигурация эндпоинта, прочитанная один раз из HBase {@link Configuration}.
@@ -27,11 +31,7 @@ import org.apache.hadoop.hbase.TableName;
  * пути предусмотрен предвычисленный флаг {@link #isRowkeyBase64()}.
  */
 public final class H2kConfig {
-    /**
-     * Регулярное выражение для санитизации имени Kafka‑топика:
-     * все символы, кроме допустимых в Kafka ([a-zA-Z0-9._-]), заменяются на подчёркивание.
-     */
-    private static final Pattern TOPIC_SANITIZE = Pattern.compile("[^a-zA-Z0-9._-]");
+    private static final Logger LOG = LoggerFactory.getLogger(H2kConfig.class);
     /**
      * Дефолтный лимит длины имени Kafka‑топика (символов).
      * Значение 249 совместимо со старыми версиями брокеров Kafka.
@@ -47,24 +47,50 @@ public final class H2kConfig {
     private static final String ROWKEY_ENCODING_HEX = "hex";
     /** Строковое значение способа кодирования rowkey — Base64. */
     private static final String ROWKEY_ENCODING_BASE64 = "base64";
+    /** Имя namespace HBase по умолчанию. */
+    private static final String HBASE_DEFAULT_NS = "default";
 
     // ==== Ключи конфигурации (собраны в одном месте для устранения "хардкода") ====
+    /**
+     * Шаблон имени Kafka‑топика (поддерживаются плейсхолдеры ${table}, ${namespace}, ${qualifier}).
+     * Используется в {@link #topicFor(TableName)}.
+     */
     private static final String K_TOPIC_PATTERN = "h2k.topic.pattern";
+    /** Максимально допустимая длина имени Kafka‑топика. */
     private static final String K_TOPIC_MAX_LENGTH = "h2k.topic.max.length";
+    /** CSV‑список имён CF, подлежащих экспорту. */
     private static final String K_CF_LIST = "h2k.cf.list";
+    /** Флаг включения rowkey в JSON‑payload. */
     private static final String K_PAYLOAD_INCLUDE_ROWKEY = "h2k.payload.include.rowkey";
+    /** Способ кодирования rowkey: "hex" (по умолчанию) или "base64". */
     private static final String K_ROWKEY_ENCODING = "h2k.rowkey.encoding";
+    /** Флаг добавления метаданных ячеек (cf/qualifier/ts) в payload. */
     private static final String K_PAYLOAD_INCLUDE_META = "h2k.payload.include.meta";
+    /** Флаг добавления признака происхождения записи из WAL. */
     private static final String K_PAYLOAD_INCLUDE_META_WAL = "h2k.payload.include.meta.wal";
+    /** Минимальный timestamp (epoch millis) клеток из WAL для фильтрации. */
     private static final String K_FILTER_WAL_MIN_TS = "h2k.filter.wal.min.ts";
-    private static final String K_TOPIC_ENSURE = "h2k.ensure.topics";
+    /** Флаг автосоздания недостающих топиков. */
+    private static final String K_ENSURE_TOPICS = "h2k.ensure.topics";
+    /** Разрешать ли автоматическое увеличение числа партиций при ensureTopics. По умолчанию выключено. */
+    private static final String K_ENSURE_INCREASE_PARTITIONS = "h2k.ensure.increase.partitions";
+    /** Разрешать ли дифф‑применение topic‑конфигов (incrementalAlterConfigs) при ensureTopics. По умолчанию выключено. */
+    private static final String K_ENSURE_DIFF_CONFIGS = "h2k.ensure.diff.configs";
+    /** Целевое число партиций создаваемого топика. */
     private static final String K_TOPIC_PARTITIONS = "h2k.topic.partitions";
+    /** Целевой фактор репликации создаваемого топика. */
     private static final String K_TOPIC_REPLICATION_FACTOR = "h2k.topic.replication";
+    /** Таймаут операций Kafka AdminClient (мс) при ensureTopics. */
     private static final String K_ADMIN_TIMEOUT_MS = "h2k.admin.timeout.ms";
+    /** Явное значение client.id для Kafka AdminClient (для читаемых логов брокера). */
     private static final String K_ADMIN_CLIENT_ID = "h2k.admin.client.id";
-    private static final String K_TOPIC_UNKNOWN_BACKOFF_MS = "h2k.ensure.unknown.backoff.ms";
+    /** Базовый backoff (мс) между повторами AdminClient при «неуверенных» ошибках. */
+    private static final String K_ENSURE_UNKNOWN_BACKOFF_MS = "h2k.ensure.unknown.backoff.ms";
+    /** Каждые N отправок ожидать подтверждение (ограничение памяти/pressure). */
     private static final String K_PRODUCER_AWAIT_EVERY = "h2k.producer.await.every";
+    /** Таймаут ожидания подтверждения батча (мс). */
     private static final String K_PRODUCER_AWAIT_TIMEOUT_MS = "h2k.producer.await.timeout.ms";
+    /** CSV‑карта переопределений длины соли rowkey в байтах по таблицам. */
     private static final String K_SALT_MAP = "h2k.salt.map";
 
     /**
@@ -146,11 +172,17 @@ public final class H2kConfig {
     private static final boolean DEFAULT_INCLUDE_META = false;
     /** По умолчанию признак происхождения из WAL отключён. */
     private static final boolean DEFAULT_INCLUDE_META_WAL = false;
-    /** По умолчанию null‑поля в JSON не сериализуются. */
+    /** По умолчанию null-поля в JSON не сериализуются. */
     private static final boolean DEFAULT_JSON_SERIALIZE_NULLS = false;
-    /** Число партиций создаваемого топика по умолчанию. */
+    /** По умолчанию автосоздание топиков включено. */
+    private static final boolean DEFAULT_ENSURE_TOPICS = true;
+    /** По умолчанию увеличение партиций при ensureTopics отключено. */
+    private static final boolean DEFAULT_ENSURE_INCREASE_PARTITIONS = false;
+    /** По умолчанию дифф‑применение конфигов при ensureTopics отключено. */
+    private static final boolean DEFAULT_ENSURE_DIFF_CONFIGS = false;
+    /** Число партиций по умолчанию при создании топика. */
     private static final int DEFAULT_TOPIC_PARTITIONS = 3;
-    /** Фактор репликации создаваемого топика по умолчанию. */
+    /** Фактор репликации по умолчанию при создании топика. */
     private static final short DEFAULT_TOPIC_REPLICATION = 1;
     /** Таймаут операций AdminClient по умолчанию, мс. */
     private static final long DEFAULT_ADMIN_TIMEOUT_MS = 60000L;
@@ -194,6 +226,10 @@ public final class H2kConfig {
 
     // ==== Автосоздание топиков ====
     private final boolean ensureTopics;
+    /** Разрешено ли увеличение партиций при ensureTopics. */
+    private final boolean ensureIncreasePartitions;
+    /** Разрешено ли дифф‑применение topic‑конфигов при ensureTopics. */
+    private final boolean ensureDiffConfigs;
     private final int topicPartitions;
     private final short topicReplication;
     private final long adminTimeoutMs;
@@ -247,6 +283,8 @@ public final class H2kConfig {
         this.filterByWalTs = b.filterByWalTs;
         this.walMinTs = b.walMinTs;
         this.ensureTopics = b.ensureTopics;
+        this.ensureIncreasePartitions = b.ensureIncreasePartitions;
+        this.ensureDiffConfigs = b.ensureDiffConfigs;
         this.topicPartitions = b.topicPartitions;
         this.topicReplication = b.topicReplication;
         this.adminTimeoutMs = b.adminTimeoutMs;
@@ -256,9 +294,9 @@ public final class H2kConfig {
         this.awaitTimeoutMs = b.awaitTimeoutMs;
         this.producerBatchCountersEnabled = b.producerBatchCountersEnabled;
         this.producerBatchDebugOnFailure = b.producerBatchDebugOnFailure;
-        this.topicConfigs = java.util.Collections.unmodifiableMap(new java.util.HashMap<>(b.topicConfigs));
-        this.saltBytesByTable = java.util.Collections.unmodifiableMap(new java.util.HashMap<>(b.saltBytesByTable));
-        this.capacityHintByTable = java.util.Collections.unmodifiableMap(new java.util.HashMap<>(b.capacityHintByTable));
+        this.topicConfigs = Collections.unmodifiableMap(new HashMap<>(b.topicConfigs));
+        this.saltBytesByTable = Collections.unmodifiableMap(new HashMap<>(b.saltBytesByTable));
+        this.capacityHintByTable = Collections.unmodifiableMap(new HashMap<>(b.capacityHintByTable));
     }
 
     /**
@@ -267,41 +305,71 @@ public final class H2kConfig {
      * Все поля имеют разумные значения по умолчанию; сеттеры возвращают this для чейнинга.
      */
     public static final class Builder {
+        /** Обязательный адрес(а) Kafka bootstrap.servers. */
         private String bootstrap;
+        /** Шаблон имени топика (см. {@link H2kConfig#K_TOPIC_PATTERN}). */
         private String topicPattern = PLACEHOLDER_TABLE;
+        /** Ограничение длины имени топика (символов). */
         private int topicMaxLength = DEFAULT_TOPIC_MAX_LENGTH;
+        /** Список имён CF, указанных в конфигурации (оригинальный порядок). */
         private String[] cfNames = new String[]{DEFAULT_CF_NAME};
+        /** Байтовые представления имён CF (UTF‑8) для быстрого сравнения. */
         private byte[][] cfBytes = new byte[][]{ DEFAULT_CF_NAME.getBytes(StandardCharsets.UTF_8) };
 
+        /** Включать ли rowkey в payload. */
         private boolean includeRowKey = DEFAULT_INCLUDE_ROWKEY;
+        /** Способ кодирования rowkey: "hex" или "base64". */
         private String rowkeyEncoding = ROWKEY_ENCODING_HEX;
+        /** Предвычисленный флаг режима Base64 для горячего пути. */
         private boolean rowkeyBase64 = false;
+        /** Включать ли метаданные ячеек (cf/qualifier/ts). */
         private boolean includeMeta = DEFAULT_INCLUDE_META;
+        /** Включать ли признак происхождения записи из WAL. */
         private boolean includeMetaWal = DEFAULT_INCLUDE_META_WAL;
+        /** Сериализовать ли null‑значения в JSON. */
         private boolean jsonSerializeNulls = DEFAULT_JSON_SERIALIZE_NULLS;
 
+        /** Включена ли фильтрация клеток по минимальному timestamp из WAL. */
         private boolean filterByWalTs = false;
+        /** Минимальный допустимый timestamp (epoch millis) для фильтра WAL. */
         private long walMinTs = Long.MIN_VALUE;
 
+        /** Автоматически создавать недостающие топики. */
         private boolean ensureTopics = true;
+        /** Разрешено ли автоматическое увеличение числа партиций. */
+        private boolean ensureIncreasePartitions = DEFAULT_ENSURE_INCREASE_PARTITIONS;
+        /** Разрешено ли дифф‑применение конфигов топика. */
+        private boolean ensureDiffConfigs = DEFAULT_ENSURE_DIFF_CONFIGS;
+        /** Целевое число партиций создаваемого топика. */
         private int topicPartitions = DEFAULT_TOPIC_PARTITIONS;
+        /** Целевой фактор репликации создаваемого топика. */
         private short topicReplication = DEFAULT_TOPIC_REPLICATION;
+        /** Таймаут операций AdminClient при ensureTopics (мс). */
         private long adminTimeoutMs = DEFAULT_ADMIN_TIMEOUT_MS;
+        /** Значение client.id для AdminClient. */
         private String adminClientId = DEFAULT_ADMIN_CLIENT_ID;
+        /** Базовый backoff между повторами при неопределённых ошибках (мс). */
         private long unknownBackoffMs = DEFAULT_UNKNOWN_BACKOFF_MS;
 
+        /** Каждые N отправок ожидать подтверждение. */
         private int awaitEvery = DEFAULT_AWAIT_EVERY;
+        /** Таймаут ожидания подтверждения батча (мс). */
         private int awaitTimeoutMs = DEFAULT_AWAIT_TIMEOUT_MS;
 
+        /** Включены ли диагностические счётчики BatchSender по умолчанию. */
         boolean producerBatchCountersEnabled;
+        /** Логировать ли подробности неуспешного авто‑сброса в DEBUG. */
         boolean producerBatchDebugOnFailure;
 
-        private Map<String, String> topicConfigs = java.util.Collections.emptyMap();
-        private Map<String, Integer> saltBytesByTable = java.util.Collections.emptyMap();
-        private Map<String, Integer> capacityHintByTable = java.util.Collections.emptyMap();
+        /** Дополнительные конфиги топика, собранные из префикса h2k.topic.config.* */
+        private Map<String, String> topicConfigs = Collections.emptyMap();
+        /** Переопределения длины соли rowkey в байтах по таблицам. */
+        private Map<String, Integer> saltBytesByTable = Collections.emptyMap();
+        /** Подсказки ёмкости корневого JSON по таблицам. */
+        private Map<String, Integer> capacityHintByTable = Collections.emptyMap();
         /**
          * Устанавливает карту переопределений соли по таблицам: имя → байты (0 — без соли).
-         * Ожидается уже готовая карта (например, результат {@link H2kConfig#readSaltMap(Configuration)}).
+         * Ожидается уже готовая карта (например, результат {@link Parsers#readSaltMap(Configuration, String)}).
          * @param v неизменяемая или копируемая карта name→bytes
          * @return this
          */
@@ -309,7 +377,7 @@ public final class H2kConfig {
 
         /**
          * Устанавливает подсказки ёмкости корневого JSON по таблицам.
-         * Ожидается уже готовая карта (результат {@link H2kConfig#readCapacityHints(Configuration)}).
+         * Ожидается уже готовая карта (например, результат {@link Parsers#readCapacityHints(Configuration, String, String)}).
          * @param v неизменяемая или копируемая карта name→capacity
          * @return this
          */
@@ -331,8 +399,8 @@ public final class H2kConfig {
          */
         public Builder topicPattern(String v) { this.topicPattern = v; return this; }
         /**
-         * Ограничение длины имени топика (символов). Старые брокеры требуют ≤ 249.
-         * @param v максимальная длина
+         * Ограничение длины имени топика (символов).
+         * @param v максимальная длина (≥1)
          * @return this
          */
         public Builder topicMaxLength(int v) { this.topicMaxLength = v; return this; }
@@ -408,6 +476,18 @@ public final class H2kConfig {
          */
         public Builder ensureTopics(boolean v) { this.ensureTopics = v; return this; }
         /**
+         * Разрешить автоматическое увеличение числа партиций при ensureTopics.
+         * @param v true — увеличивать партиции при необходимости
+         * @return this
+         */
+        public Builder ensureIncreasePartitions(boolean v) { this.ensureIncreasePartitions = v; return this; }
+        /**
+         * Разрешить дифф‑применение конфигов топика (incrementalAlterConfigs) при ensureTopics.
+         * @param v true — сравнивать и применять отличия конфигов
+         * @return this
+         */
+        public Builder ensureDiffConfigs(boolean v) { this.ensureDiffConfigs = v; return this; }
+        /**
          * Число партиций создаваемого топика (если ensureTopics=true).
          * @param v количество партиций (≥1)
          * @return this
@@ -439,13 +519,13 @@ public final class H2kConfig {
         public Builder unknownBackoffMs(long v) { this.unknownBackoffMs = v; return this; }
 
         /**
-         * Каждые N отправок ждать подтверждения (батчевое ожидание) для ограничения памяти/pressure.
+         * Каждые N отправок ждать подтверждения (батчевое ожидание).
          * @param v размер батча N (≥1)
          * @return this
          */
         public Builder awaitEvery(int v) { this.awaitEvery = v; return this; }
         /**
-         * Таймаут ожидания подтверждений батча, мс.
+         * Таймаут ожидания подтверждений батча.
          * @param v таймаут в миллисекундах (≥1)
          * @return this
          */
@@ -465,7 +545,7 @@ public final class H2kConfig {
         public Builder producerBatchDebugOnFailure(boolean v) { this.producerBatchDebugOnFailure = v; return this; }
 
         /**
-         * Произвольные конфиги топика из префикса h2k.topic.config.* (см. {@link #readTopicConfigs}).
+         * Произвольные конфиги топика из префикса h2k.topic.config.* (см. {@link Parsers#readTopicConfigs(Configuration, String)}).
          * @param v карта ключ‑значение конфигураций топика
          * @return this
          */
@@ -473,6 +553,8 @@ public final class H2kConfig {
 
         /**
          * Собирает неизменяемый объект конфигурации с текущими значениями билдера.
+         *
+         * Возвращаемый экземпляр {@link H2kConfig} иммутабелен и фиксирует копии/снимки переданных карт и массивов там, где это требуется.
          * @return готовый {@link H2kConfig}
          */
         public H2kConfig build() { return new H2kConfig(this); }
@@ -492,41 +574,55 @@ public final class H2kConfig {
         }
         bootstrap = bootstrap.trim();
 
-        Map<String, Integer> saltMap = readSaltMap(cfg);
-        Map<String, Integer> capacityHints = readCapacityHints(cfg);
+        Map<String, Integer> saltMap = Parsers.readSaltMap(cfg, K_SALT_MAP);
+        Map<String, Integer> capacityHints = Parsers.readCapacityHints(cfg, Keys.CAPACITY_HINTS, Keys.CAPACITY_HINT_PREFIX);
 
-        String topicPattern = readTopicPattern(cfg);
-        int topicMaxLength = readIntMin(cfg, K_TOPIC_MAX_LENGTH, DEFAULT_TOPIC_MAX_LENGTH, 1);
-        String[] cfNames = readCfNames(cfg);
-        byte[][] cfBytes = toUtf8Bytes(cfNames);
+        String topicPattern = Parsers.readTopicPattern(cfg, K_TOPIC_PATTERN, PLACEHOLDER_TABLE);
+        int topicMaxLength = Parsers.readIntMin(cfg, K_TOPIC_MAX_LENGTH, DEFAULT_TOPIC_MAX_LENGTH, 1);
+        String[] cfNames = Parsers.readCfNames(cfg, K_CF_LIST, DEFAULT_CF_NAME);
+        byte[][] cfBytes = Parsers.toUtf8Bytes(cfNames);
 
         boolean includeRowKey = cfg.getBoolean(K_PAYLOAD_INCLUDE_ROWKEY, DEFAULT_INCLUDE_ROWKEY);
-        String rowkeyEncoding = normalizeRowkeyEncoding(cfg.get(K_ROWKEY_ENCODING, ROWKEY_ENCODING_HEX));
+        String rowkeyEncoding = Parsers.normalizeRowkeyEncoding(cfg.get(K_ROWKEY_ENCODING, ROWKEY_ENCODING_HEX));
         final boolean rowkeyBase64 = ROWKEY_ENCODING_BASE64.equals(rowkeyEncoding);
         boolean includeMeta = cfg.getBoolean(K_PAYLOAD_INCLUDE_META, DEFAULT_INCLUDE_META);
         boolean includeMetaWal = cfg.getBoolean(K_PAYLOAD_INCLUDE_META_WAL, DEFAULT_INCLUDE_META_WAL);
         boolean jsonSerializeNulls = cfg.getBoolean(Keys.JSON_SERIALIZE_NULLS, DEFAULT_JSON_SERIALIZE_NULLS);
 
-        WalFilter wf = readWalFilter(cfg);
+        Parsers.WalFilter wf = Parsers.readWalFilter(cfg, K_FILTER_WAL_MIN_TS);
         boolean filterByWalTs = wf.enabled;
         long walMinTs = wf.minTs;
 
-        // По умолчанию автосоздание топиков включено
-        boolean ensureTopics = cfg.getBoolean(K_TOPIC_ENSURE, true);
-        int topicPartitions = readIntMin(cfg, K_TOPIC_PARTITIONS, DEFAULT_TOPIC_PARTITIONS, 1);
-        short topicReplication = (short) readIntMin(cfg, K_TOPIC_REPLICATION_FACTOR, DEFAULT_TOPIC_REPLICATION, 1);
-        long adminTimeoutMs = readLong(cfg, K_ADMIN_TIMEOUT_MS, DEFAULT_ADMIN_TIMEOUT_MS);
-        String adminClientId = buildAdminClientId(cfg);
-        long unknownBackoffMs = readLong(cfg, K_TOPIC_UNKNOWN_BACKOFF_MS, DEFAULT_UNKNOWN_BACKOFF_MS);
+        // По умолчанию автосоздание топиков включено (централизованный дефолт)
+        boolean ensureTopics = cfg.getBoolean(K_ENSURE_TOPICS, DEFAULT_ENSURE_TOPICS);
+        boolean ensureIncreasePartitions = cfg.getBoolean(K_ENSURE_INCREASE_PARTITIONS, DEFAULT_ENSURE_INCREASE_PARTITIONS);
+        boolean ensureDiffConfigs = cfg.getBoolean(K_ENSURE_DIFF_CONFIGS, DEFAULT_ENSURE_DIFF_CONFIGS);
+        int topicPartitions = cfg.getInt(K_TOPIC_PARTITIONS, DEFAULT_TOPIC_PARTITIONS);
+        if (topicPartitions < 1) {
+            LOG.warn("Некорректное значение {}={}, устанавливаю минимум: {}", K_TOPIC_PARTITIONS, topicPartitions, 1);
+            topicPartitions = 1;
+        }
 
-        int awaitEvery = readIntMin(cfg, K_PRODUCER_AWAIT_EVERY, DEFAULT_AWAIT_EVERY, 1);
-        int awaitTimeoutMs = readIntMin(cfg, K_PRODUCER_AWAIT_TIMEOUT_MS, DEFAULT_AWAIT_TIMEOUT_MS, 1);
+        short topicReplication = (short) cfg.getInt(K_TOPIC_REPLICATION_FACTOR, DEFAULT_TOPIC_REPLICATION);
+        if (topicReplication < 1) {
+            LOG.warn("Некорректное значение {}={}, устанавливаю минимум: {}", K_TOPIC_REPLICATION_FACTOR, topicReplication, 1);
+            topicReplication = 1;
+        }
+        long adminTimeoutMs = Parsers.readLong(cfg, K_ADMIN_TIMEOUT_MS, DEFAULT_ADMIN_TIMEOUT_MS);
+        String adminClientId = Parsers.buildAdminClientId(cfg, K_ADMIN_CLIENT_ID, DEFAULT_ADMIN_CLIENT_ID);
+        long unknownBackoffMs = cfg.getLong(K_ENSURE_UNKNOWN_BACKOFF_MS, DEFAULT_UNKNOWN_BACKOFF_MS);
+        if (unknownBackoffMs < 1L) {
+            LOG.warn("Некорректное значение {}={}, устанавливаю минимум: {} мс", K_ENSURE_UNKNOWN_BACKOFF_MS, unknownBackoffMs, 1);
+            unknownBackoffMs = 1L;
+        }
+        int awaitEvery = Parsers.readIntMin(cfg, K_PRODUCER_AWAIT_EVERY, DEFAULT_AWAIT_EVERY, 1);
+        int awaitTimeoutMs = Parsers.readIntMin(cfg, K_PRODUCER_AWAIT_TIMEOUT_MS, DEFAULT_AWAIT_TIMEOUT_MS, 1);
         boolean producerBatchCountersEnabled = cfg.getBoolean(Keys.PRODUCER_BATCH_COUNTERS_ENABLED, DEFAULT_PRODUCER_BATCH_COUNTERS_ENABLED);
         boolean producerBatchDebugOnFailure  = cfg.getBoolean(Keys.PRODUCER_BATCH_DEBUG_ON_FAILURE,  DEFAULT_PRODUCER_BATCH_DEBUG_ON_FAILURE);
 
-        Map<String, String> topicConfigs = readTopicConfigs(cfg);
+        Map<String, String> topicConfigs = Parsers.readTopicConfigs(cfg, Keys.TOPIC_CONFIG_PREFIX);
 
-        return new Builder(bootstrap)
+        H2kConfig conf = new Builder(bootstrap)
                 .topicPattern(topicPattern)
                 .topicMaxLength(topicMaxLength)
                 .cfNames(cfNames)
@@ -540,6 +636,8 @@ public final class H2kConfig {
                 .filterByWalTs(filterByWalTs)
                 .walMinTs(walMinTs)
                 .ensureTopics(ensureTopics)
+                .ensureIncreasePartitions(ensureIncreasePartitions)
+                .ensureDiffConfigs(ensureDiffConfigs)
                 .topicPartitions(topicPartitions)
                 .topicReplication(topicReplication)
                 .adminTimeoutMs(adminTimeoutMs)
@@ -553,255 +651,8 @@ public final class H2kConfig {
                 .capacityHintByTable(capacityHints)
                 .topicConfigs(topicConfigs)
                 .build();
-    }
-    /**
-     * Парсит h2k.capacity.hints (CSV) и h2k.capacity.hint.* в карту { имя_таблицы → ожидаемая_ёмкость }.
-     * Значения ≤0 игнорируются. Допускаются ключи как по полному имени (ns:qualifier), так и по одному qualifier.
-     */
-    private static Map<String, Integer> readCapacityHints(Configuration cfg) {
-        Map<String, Integer> out = new java.util.HashMap<>();
-
-        // 1) CSV-вариант: h2k.capacity.hints=TABLE=keys[,NS:TABLE=keys2,...]
-        String raw = cfg.get(Keys.CAPACITY_HINTS);
-        if (raw != null && !raw.trim().isEmpty()) {
-            String[] tokens = raw.split(",");
-            for (String t : tokens) {
-                if (t != null) {
-                    String s = t.trim();
-                    if (!s.isEmpty()) {
-                        addCapacityHintCsvToken(out, s);
-                    }
-                }
-            }
-        }
-
-        // 2) Индивидуальные ключи с префиксом h2k.capacity.hint.TABLE = int
-        final String prefix = Keys.CAPACITY_HINT_PREFIX;
-        for (Map.Entry<String, String> e : cfg) {
-            addCapacityHint(out, e.getKey(), e.getValue(), prefix);
-        }
-        return out;
-    }
-
-    /**
-     * Добавляет подсказку ёмкости в карту, если ключ начинается с нужного префикса
-     * и значение корректное положительное число.
-     */
-    private static void addCapacityHint(Map<String, Integer> out, String key, String val, String prefix) {
-        if (key == null || !key.startsWith(prefix)) return;
-        String table = key.substring(prefix.length()).trim();
-        if (table.isEmpty()) return;
-        int parsed = parseIntSafe(val, -1);
-        if (parsed > 0) {
-            out.put(up(table), parsed);
-        }
-    }
-
-    /**
-     * Разбирает один CSV-токен подсказки ёмкости формата "TABLE=keys" или "NS:TABLE=keys"
-     * и добавляет его в карту при корректном положительном значении keys.
-     */
-    private static void addCapacityHintCsvToken(Map<String, Integer> out, String token) {
-        int eq = token.lastIndexOf('=');
-        if (eq <= 0 || eq >= token.length() - 1) {
-            return; // нет пары key=value
-        }
-        String name = token.substring(0, eq).trim();
-        String val = token.substring(eq + 1).trim();
-        if (name.isEmpty() || val.isEmpty()) return;
-        int parsed = parseIntSafe(val, -1);
-        if (parsed > 0) {
-            out.put(up(name), parsed);
-        }
-    }
-    /**
-     * Считывает int из конфигурации с дефолтом и минимальным порогом (minVal).
-     * Используется для параметров, требующих значения \u2265 1.
-     */
-    private static int readIntMin(Configuration cfg, String key, int defVal, int minVal) {
-        int v = cfg.getInt(key, defVal);
-        return (v < minVal) ? minVal : v;
-    }
-
-    /** Прочитать h2k.topic.config.* → {@code Map<конфиг, значение>}. */
-    private static Map<String, String> readTopicConfigs(Configuration cfg) {
-        Map<String, String> out = new HashMap<>();
-        final String prefix = Keys.TOPIC_CONFIG_PREFIX;
-        for (Map.Entry<String, String> e : cfg) {
-            String k = e.getKey();
-            if (k == null || !k.startsWith(prefix)) {
-                continue;
-            }
-            String real = k.substring(prefix.length()).trim();
-            String v = e.getValue() != null ? e.getValue().trim() : "";
-            if (!real.isEmpty() && !v.isEmpty()) {
-                out.put(real, v);
-            }
-        }
-        return out;
-    }
-
-    /**
-     * Парсит CSV из h2k.salt.map в карту { имя_таблицы(UPPER) → байты_соли }.
-     * Элемент CSV: "TABLE", "TABLE:BYTES", "TABLE=BYTES", "NS:TABLE:BYTES", "NS:TABLE=BYTES".
-     * Имя может быть полным ("ns:qualifier") или только qualifier. Значение клиппится в 0..8.
-     */
-    private static Map<String, Integer> readSaltMap(Configuration cfg) {
-        String raw = cfg.get(K_SALT_MAP);
-        if (raw == null || raw.trim().isEmpty()) {
-            return java.util.Collections.emptyMap();
-        }
-        Map<String, Integer> out = new java.util.HashMap<>();
-        String[] parts = raw.split(",");
-        for (String part : parts) {
-            if (part == null) {
-                continue;
-            }
-            String s = part.trim();
-            if (!s.isEmpty()) {
-                addSaltEntry(out, s);
-            }
-        }
-        return out;
-    }
-
-    /**
-     * Разбирает один CSV-токен карты соли и, при корректности, добавляет в out.
-     * Поддерживаются формы "TABLE", "TABLE:BYTES", "TABLE=BYTES", "NS:TABLE:BYTES", "NS:TABLE=BYTES".
-     */
-    private static void addSaltEntry(Map<String, Integer> out, String token) {
-        int eq = token.lastIndexOf('=');
-        int sep = (eq >= 0) ? eq : token.lastIndexOf(':'); // поддержка NS:TABLE=BYTES и NS:TABLE:BYTES
-        String name = (sep > 0) ? token.substring(0, sep).trim() : token.trim();
-        if (name.isEmpty()) {
-            return;
-        }
-        int bytes = 1; // по умолчанию TABLE -> 1
-        if (sep > 0) {
-            String num = token.substring(sep + 1).trim();
-            if (!num.isEmpty()) {
-                int b = parseIntSafe(num, 1);
-                if (b < 0)      b = 0;
-                else if (b > 8) b = 8;
-                bytes = b;
-            }
-        }
-        out.put(up(name), bytes);
-    }
-
-    /** Безопасный parseInt с дефолтом при null/пустой/некорректной строке. */
-    private static int parseIntSafe(String s, int defVal) {
-        if (s == null) return defVal;
-        try {
-            return Integer.parseInt(s.trim());
-        } catch (NumberFormatException ex) {
-            return defVal;
-        }
-    }
-
-    /** Нормализует ключ таблицы для поиска в внутренних картах (UPPERCASE, trim). */
-    private static String up(String s) {
-        return (s == null) ? "" : s.trim().toUpperCase(java.util.Locale.ROOT);
-    }
-
-    /**
-     * Читает и нормализует шаблон имени топика из конфигурации (с обрезкой пробелов).
-     */
-    private static String readTopicPattern(Configuration cfg) {
-        String topicPattern = cfg.get(K_TOPIC_PATTERN, PLACEHOLDER_TABLE);
-        return topicPattern == null ? PLACEHOLDER_TABLE : topicPattern.trim();
-    }
-
-    /**
-     * Читает h2k.cf.list как CSV, нормализует: обрезает пробелы, игнорирует пустые элементы.
-     * Поддерживаются произвольные CF-имена (например, 'DOCUMENTS').
-     */
-    private static String[] readCfNames(Configuration cfg) {
-        String raw = cfg.get(K_CF_LIST, DEFAULT_CF_NAME);
-        if (raw == null) return new String[]{ DEFAULT_CF_NAME };
-        String[] parts = raw.split(",");
-        java.util.ArrayList<String> out = new java.util.ArrayList<>(parts.length);
-        for (String p : parts) {
-            if (p == null) continue;
-            String s = p.trim();
-            if (!s.isEmpty()) out.add(s);
-        }
-        if (out.isEmpty()) out.add(DEFAULT_CF_NAME);
-        return out.toArray(new String[0]);
-    }
-
-    /** Быстрое UTF‑8‑кодирование массива имён CF. */
-    private static byte[][] toUtf8Bytes(String[] names) {
-        byte[][] res = new byte[names.length][];
-        for (int i = 0; i < names.length; i++) {
-            res[i] = names[i].getBytes(StandardCharsets.UTF_8);
-        }
-        return res;
-    }
-
-    /**
-     * Нормализует способ кодирования rowkey до двух допустимых значений: "hex" или "base64".
-     * По умолчанию используется "hex".
-     */
-    private static String normalizeRowkeyEncoding(String val) {
-        if (val == null) return ROWKEY_ENCODING_HEX;
-        String v = val.trim().toLowerCase(Locale.ROOT);
-        return ROWKEY_ENCODING_BASE64.equals(v) ? ROWKEY_ENCODING_BASE64 : ROWKEY_ENCODING_HEX;
-    }
-
-    /**
-     * Небольшой объект‑контейнер для параметров фильтра по timestamp из WAL.
-     */
-    private static final class WalFilter {
-        final boolean enabled;
-        final long minTs;
-        WalFilter(boolean enabled, long minTs) { this.enabled = enabled; this.minTs = minTs; }
-    }
-
-    /**
-     * Парсит параметры фильтра WAL: флаг включения и минимальный timestamp.
-     */
-    private static WalFilter readWalFilter(Configuration cfg) {
-        String walMinStr = cfg.get(K_FILTER_WAL_MIN_TS);
-        if (walMinStr == null) return new WalFilter(false, Long.MIN_VALUE);
-        try {
-            return new WalFilter(true, Long.parseLong(walMinStr.trim()));
-        } catch (NumberFormatException nfe) {
-            return new WalFilter(false, Long.MIN_VALUE);
-        }
-    }
-
-    /**
-     * Считывает long из конфигурации с мягкой деградацией к значению по умолчанию
-     * при пустых или некорректных данных.
-     */
-    private static long readLong(Configuration cfg, String key, long defVal) {
-        String v = cfg.get(key);
-        if (v == null) return defVal;
-        try {
-            return Long.parseLong(v.trim());
-        } catch (NumberFormatException nfe) {
-            return defVal;
-        }
-    }
-
-    /**
-     * Формирует значение client.id для AdminClient. Если явно не задано — пытается
-     * использовать имя хоста; при ошибке возвращает константу "h2k-admin".
-     */
-    private static String buildAdminClientId(Configuration cfg) {
-        String adminClientId = cfg.get(K_ADMIN_CLIENT_ID);
-        if (adminClientId != null) {
-            adminClientId = adminClientId.trim();
-            if (!adminClientId.isEmpty()) {
-                return adminClientId;
-            }
-        }
-        try {
-            return DEFAULT_ADMIN_CLIENT_ID + "-" + java.net.InetAddress.getLocalHost().getHostName();
-        } catch (java.net.UnknownHostException e) {
-            return DEFAULT_ADMIN_CLIENT_ID;
-        }
+        LOG.info("Сконструирована конфигурация H2k: {}", conf);
+        return conf;
     }
 
     /**
@@ -816,21 +667,50 @@ public final class H2kConfig {
         String ns = table.getNamespaceAsString();
         String qn = table.getQualifierAsString();
         // для namespace "default" префикс не пишем
-        String tableAtom = "default".equals(ns) ? qn : (ns + "_" + qn);
-        String nsAtom = "default".equals(ns) ? "" : ns;
+        String tableAtom = HBASE_DEFAULT_NS.equals(ns) ? qn : (ns + "_" + qn);
+        String nsAtom = HBASE_DEFAULT_NS.equals(ns) ? "" : ns;
         String base = topicPattern
                 .replace(PLACEHOLDER_TABLE, tableAtom)
                 .replace(PLACEHOLDER_NAMESPACE, nsAtom)
                 .replace(PLACEHOLDER_QUALIFIER, qn);
-        String sanitized = TOPIC_SANITIZE.matcher(base).replaceAll("_");
-        if (sanitized.length() > topicMaxLength) {
-            sanitized = sanitized.substring(0, topicMaxLength);
+
+        return sanitizeTopic(base);
+    }
+
+    /**
+     * Санитизирует и нормализует произвольное «сырое» имя Kafka‑топика по тем же правилам,
+     * что и {@link #topicFor(TableName)}: удаление ведущих/повторных разделителей, замена
+     * недопустимых символов на '_', защита от "." и "..", обрезка до {@link #topicMaxLength}.
+     *
+     * Важно: эта функция — единая точка ответственности за правила формирования имени топика.
+     * Используйте её при любых внешних/динамических именах, чтобы избежать расхождений.
+     *
+     * @implNote Делегирует нормализацию символов и разделителей вспомогательным методам {@code Parsers}; укорочение до {@code topicMaxLength} выполняется на финальном шаге.
+     *
+     * @param raw исходная строка (шаблон или произвольное имя)
+     * @return корректное имя Kafka‑топика, соответствующее ограничениям брокера
+     */
+    public String sanitizeTopic(String raw) {
+        String base = (raw == null) ? "" : raw;
+        // убрать ведущие и повторные разделители
+        String s = Parsers.topicCollapseRepeatedDelimiters(
+                Parsers.topicStripLeadingDelimiters(base));
+        // санитизация под допустимые символы Kafka
+        String sanitized = Parsers.topicSanitizeKafkaChars(s);
+
+        // защита от ".", ".." и пустой строки — используем универсальный безопасный placeholder
+        if (sanitized.equals(".") || sanitized.equals("..") || sanitized.isEmpty()) {
+            sanitized = "topic";
         }
-        return sanitized;
+
+        // обрезка по максимальной длине
+        return (sanitized.length() > topicMaxLength)
+                ? sanitized.substring(0, topicMaxLength)
+                : sanitized;
     }
 
 
-    // ===== Итоговые геттеры (без дублирования и алиасов) =====
+    // ===== Итоговые геттеры =====
     /** @return список Kafka bootstrap.servers */
     public String getBootstrap() { return bootstrap; }
     /** @return шаблон имени Kafka‑топика с плейсхолдерами */
@@ -870,18 +750,56 @@ public final class H2kConfig {
 
     /** @return создавать ли недостающие топики автоматически */
     public boolean isEnsureTopics() { return ensureTopics; }
-    /** @return число партиций создаваемого топика */
+    /**
+     * Разрешено ли автоматическое увеличение числа партиций при ensureTopics.
+     * По умолчанию false; управляется ключом h2k.ensure.increase.partitions.
+     */
+    public boolean isEnsureIncreasePartitions() { return ensureIncreasePartitions; }
+    /**
+     * Разрешено ли дифф‑применение конфигов топика (incrementalAlterConfigs) при ensureTopics.
+     * По умолчанию false; управляется ключом h2k.ensure.diff.configs.
+     */
+    public boolean isEnsureDiffConfigs() { return ensureDiffConfigs; }
+    /**
+     * Число партиций для создаваемых Kafka-тем.
+     * Значение нормализуется при построении конфигурации: минимум 1.
+     */
     public int getTopicPartitions() { return topicPartitions; }
-    /** @return фактор репликации создаваемого топика */
+    /**
+     * Фактор репликации для создаваемых Kafka-тем.
+     * Значение нормализуется при построении конфигурации: минимум 1.
+     */
     public short getTopicReplication() { return topicReplication; }
-
     /** @return таймаут операций AdminClient при ensureTopics, мс */
     public long getAdminTimeoutMs() { return adminTimeoutMs; }
+
+    /**
+     * Таймаут как int для API, принимающих миллисекунды 32‑битным целым.
+     * Возвращает {@code Integer.MAX_VALUE}, если значение выходит за пределы int.
+     */
+    public int getAdminTimeoutMsAsInt() {
+        long v = this.adminTimeoutMs;
+        return (v > Integer.MAX_VALUE) ? Integer.MAX_VALUE : (int) v;
+    }
+
+    /**
+     * Готовые свойства для Kafka AdminClient.
+     * Содержит как минимум bootstrap.servers и client.id.
+     * Значения таймаутов намеренно не устанавливаются здесь и задаются на стороне TopicEnsurer.
+     */
+    public Properties kafkaAdminProps() {
+        Properties p = new Properties();
+        p.setProperty("bootstrap.servers", this.bootstrap);
+        p.setProperty("client.id", this.adminClientId);
+        return p;
+    }
     /** @return значение client.id для AdminClient */
     public String getAdminClientId() { return adminClientId; }
-    /** @return пауза между повторами при неопределённых ошибках AdminClient, мс */
+    /**
+     * Базовая задержка (в миллисекундах) для повторной попытки при «неуверенных» ошибках AdminClient.
+     * Значение нормализуется при построении конфигурации: минимум 1 мс.
+     */
     public long getUnknownBackoffMs() { return unknownBackoffMs; }
-
     /** @return размер батча отправок, после которого ожидаются подтверждения */
     public int getAwaitEvery() { return awaitEvery; }
     /** @return таймаут ожидания подтверждений батча, мс */
@@ -901,10 +819,10 @@ public final class H2kConfig {
      * @return 0 если соль не используется; {@code >0} — число байт соли
      */
     public int getSaltBytesFor(TableName table) {
-        String full = up(table.getNameAsString()); // NS:QUALIFIER
+        String full = Parsers.up(table.getNameAsString()); // NS:QUALIFIER
         Integer v = saltBytesByTable.get(full);
         if (v != null) return v; // auto-unboxing
-        v = saltBytesByTable.get(up(table.getQualifierAsString()));
+        v = saltBytesByTable.get(Parsers.up(table.getQualifierAsString()));
         return v == null ? 0 : v; // auto-unboxing
     }
 
@@ -924,10 +842,58 @@ public final class H2kConfig {
      * @return ожидаемое число полей в корневом JSON (0 — если подсказка не задана)
      */
     public int getCapacityHintFor(TableName table) {
-        String full = up(table.getNameAsString()); // NS:QUALIFIER
+        String full = Parsers.up(table.getNameAsString()); // NS:QUALIFIER
         Integer v = capacityHintByTable.get(full);
         if (v != null) return v; // auto-unboxing
-        v = capacityHintByTable.get(up(table.getQualifierAsString()));
+        v = capacityHintByTable.get(Parsers.up(table.getQualifierAsString()));
         return v == null ? 0 : v; // auto-unboxing
+    }
+    /**
+     * Строковое представление конфигурации с маскировкой bootstrap.servers.
+     * Используется только для диагностических логов.
+     */
+    @Override
+    public String toString() {
+        final String maskedBootstrap = maskBootstrap(bootstrap);
+        final String cfCsv = String.join(",", cfNames);
+        return new StringBuilder(256)
+                .append("H2kConfig{")
+                .append("bootstrap=").append(maskedBootstrap)
+                .append(", topicPattern='").append(topicPattern).append('\'')
+                .append(", topicMaxLength=").append(topicMaxLength)
+                .append(", cf=").append(cfCsv)
+                .append(", includeRowKey=").append(includeRowKey)
+                .append(", rowkeyEncoding='").append(rowkeyEncoding).append('\'')
+                .append(", includeMeta=").append(includeMeta)
+                .append(", includeMetaWal=").append(includeMetaWal)
+                .append(", jsonSerializeNulls=").append(jsonSerializeNulls)
+                .append(", filterByWalTs=").append(filterByWalTs)
+                .append(", walMinTs=").append(walMinTs)
+                .append(", ensureTopics=").append(ensureTopics)
+                .append(", ensureIncreasePartitions=").append(ensureIncreasePartitions)
+                .append(", ensureDiffConfigs=").append(ensureDiffConfigs)
+                .append(", topicPartitions=").append(topicPartitions)
+                .append(", topicReplication=").append(topicReplication)
+                .append(", adminTimeoutMs=").append(adminTimeoutMs)
+                .append(", adminClientId='").append(adminClientId).append('\'')
+                .append(", unknownBackoffMs=").append(unknownBackoffMs)
+                .append(", awaitEvery=").append(awaitEvery)
+                .append(", awaitTimeoutMs=").append(awaitTimeoutMs)
+                .append(", topicConfigs.size=").append(topicConfigs.size())
+                .append(", saltBytesByTable.size=").append(saltBytesByTable.size())
+                .append(", capacityHintByTable.size=").append(capacityHintByTable.size())
+                .append('}')
+                .toString();
+    }
+
+    /** Маскирует bootstrap.servers для логов: показывает только первый host и признак продолжения. */
+    private static String maskBootstrap(String s) {
+        if (s == null || s.isEmpty()) return "";
+        String[] parts = s.split(",", 2);
+        String first = parts[0];
+        int colon = first.indexOf(':');
+        String host = (colon >= 0 ? first.substring(0, colon) : first);
+        String suffix = (parts.length > 1 ? ",..." : "");
+        return host + suffix;
     }
 }

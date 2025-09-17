@@ -33,6 +33,7 @@
       "exd": "TIMESTAMP",
       "pvad": "VARCHAR",
       "ag": "VARCHAR"
-    }
+    },
+    "pk": ["c","t","opd"]
   }
 }
