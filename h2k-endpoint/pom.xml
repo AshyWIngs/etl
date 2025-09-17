@@ -32,7 +32,7 @@
     <!-- Версия Phoenix, собранная под HBase 1.4 -->
     <phoenix.version>4.14.2-HBase-1.4</phoenix.version>
     <!-- Версия Kafka клиента (совместима с JDK 8) -->
-    <kafka.version>2.3.1</kafka.version>
+    <kafka.version>3.9.1</kafka.version>
 
     <!-- Логирование через SLF4J API; бэкенд выбирается окружением (log4j2/logback/slf4j-simple в dev) -->
     <slf4j.version>1.7.36</slf4j.version>
