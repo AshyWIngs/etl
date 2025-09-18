@@ -492,17 +492,19 @@ public final class ValueCodecPhoenix implements Decoder {
     /**
      * Декодирует составной Phoenix rowkey в поля PK (согласно {@link SchemaRegistry#primaryKeyColumns(TableName)}).
      *
-     * Правила:
-     *  • учитывает соль (saltBytes) — пропускает префикс в начале ключа;
-     *  • для fixed-size типов (у которых {@code PDataType#getByteSize() != null}) берёт ровно указанное число байт;
-     *  • для var-size типов ищет разделитель {@code 0x00} c учётом экранирования Phoenix ({@code 0xFF 0x00} и {@code 0xFF 0xFF});
-     *  • для последнего PK-поля var-size допустимо отсутствие завершающего {@code 0x00} — берём «хвост»;
-     *  • преобразование байтов в объекты — через {@link PDataType#toObject(byte[], int, int)}; далее унификация времени
-     *    (TIMESTAMP/DATE/TIME → epoch millis) — как в {@link #decode(TableName, String, byte[])}.
+     * Коротко о реализации (чтобы не скроллить к помощникам):
+     *  • «Соль» Phoenix: чтение начинается с позиции {@code rk.getOffset() + saltBytes}, хвост ограничен {@code rk.getOffset() + rk.getLength()}.
+     *  • Fixed-size типы: если {@code PDataType#getByteSize() != null}, берём ровно указанное число байт (см. {@link #readFixedSegment(int, int, int)}).
+     *  • Var-size типы: ищем неэкранированный {@code 0x00} как разделитель (см. {@link #findUnescapedSeparator(byte[], int, int)}),
+     *    экранирование снимаем по правилам Phoenix ({@code FF 00 → 00}, {@code FF FF → FF}) — см. {@link #unescapePhoenix(byte[], int, int)}.
+     *    Для последнего PK-поля var-size допустим «безразделительный» хвост — читаем до конца среза (см. {@link #readVarSegment(byte[], int, int, boolean)}).
+     *  • Нормализация времени: после {@link PDataType#toObject(byte[], int, int)} значения {@link Timestamp}/{@link Date}/{@link Time}
+     *    приводятся к миллисекундам эпохи (long) через табличный маппер {@link #TEMP_NORMALIZERS} (см. {@link #normalizeTemporal(Object)}).
      *
      * Контракт:
      *  • метод безопасен (не бросает исключения); при невозможности корректно разобрать сегмент — прерывает разбор и возвращает управление;
-     *  • ключи кладутся в {@code out} под исходными именами PK из схемы (без суффикса *_ms).
+     *  • имена PK-колонок сохраняются как в схеме (без суффиксов), значения временных типов нормализуются к epoch millis;
+     *  • коллекция {@code out} не очищается; записи добавляются/переопределяются по месту.
      */
     @Override
     public void decodeRowKey(TableName table,

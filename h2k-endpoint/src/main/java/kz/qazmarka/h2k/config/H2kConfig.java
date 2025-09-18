@@ -20,7 +20,6 @@ import kz.qazmarka.h2k.util.Parsers;
  *  - Базовые параметры Kafka/CF и ограничение длины имени топика
  *  - Флаги формирования payload (rowkey/meta) и JSON (serializeNulls)
  *  - Параметры ожидания подтверждений отправок (awaitEvery/awaitTimeoutMs)
- *  - Фильтр по timestamp клеток целевого CF
  *  - Параметры автосоздания топиков (партиции/репликация/таймаут/backoff), client.id для AdminClient и произвольные topic-level конфиги
  *  - Табличные переопределения «соли» rowkey: параметр {@code h2k.salt.map} (TABLE[:BYTES])
  *
@@ -68,8 +67,6 @@ public final class H2kConfig {
     private static final String K_PAYLOAD_INCLUDE_META = "h2k.payload.include.meta";
     /** Флаг добавления признака происхождения записи из WAL. */
     private static final String K_PAYLOAD_INCLUDE_META_WAL = "h2k.payload.include.meta.wal";
-    /** Минимальный timestamp (epoch millis) клеток из WAL для фильтрации. */
-    private static final String K_FILTER_WAL_MIN_TS = "h2k.filter.wal.min.ts";
     /** Флаг автосоздания недостающих топиков. */
     private static final String K_ENSURE_TOPICS = "h2k.ensure.topics";
     /** Разрешать ли автоматическое увеличение числа партиций при ensureTopics. По умолчанию выключено. */
@@ -220,10 +217,6 @@ public final class H2kConfig {
     private final boolean includeMetaWal;
     private final boolean jsonSerializeNulls;
 
-    // ==== Фильтр по ts клеток целевого CF ====
-    private final boolean filterByWalTs;
-    private final long walMinTs;
-
     // ==== Автосоздание топиков ====
     private final boolean ensureTopics;
     /** Разрешено ли увеличение партиций при ensureTopics. */
@@ -280,8 +273,6 @@ public final class H2kConfig {
         this.includeMeta = b.includeMeta;
         this.includeMetaWal = b.includeMetaWal;
         this.jsonSerializeNulls = b.jsonSerializeNulls;
-        this.filterByWalTs = b.filterByWalTs;
-        this.walMinTs = b.walMinTs;
         this.ensureTopics = b.ensureTopics;
         this.ensureIncreasePartitions = b.ensureIncreasePartitions;
         this.ensureDiffConfigs = b.ensureDiffConfigs;
@@ -328,12 +319,6 @@ public final class H2kConfig {
         private boolean includeMetaWal = DEFAULT_INCLUDE_META_WAL;
         /** Сериализовать ли null‑значения в JSON. */
         private boolean jsonSerializeNulls = DEFAULT_JSON_SERIALIZE_NULLS;
-
-        /** Включена ли фильтрация клеток по минимальному timestamp из WAL. */
-        private boolean filterByWalTs = false;
-        /** Минимальный допустимый timestamp (epoch millis) для фильтра WAL. */
-        private long walMinTs = Long.MIN_VALUE;
-
         /** Автоматически создавать недостающие топики. */
         private boolean ensureTopics = true;
         /** Разрешено ли автоматическое увеличение числа партиций. */
@@ -455,20 +440,6 @@ public final class H2kConfig {
          * @return this
          */
         public Builder jsonSerializeNulls(boolean v) { this.jsonSerializeNulls = v; return this; }
-
-        /**
-         * Включает фильтрацию по минимальному timestamp клеток из WAL.
-         * @param v true — включить фильтр
-         * @return this
-         */
-        public Builder filterByWalTs(boolean v) { this.filterByWalTs = v; return this; }
-        /**
-         * Минимальный timestamp (epoch millis) клеток из WAL для включения в поток.
-         * @param v минимальное значение ts
-         * @return this
-         */
-        public Builder walMinTs(long v) { this.walMinTs = v; return this; }
-
         /**
          * Автоматически создавать недостающие топики при старте.
          * @param v true — создавать при необходимости
@@ -589,10 +560,6 @@ public final class H2kConfig {
         boolean includeMetaWal = cfg.getBoolean(K_PAYLOAD_INCLUDE_META_WAL, DEFAULT_INCLUDE_META_WAL);
         boolean jsonSerializeNulls = cfg.getBoolean(Keys.JSON_SERIALIZE_NULLS, DEFAULT_JSON_SERIALIZE_NULLS);
 
-        Parsers.WalFilter wf = Parsers.readWalFilter(cfg, K_FILTER_WAL_MIN_TS);
-        boolean filterByWalTs = wf.enabled;
-        long walMinTs = wf.minTs;
-
         // По умолчанию автосоздание топиков включено (централизованный дефолт)
         boolean ensureTopics = cfg.getBoolean(K_ENSURE_TOPICS, DEFAULT_ENSURE_TOPICS);
         boolean ensureIncreasePartitions = cfg.getBoolean(K_ENSURE_INCREASE_PARTITIONS, DEFAULT_ENSURE_INCREASE_PARTITIONS);
@@ -633,8 +600,6 @@ public final class H2kConfig {
                 .includeMeta(includeMeta)
                 .includeMetaWal(includeMetaWal)
                 .jsonSerializeNulls(jsonSerializeNulls)
-                .filterByWalTs(filterByWalTs)
-                .walMinTs(walMinTs)
                 .ensureTopics(ensureTopics)
                 .ensureIncreasePartitions(ensureIncreasePartitions)
                 .ensureDiffConfigs(ensureDiffConfigs)
@@ -742,11 +707,6 @@ public final class H2kConfig {
     public boolean isIncludeMetaWal() { return includeMetaWal; }
     /** @return сериализуются ли null‑значения в JSON */
     public boolean isJsonSerializeNulls() { return jsonSerializeNulls; }
-
-    /** @return включена ли фильтрация по минимальному timestamp из WAL */
-    public boolean isFilterByWalTs() { return filterByWalTs; }
-    /** @return минимальный timestamp (epoch millis) для фильтра WAL */
-    public long getWalMinTs() { return walMinTs; }
 
     /** @return создавать ли недостающие топики автоматически */
     public boolean isEnsureTopics() { return ensureTopics; }
@@ -867,8 +827,6 @@ public final class H2kConfig {
                 .append(", includeMeta=").append(includeMeta)
                 .append(", includeMetaWal=").append(includeMetaWal)
                 .append(", jsonSerializeNulls=").append(jsonSerializeNulls)
-                .append(", filterByWalTs=").append(filterByWalTs)
-                .append(", walMinTs=").append(walMinTs)
                 .append(", ensureTopics=").append(ensureTopics)
                 .append(", ensureIncreasePartitions=").append(ensureIncreasePartitions)
                 .append(", ensureDiffConfigs=").append(ensureDiffConfigs)

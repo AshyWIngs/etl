@@ -27,6 +27,7 @@ import kz.qazmarka.h2k.util.RowKeySlice;
  *  - Перед сериализацией выполняется декодирование rowkey: {@link Decoder#decodeRowKey}
  *    обогащает карту значений расшифрованными компонентами PK (например, "c","t","opd"), чтобы PK были видны
  *    в Value как обычные колонки.
+ *  - Детали извлечения PK: см. {@link kz.qazmarka.h2k.schema.ValueCodecPhoenix#decodeRowKey(org.apache.hadoop.hbase.TableName, kz.qazmarka.h2k.util.RowKeySlice, int, java.util.Map)}.
  *
  * Сериализация и метаданные
  *  - Нулевые значения колонок не сериализуются, если не включено cfg.isJsonSerializeNulls().
@@ -201,6 +202,7 @@ public final class PayloadBuilder {
      * Декодирует составной PK из {@link RowKeySlice} в именованные поля значения.
      * Реализация декодирования и знание порядка/типов колонок PK — на стороне {@link Decoder}.
      * Если rowkey отсутствует/пустой или таблица не описана в схеме — метод ничего не делает.
+     * Детали декодирования Phoenix rowkey: {@link kz.qazmarka.h2k.schema.ValueCodecPhoenix#decodeRowKey(org.apache.hadoop.hbase.TableName, kz.qazmarka.h2k.util.RowKeySlice, int, java.util.Map)}.
      */
     private void decodePkFromRowKey(TableName table, RowKeySlice rk, Map<String, Object> out) {
         if (rk == null) {

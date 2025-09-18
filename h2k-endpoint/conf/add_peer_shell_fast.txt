@@ -28,7 +28,6 @@ add_peer 'h2k_fast',
     'CONFIG' => {
       # БАЗА: ключи читаются в Endpoint; peer-параметры перекрывают hbase-site.xml
       'h2k.kafka.bootstrap.servers'         => '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
-      'h2k.log.dir'                         => '/opt/hbase-default-current/logs', # Явный путь для логов Endpoint'а (если ${hbase.log.dir} пуст)
       # client.id не задаём — Endpoint сам сгенерирует уникальный id per-host (hostname/UUID)
       'h2k.topic.pattern'                   => '${table}',              # ${table}|${namespace}|${qualifier}
       'h2k.cf.list'                         => 'd',                     # можно CSV: 'b,d'

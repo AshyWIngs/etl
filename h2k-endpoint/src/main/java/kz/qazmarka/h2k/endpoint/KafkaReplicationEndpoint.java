@@ -69,7 +69,7 @@ import kz.qazmarka.h2k.util.RowKeySlice;
  *
  * Конфигурация
  *  - Основные ключи h2k.* см. в {@link kz.qazmarka.h2k.config.H2kConfig H2kConfig}.
- *  - В частности: bootstrap серверов Kafka, выбор режима декодера, шаблон имён топиков, фильтрация по WAL ts.
+ *  - В частности: bootstrap серверов Kafka, выбор режима декодера, шаблон имён топиков.
  */
 public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
 
@@ -108,9 +108,6 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
      *  TableName имеет стабильные equals/hashCode, кэш корректен на время жизни пира.
      */
     private final Map<TableName, String> topicCache = new HashMap<>(8);
-    /** Кэшированный набор CF (в байтах) для фильтрации по WAL-timestamp; вычисляется один раз из конфигурации и не меняется
-     * на время жизни пира (иммутабельный слепок). Поток один, доп. синхронизация не требуется. */
-    private byte[][] cfFamiliesBytesCached;
 
     /**
      * Инициализация эндпоинта: чтение конфигурации, подготовка продьюсера, декодера и сборщика payload.
@@ -137,8 +134,6 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
 
         // immut-конфиг, билдер и энсюрер
         this.h2k = H2kConfig.from(cfg, bootstrap);
-        // Предкешируем набор CF в байтах для фильтрации по WAL-ts (конфигурация иммутабельна на время жизни пира)
-        this.cfFamiliesBytesCached = h2k.getCfFamiliesBytes();
         // Сводка по карте «соли» rowkey (h2k.salt.map) — только на DEBUG, чтобы не шуметь
         try {
             if (LOG.isDebugEnabled()) {
@@ -158,10 +153,10 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
         this.topicEnsurer = TopicEnsurer.createIfEnabled(h2k);
 
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Инициализация завершена: шаблон_топика={}, cf_список={}, проверять_топики={}, фильтр_WAL_ts={}, включать_rowkey={}, кодировка_rowkey={}, включать_meta={}, включать_meta_WAL={}, счетчики_батчей={}, debug_батчей_при_ошибке={}",
+            LOG.debug("Инициализация завершена: шаблон_топика={}, cf_список={}, проверять_топики={}, включать_rowkey={}, кодировка_rowkey={}, включать_meta={}, включать_meta_WAL={}, счетчики_батчей={}, debug_батчей_при_ошибке={}",
                     h2k.getTopicPattern(),
                     h2k.getCfNamesCsv(),
-                    h2k.isEnsureTopics(), h2k.isFilterByWalTs(), h2k.isIncludeRowKey(), h2k.getRowkeyEncoding(), h2k.isIncludeMeta(), h2k.isIncludeMetaWal(),
+                    h2k.isEnsureTopics(), h2k.isIncludeRowKey(), h2k.getRowkeyEncoding(), h2k.isIncludeMeta(), h2k.isIncludeMetaWal(),
                     h2k.isProducerBatchCountersEnabled(), h2k.isProducerBatchDebugOnFailure());
         }
     }
@@ -279,8 +274,8 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
     }
 
     /**
-     * Основной цикл обработки партии WAL‑записей: группировка по rowkey, опциональная фильтрация по WAL‑timestamp,
-     * сборка JSON и асинхронная отправка сообщений в Kafka с последующим ожиданием подтверждений.
+     * Основной цикл обработки партии WAL‑записей: группировка по rowkey, сборка JSON и асинхронная отправка сообщений в Kafka
+     * с последующим ожиданием подтверждений.
      *
      * @param ctx контекст с WAL‑записями
      * @return {@code true} — продолжать репликацию; {@code false} — попросить HBase повторить партию
@@ -295,13 +290,13 @@ public final class KafkaReplicationEndpoint extends BaseReplicationEndpoint {
             final int awaitEvery = h2k.getAwaitEvery();
             final int awaitTimeoutMs = h2k.getAwaitTimeoutMs();
             final boolean includeWalMeta = h2k.isIncludeMetaWal();
-            final boolean doFilter = h2k.isFilterByWalTs();
-            final byte[][] cfFamilies = doFilter ? cfFamiliesBytesCached : null;
-            final long minTs = doFilter ? h2k.getWalMinTs() : -1L;
+            final boolean doFilter = false;
+            final byte[][] cfFamilies = null;
+            final long minTs = -1L;
 
             if (LOG.isDebugEnabled()) {
-                LOG.debug("Репликация: записей={}, awaitEvery={}, awaitTimeoutMs={}, фильтр по WAL-ts={}, включать WAL‑мета={}",
-                        entries.size(), awaitEvery, awaitTimeoutMs, doFilter, includeWalMeta);
+                LOG.debug("Репликация: записей={}, awaitEvery={}, awaitTimeoutMs={}, включать WAL‑мета={}",
+                        entries.size(), awaitEvery, awaitTimeoutMs, includeWalMeta);
             }
 
             try (BatchSender sender = new BatchSender(
