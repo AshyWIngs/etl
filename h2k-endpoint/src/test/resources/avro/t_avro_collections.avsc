@@ -1,0 +1,52 @@
+{
+  "type": "record",
+  "name": "T_AVRO_COLLECTIONS",
+  "namespace": "kz.qazmarka.test",
+  "fields": [
+    {
+      "name": "tags",
+      "type": [
+        "null",
+        {
+          "type": "array",
+          "items": "string"
+        }
+      ],
+      "default": null,
+      "h2k.phoenixType": "VARCHAR ARRAY"
+    },
+    {
+      "name": "metrics",
+      "type": [
+        "null",
+        {
+          "type": "map",
+          "values": "long"
+        }
+      ],
+      "default": null,
+      "h2k.phoenixType": "VARCHAR"
+    },
+    {
+      "name": "numbers",
+      "type": [
+        "null",
+        {
+          "type": "array",
+          "items": "long"
+        }
+      ],
+      "default": null,
+      "h2k.phoenixType": "BIGINT ARRAY"
+    },
+    {
+      "name": "_event_ts",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    }
+  ],
+  "h2k.pk": []
+}

@@ -91,3 +91,6 @@ dependency-reduced-pom.xml
 release.properties
 pom.xml.releaseBackup
 pom.xml.tag
+
+#Ignore vscode AI rules
+.github/instructions/codacy.instructions.md

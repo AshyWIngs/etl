@@ -5,9 +5,13 @@ import org.apache.hadoop.hbase.TableName;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertIterableEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+
+import kz.qazmarka.h2k.schema.registry.PhoenixTableMetadataProvider;
 
 /**
  * Набор юнит‑тестов для конфигурации {@link H2kConfig}.
@@ -44,6 +48,10 @@ class H2kConfigTest {
      */
     private static H2kConfig fromCfg(Configuration cfg) {
         return H2kConfig.from(cfg, "kafka1:9092");
+    }
+
+    private static H2kConfig fromCfg(Configuration cfg, PhoenixTableMetadataProvider provider) {
+        return H2kConfig.from(cfg, "kafka1:9092", provider);
     }
 
     /**
@@ -85,6 +93,42 @@ class H2kConfigTest {
         assertEquals(36, hc.getCapacityHintFor(TableName.valueOf("DEFAULT", "TBL")));
         assertEquals(18, hc.getCapacityHintFor(TableName.valueOf("ANY", "ONLYQUAL")));
         assertEquals(0,  hc.getCapacityHintFor(TableName.valueOf("DEFAULT", "ABSENT")));
+    }
+
+    @Test
+    @DisplayName("Avro metadata provider дополняет соль и capacity при отсутствии конфигурации")
+    void metadataProvider_overridesMissingConfig() {
+        Configuration c = new Configuration(false);
+        PhoenixTableMetadataProvider provider = new PhoenixTableMetadataProvider() {
+            @Override
+            public Integer saltBytes(TableName table) {
+                if ("DEFAULT:T_META".equalsIgnoreCase(table.getNameAsString())) {
+                    return 3;
+                }
+                return null;
+            }
+
+            @Override
+            public Integer capacityHint(TableName table) {
+                if ("DEFAULT:T_META".equalsIgnoreCase(table.getNameAsString())) {
+                    return 42;
+                }
+                return null;
+            }
+        };
+
+        H2kConfig hc = fromCfg(c, provider);
+
+        TableName table = TableName.valueOf("DEFAULT", "T_META");
+        assertEquals(3, hc.getSaltBytesFor(table));
+        assertEquals(42, hc.getCapacityHintFor(table));
+
+        // Конфигурация имеет приоритет над метаданными
+        c.set("h2k.salt.map", "T_META=5");
+        c.set("h2k.capacity.hint.T_META", "7");
+        hc = fromCfg(c, provider);
+        assertEquals(5, hc.getSaltBytesFor(table));
+        assertEquals(7, hc.getCapacityHintFor(table));
     }
 
     /**
@@ -144,6 +188,57 @@ class H2kConfigTest {
         assertArrayEquals(new String[]{"d","b","0"}, hc.getCfNames());
         assertEquals("d,b,0", hc.getCfNamesCsv());
         assertEquals(3, hc.getCfFamiliesBytes().length);
+        assertTrue(hc.isCfFilterExplicit());
+
+        byte[][] families = hc.getCfFamiliesBytes();
+        families[0][0] = (byte) 'X';
+        assertNotEquals((byte) 'X', hc.getCfFamiliesBytes()[0][0], "Возвращается копия CF-байтов");
+    }
+
+    @Test
+    @DisplayName("cf.list: ключ не задан → фильтр не считается явным")
+    void cfList_notSet() {
+        Configuration c = new Configuration(false);
+        H2kConfig hc = fromCfg(c);
+        assertArrayEquals(new String[]{"0"}, hc.getCfNames());
+        assertFalse(hc.isCfFilterExplicit());
+        assertEquals(1, hc.getCfFamiliesBytes().length);
+    }
+
+    @Test
+    @DisplayName("Avro: типизированное чтение режима, каталога, SR URL и auth")
+    void avroConfig_typedParsing() {
+        Configuration c = new Configuration(false);
+        c.set("h2k.avro.mode", "confluent");
+        c.set("h2k.avro.schema.dir", "/opt/avro");
+        c.set("h2k.avro.sr.urls", "http://sr1:8081, http://sr2:8081 ");
+        c.set("h2k.avro.sr.auth.basic.username", "user");
+        c.set("h2k.avro.sr.auth.basic.password", "pass");
+        c.set("h2k.avro.extra", "value");
+
+        H2kConfig hc = fromCfg(c);
+
+        assertEquals(H2kConfig.AvroMode.CONFLUENT, hc.getAvroMode());
+        assertEquals("/opt/avro", hc.getAvroSchemaDir());
+        assertIterableEquals(java.util.Arrays.asList("http://sr1:8081", "http://sr2:8081"), hc.getAvroSchemaRegistryUrls());
+        assertEquals("user", hc.getAvroSrAuth().get("basic.username"));
+        assertEquals("pass", hc.getAvroSrAuth().get("basic.password"));
+        assertFalse(hc.getAvroProps().containsKey("mode"), "Известные ключи не должны попадать в extra map");
+        assertEquals("value", hc.getAvroProps().get("extra"));
+    }
+
+    @Test
+    @DisplayName("Avro: алиасы URL Schema Registry (schema.registry[.url])")
+    void avroConfig_schemaRegistryAliases() {
+        Configuration c = new Configuration(false);
+        c.set("h2k.avro.schema.registry", "http://legacy:8081");
+        H2kConfig hc = fromCfg(c);
+        assertIterableEquals(java.util.Collections.singletonList("http://legacy:8081"), hc.getAvroSchemaRegistryUrls());
+
+        c = new Configuration(false);
+        c.set("h2k.avro.schema.registry.url", "http://single:8081");
+        hc = fromCfg(c);
+        assertIterableEquals(java.util.Collections.singletonList("http://single:8081"), hc.getAvroSchemaRegistryUrls());
     }
 
     /**

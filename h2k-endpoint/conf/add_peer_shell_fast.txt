@@ -34,8 +34,15 @@ add_peer 'h2k_fast',
 # PK-колонки из rowkey автоматически инъектируются в payload (c,t,opd и пр.);
 # включать их в h2k.cf.list не требуется, но в подсказке ёмкости учитываются как обычные поля.
 
+      # Формат payload (json-each-row | avro-binary | avro-json)
+      'h2k.payload.format'                  => 'json-each-row',
+      # Для Avro раскомментируйте и укажите каталог схем / параметры SR (см. docs/avro.md):
+      # 'h2k.payload.format'                => 'avro-binary',
+      # 'h2k.avro.mode'                     => 'generic',
+      # 'h2k.avro.schema.dir'               => '/opt/hbase-default-current/conf/avro',
+
       # Декодирование
-      'h2k.decode.mode'                     => 'json-phoenix',          # 'simple' | 'json-phoenix'
+      'h2k.decode.mode'                     => 'phoenix-avro',          # 'simple' | 'phoenix-avro' | 'json-phoenix'
 # TIMESTAMP/DATE/TIME сериализуются как epoch millis (long); любой ARRAY -> JSON-массив
 # null-значения пропускаются согласно h2k.json.serialize.nulls=false
       'h2k.schema.path'                     => '/opt/hbase-default-current/conf/schema.json',
@@ -47,10 +54,8 @@ add_peer 'h2k_fast',
       'h2k.payload.include.meta.wal'       => 'false',
       'h2k.payload.include.rowkey'         => 'false',
 
-      # RowKey/соль/подсказки ёмкости (для DEFAULT namespace имя без префикса)
+      # RowKey/соль/подсказки: соль/ёмкость теперь задаются в conf/avro/*.avsc (h2k.saltBytes / h2k.capacityHint)
       'h2k.rowkey.encoding'                 => 'BASE64',
-      'h2k.salt.map'                        => 'TBL_JTI_TRACE_CIS_HISTORY=1',
-      'h2k.capacity.hints'                  => 'TBL_JTI_TRACE_CIS_HISTORY=32',   # общее число полей (включая PK) = 32
 
       # Ожидание подтверждений внутри BatchSender
       'h2k.producer.await.every'            => '500',

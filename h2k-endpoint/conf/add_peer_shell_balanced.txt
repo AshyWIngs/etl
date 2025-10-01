@@ -33,9 +33,20 @@ add_peer 'h2k_balanced',
       'h2k.topic.pattern'                   => '${table}',              # ${table}|${namespace}|${qualifier}
       'h2k.cf.list'                         => 'd',                     # можно CSV: 'b,d'; PK из rowkey инъектируются в payload — в CF добавлять не нужно
 
-      'h2k.decode.mode'                     => 'json-phoenix',          # 'simple' | 'json-phoenix'
+      'h2k.decode.mode'                     => 'phoenix-avro',          # 'simple' | 'phoenix-avro' | 'json-phoenix'
       # TIMESTAMP/DATE/TIME -> epoch millis; любой ARRAY -> JSON‑массив
-      'h2k.schema.path'                     => '/opt/hbase-default-current/conf/schema.json', # schema.json содержит колонки и PK
+      'h2k.schema.path'                     => '/opt/hbase-default-current/conf/schema.json', # фолбэк на время миграции
+      # формат полезной нагрузки
+      'h2k.payload.format'                  => 'avro-binary',           # дефолт json-eachrow
+      'h2k.avro.mode'                       => 'generic',
+      # где лежат *.avsc
+      'h2k.avro.schema.dir'                 => '/opt/hbase-default-current/conf/avro',
+      # Для Confluent Schema Registry раскомментируйте и заполните:
+      # 'h2k.avro.mode'                     => 'confluent',
+      # 'h2k.avro.sr.urls'                  => 'http://sr1:8081,http://sr2:8081',
+      # 'h2k.avro.sr.auth.basic.username'  => 'svc-hbase',
+      # 'h2k.avro.sr.auth.basic.password'  => '***',
+      # 'h2k.avro.subject.strategy'        => 'table',
       'h2k.json.serialize.nulls'            => 'false',
 
       # Метаполя в полезной нагрузке
@@ -44,11 +55,8 @@ add_peer 'h2k_balanced',
       'h2k.payload.include.rowkey'         => 'false',
 
 
-      # Подсказка ёмкости считает ВСЕ ключи в payload (включая PK). Для TBL_JTI_TRACE_CIS_HISTORY это 32.
-      # RowKey/соль/подсказки ёмкости (для DEFAULT namespace имя без префикса)
+      # RowKey/соль/подсказки: соль/ёмкость задаются в conf/avro/*.avsc (h2k.saltBytes / h2k.capacityHint)
       'h2k.rowkey.encoding'                 => 'BASE64',
-      'h2k.salt.map'                        => 'TBL_JTI_TRACE_CIS_HISTORY=1',
-      'h2k.capacity.hints'                  => 'TBL_JTI_TRACE_CIS_HISTORY=32',
 
       # Ожидание подтверждений внутри BatchSender
       'h2k.producer.await.every'            => '500',

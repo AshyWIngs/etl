@@ -41,3 +41,6 @@ pom.xml.tag
 # Отчёты тестов (если выкладывать не планируешь)
 surefire-reports/
 failsafe-reports/
+
+#Ignore vscode AI rules
+.github/instructions/codacy.instructions.md

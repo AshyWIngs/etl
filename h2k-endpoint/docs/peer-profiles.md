@@ -1,81 +1,110 @@
+# Профили peer (экспорт из `conf/add_peer_shell_*.txt`)
 
-
-# Профили peer (полная матрица)
-
-## FAST
-**Описание:**  
-Профиль для задач, где приоритетом является максимальная скорость обработки и передачи данных. Подходит для сценариев, где задержки критичны, а потеря данных или нестабильность допустимы.
-
-**Параметры:**
-- Максимально высокая скорость передачи пакетов.
-- Минимальные задержки.
-- Менее строгий контроль надежности доставки.
-
-**Характеристики:**
-- Возможны потери пакетов.
-- Меньше подтверждений доставки.
-- Подходит для real-time событий, игр, стриминга.
+Документ фиксирует реальные параметры из скриптов `conf/add_peer_shell_fast.txt`, `conf/add_peer_shell_balanced.txt`, `conf/add_peer_shell_reliable.txt`.  
+Используйте его как «матрицу истинности» при ревью или подготовке собственных профилей.
 
 ---
 
-## BALANCED
-**Описание:**  
-Сбалансированный профиль, сочетающий достаточную скорость и приемлемую надежность. Используется для большинства стандартных приложений, где важны и скорость, и сохранность данных.
+## Сводная таблица ключевых отличий
 
-**Параметры:**
-- Средний уровень контроля доставки.
-- Компромисс между скоростью и надежностью.
-- Автоматическая адаптация к условиям сети.
+| Профиль | Целевой сценарий | Формат payload | Avro режим | `acks` | `enable.idempotence` | `max.in.flight` | `linger.ms` | `batch.size` | `compression.type` |
+|---------|------------------|----------------|-----------|--------|----------------------|-----------------|-------------|--------------|--------------------|
+| **FAST** | Максимальная скорость, допускаем дубликаты | `json-each-row` (Avro опционально) | — | `1` | `false` | `5` | `100` | `524288` (512 KiB) | `lz4` |
+| **BALANCED** | Прод формат с Avro и умеренным батчингом | `avro-binary` | `generic` (`conf/avro/*.avsc`) | `all` | `true` | `5` | `100` | `524288` | `lz4` |
+| **RELIABLE** | Максимальная надёжность и порядок | `json-each-row` (Avro опционально) | — | `all` | `true` | `1` | `50` | `65536` (64 KiB) | `snappy` |
 
-**Характеристики:**
-- Баланс между потерями и задержками.
-- Подходит для обмена сообщениями, обычных сетевых сервисов.
+Дополнительные общие настройки (равны во всех профилях):
 
----
-
-## RELIABLE
-**Описание:**  
-Профиль с максимальным упором на надежность доставки данных. Используется там, где потеря информации недопустима, даже если это приводит к увеличению задержек.
-
-**Параметры:**
-- Гарантированная доставка каждого пакета.
-- Повторная отправка при потере.
-- Более строгий контроль целостности.
-
-**Характеристики:**
-- Минимизация потерь.
-- Возможны большие задержки.
-- Подходит для финансовых транзакций, важных уведомлений, передачи файлов.
+- `h2k.kafka.bootstrap.servers=10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092`
+- `h2k.topic.pattern=${table}`
+- `h2k.cf.list=d`
+- `h2k.decode.mode=phoenix-avro`
+- `h2k.schema.path=/opt/hbase-default-current/conf/schema.json`
+- `h2k.json.serialize.nulls=false`
+- `h2k.rowkey.encoding=BASE64`
+- `h2k.ensure.topics=true`, `h2k.topic.partitions=12`, `h2k.topic.replication=3`
+- `h2k.producer.await.every=500`, `h2k.producer.await.timeout.ms=180000` (FAST) / `300000` (BALANCED/RELIABLE)
+- `h2k.producer.buffer.memory=268435456`, `h2k.producer.max.request.size=2097152`
 
 ---
 
-## Общие ключи профилей
-- **latency** — задержка, мс
-- **throughput** — пропускная способность, пакетов/сек
-- **packet_loss** — допустимый процент потерь пакетов
-- **retransmit** — повторная отправка потерянных пакетов (да/нет)
-- **acknowledgement** — подтверждение доставки (да/нет)
+## FAST: максимальная скорость
+
+```ruby
+add_peer 'h2k_fast', {
+  'ENDPOINT_CLASSNAME' => 'kz.qazmarka.h2k.endpoint.KafkaReplicationEndpoint',
+  'CONFIG' => {
+    'h2k.payload.format'              => 'json-each-row',   # Avro при необходимости раскомментировать
+    'h2k.producer.enable.idempotence' => 'false',
+    'h2k.producer.acks'               => '1',
+    'h2k.producer.max.in.flight'      => '5',
+    'h2k.producer.retries'            => '10',
+    'h2k.producer.request.timeout.ms' => '30000',
+    'h2k.producer.delivery.timeout.ms'=> '90000',
+    'h2k.producer.linger.ms'          => '100',
+    'h2k.producer.batch.size'         => '524288',
+    'h2k.producer.compression.type'   => 'lz4'
+  }
+}
+```
+
+**Назначение:** ingestion, когда кратковременные дубликаты допустимы и важна минимальная задержка подтверждения.  
+**Комментарий:** если включаете Avro — добавьте `h2k.avro.mode=generic` и `h2k.avro.schema.dir` (или `confluent` + SR параметры).
 
 ---
 
-## Сравнительная таблица профилей
+## BALANCED: Avro по умолчанию
 
+```ruby
+add_peer 'h2k_balanced', {
+  'CONFIG' => {
+    'h2k.payload.format'              => 'avro-binary',
+    'h2k.avro.mode'                   => 'generic',
+    'h2k.avro.schema.dir'             => '/opt/hbase-default-current/conf/avro',
+    'h2k.producer.enable.idempotence' => 'true',
+    'h2k.producer.acks'               => 'all',
+    'h2k.producer.max.in.flight'      => '5',
+    'h2k.producer.retries'            => '2147483647',
+    'h2k.producer.request.timeout.ms' => '120000',
+    'h2k.producer.delivery.timeout.ms'=> '300000',
+    'h2k.producer.linger.ms'          => '100',
+    'h2k.producer.batch.size'         => '524288',
+    'h2k.producer.compression.type'   => 'lz4'
+  }
+}
+```
 
-| Профиль   | latency   | throughput | packet_loss | retransmit | acknowledgement | Назначение                      |
-|-----------|-----------|------------|-------------|------------|-----------------|---------------------------------|
-| FAST      | минимальная | максимальная | до 5%      | нет        | нет             | Игры, стриминг, real-time       |
-| BALANCED  | средняя     | средняя      | до 1%      | частично   | частично        | Мессенджеры, сервисы            |
-| RELIABLE  | выше средн. | ниже средней | 0%         | да         | да              | Финансы, важные уведомления     |
+**Назначение:** основной продакшен-профиль: Avro, идемпотентность и сохранение порядка при `max.in.flight ≤ 5`.  
+**SR (Confluent):** замените блок `avro.mode` на `confluent`, добавьте `h2k.avro.sr.urls` и опциональные ключи авторизации.
 
 ---
 
-## Примеры конфигураций
+## RELIABLE: жёсткий порядок и отсутствие дублей
 
-Для каждого профиля подготовлены примеры конфигурации `add_peer` в формате HBase shell.  
-Их можно использовать как основу для настройки репликации:
+```ruby
+add_peer 'h2k_reliable', {
+  'CONFIG' => {
+    'h2k.payload.format'              => 'json-each-row',   # Avro включается аналогично fast
+    'h2k.producer.enable.idempotence' => 'true',
+    'h2k.producer.acks'               => 'all',
+    'h2k.producer.max.in.flight'      => '1',
+    'h2k.producer.retries'            => '2147483647',
+    'h2k.producer.request.timeout.ms' => '120000',
+    'h2k.producer.delivery.timeout.ms'=> '300000',
+    'h2k.producer.linger.ms'          => '50',
+    'h2k.producer.batch.size'         => '65536',
+    'h2k.producer.compression.type'   => 'snappy'
+  }
+}
+```
 
-- **FAST:** `add_peer_shell_fast.txt`  
-- **BALANCED:** `add_peer_shell_balanced.txt`  
-- **RELIABLE:** `add_peer_shell_reliable.txt`
+**Назначение:** поток с жёсткими требованиями к порядку и повторяемости (финансы, бухгалтерия).  
+**Совет:** при увеличении нагрузки поднимайте только `linger.ms`/`batch.size`, но не `max.in.flight` — иначе нарушится порядок.
 
-Файлы находятся в корне проекта рядом с исходниками и содержат готовые JSON-конфиги.
+---
+
+## Где искать дополнительные параметры
+
+- Детальные комментарии и подсказки — прямо в `conf/add_peer_shell_*.txt` (разделы «Быстрые подсказки»).  
+- Полное описание ключей `h2k.*` — в `docs/config.md`.  
+- Про форматы данных и работу со схемами — `docs/avro.md` и `README.md` (раздел «Поддержка форматов сообщений»).

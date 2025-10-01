@@ -46,10 +46,7 @@
     'default' — фолбэк для остальных таблиц (0 = соли нет).
     Пример: TBL_JTI_TRACE_CIS_HISTORY=1,TBL_JTI_TRACE_CIS=1,RECEIPT=1,DOCUMENT=1
   -->
-  <property>
-    <name>h2k.salt.map</name>
-    <value>TBL_JTI_TRACE_CIS_HISTORY=1</value>
-  </property>
+  <!-- Основной источник соли — conf/avro/*.avsc (h2k.saltBytes). При необходимости можно продублировать фолбэк -->
 
   <!--
     Подсказки ёмкости JSON‑payload (число ключей в корневой map) per-table.
@@ -58,10 +55,7 @@
     Примечание: если считаете только колонки CF, прибавьте количество PK (обычно 2–3).
     Если считаете по итоговому JSON (как в DDL 32 колонки, включая PK) — ставьте ровно это число.
   -->
-  <property>
-    <name>h2k.capacity.hints</name>
-    <value>default=0,TBL_JTI_TRACE_CIS_HISTORY=32</value>
-  </property>
+  <!-- Основной источник подсказки ёмкости — conf/avro/*.avsc (h2k.capacityHint). Фолбэк в конфиге не обязателен, но можно оставить default=0. -->
 
   <!--
     ===== Профиль "максимальная скорость" для Kafka Producer =====
@@ -236,11 +230,11 @@
   -->
   <property>
     <name>h2k.decode.mode</name>
-    <value>json-phoenix</value>
+    <value>phoenix-avro</value>
   </property>
 
   <!--
-    Путь к файлу схемы (schema.json) для режима json‑phoenix.
+    Путь к файлу схемы (schema.json) для режима json‑phoenix и в качестве фолбэка для phoenix-avro.
     Ожидается структура:
       {
         "TBL_JTI_TRACE_CIS_HISTORY": {

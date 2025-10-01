@@ -1,11 +1,17 @@
 package kz.qazmarka.h2k.util;
 
+/**
+ * Служебные парсеры и нормализация значений конфигурации {@code h2k.*}.
+ */
+
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Pattern;
@@ -121,17 +127,25 @@ public final class Parsers {
      * @return массив непустых имён CF; гарантирует хотя бы одно значение {@code defaultCf}
      */
     public static String[] readCfNames(Configuration cfg, String key, String defaultCf) {
-        String raw = cfg.get(key, defaultCf);
-        if (raw == null) return new String[]{ defaultCf };
-        String[] parts = raw.split(",");
-        ArrayList<String> out = new ArrayList<>(parts.length);
-        for (String p : parts) {
-            if (p == null) continue;
-            String s = p.trim();
-            if (!s.isEmpty()) out.add(s);
+        String raw = cfg.get(key);
+        if (raw == null) {
+            return new String[]{ defaultCf };
         }
-        if (out.isEmpty()) out.add(defaultCf);
-        return out.toArray(new String[0]);
+        String[] parts = raw.split(",");
+        LinkedHashSet<String> unique = new LinkedHashSet<>(parts.length);
+        for (String part : parts) {
+            if (part == null) {
+                continue;
+            }
+            String trimmed = part.trim();
+            if (!trimmed.isEmpty()) {
+                unique.add(trimmed);
+            }
+        }
+        if (unique.isEmpty()) {
+            unique.add(defaultCf);
+        }
+        return unique.toArray(new String[0]);
     }
 
     /**
@@ -161,47 +175,10 @@ public final class Parsers {
     }
 
     /**
-     * Параметры фильтрации WAL по минимальному timestamp.
-     * Используется для выборки записей не старше заданного порога.
+     * Внутренняя реализация чтения пар ключ/значение по заданному префиксу.
+     * Используется публичными методами-обёртками для избежания дублирования логики.
      */
-    public static final class WalFilter {
-        /** Признак включения фильтрации WAL. */
-        public final boolean enabled;
-        /** Минимально допустимый timestamp (включительно), {@link Long#MIN_VALUE} если не задан. */
-        public final long minTs;
-        /**
-         * @param enabled включён ли фильтр
-         * @param minTs   минимальный timestamp; при выключенном фильтре игнорируется
-         */
-        public WalFilter(boolean enabled, long minTs) { this.enabled = enabled; this.minTs = minTs; }
-    }
-
-    /**
-     * Читает параметры фильтра WAL из конфигурации.
-     *
-     * @param cfg конфигурация Hadoop
-     * @param key ключ, содержащий минимальный timestamp
-     * @return {@link WalFilter} с флагом и значением минимального timestamp; при ошибке парсинга — выключенный фильтр
-     */
-    public static WalFilter readWalFilter(Configuration cfg, String key) {
-        String walMinStr = cfg.get(key);
-        if (walMinStr == null) return new WalFilter(false, Long.MIN_VALUE);
-        try {
-            return new WalFilter(true, Long.parseLong(walMinStr.trim()));
-        } catch (NumberFormatException nfe) {
-            return new WalFilter(false, Long.MIN_VALUE);
-        }
-    }
-
-    /**
-     * Извлекает topic‑level конфиги по заданному префиксу.
-     * Пример: {@code h2k.topic.config.X=Y} → {@code {"X" → "Y"}}.
-     *
-     * @param cfg    конфигурация Hadoop
-     * @param prefix строковый префикс ключей (например, {@code "h2k.topic.config."})
-     * @return новая неизложная {@link Map} с нормализованными ключами без префикса
-     */
-    public static Map<String, String> readTopicConfigs(Configuration cfg, String prefix) {
+    private static Map<String, String> readByPrefix(Configuration cfg, String prefix) {
         Map<String, String> out = new HashMap<>();
         for (Map.Entry<String, String> e : cfg) {
             String k = e.getKey();
@@ -216,6 +193,151 @@ public final class Parsers {
             }
         }
         return out;
+    }
+
+    /**
+     * Извлекает topic‑level конфиги по заданному префиксу.
+     * Пример: {@code h2k.topic.config.X=Y} → {@code {"X" → "Y"}}.
+     *
+     * @param cfg    конфигурация Hadoop
+     * @param prefix строковый префикс ключей (например, {@code "h2k.topic.config."})
+     * @return новая изменяемая {@link java.util.HashMap} с нормализованными ключами без префикса
+     */
+    public static Map<String, String> readTopicConfigs(Configuration cfg, String prefix) {
+        return readByPrefix(cfg, prefix);
+    }
+
+    /**
+     * Универсальное чтение перечисления (enum) из {@link Configuration} по ключу.
+     * Сопоставление значения выполняется без учёта регистра и с предварительным {@code trim()}.
+     * Пример использования:
+     * {@code PayloadFormat fmt = Parsers.readEnum(cfg, "h2k.payload.format", H2kConfig.PayloadFormat.class, H2kConfig.PayloadFormat.JSON_EACH_ROW);}
+     *
+     * @param cfg      конфигурация Hadoop
+     * @param key      ключ конфигурации
+     * @param enumType класс перечисления
+     * @param defVal   значение по умолчанию
+     * @param <E>      тип перечисления
+     * @return распознанное значение перечисления либо {@code defVal}, если ключ отсутствует или значение не распознано
+     */
+    public static <E extends Enum<E>> E readEnum(Configuration cfg, String key, Class<E> enumType, E defVal) {
+        String v = cfg.getTrimmed(key);
+        if (v == null || v.isEmpty()) return defVal;
+        String normalized = v.trim().toUpperCase(Locale.ROOT);
+        try {
+            return Enum.valueOf(enumType, normalized);
+        } catch (IllegalArgumentException ex) {
+            return defVal;
+        }
+    }
+
+    /**
+     * Читает формат полезной нагрузки из конфигурации и сопоставляет его с enum.
+     * Принимаются значения без учёта регистра: {@code json_each_row | avro_binary | avro_json},
+     * а также распространённые алиасы: {@code "json"}, {@code "json_each"}, {@code "avro"},
+     * {@code "avro-bin"}, {@code "avro-binary"}, {@code "binary"}.
+     */
+    public static kz.qazmarka.h2k.config.H2kConfig.PayloadFormat readPayloadFormat(
+            org.apache.hadoop.conf.Configuration cfg,
+            String key,
+            kz.qazmarka.h2k.config.H2kConfig.PayloadFormat def
+    ) {
+        String raw = cfg.getTrimmed(key);
+        if (raw == null || raw.isEmpty()) return def;
+        String v = raw.trim().toLowerCase(java.util.Locale.ROOT).replace('-', '_');
+        switch (v) {
+            case "json_each_row":
+            case "json_each":
+            case "json":
+                return kz.qazmarka.h2k.config.H2kConfig.PayloadFormat.JSON_EACH_ROW;
+            case "avro_binary":
+            case "avro_bin":
+            case "avro":
+            case "binary":
+                return kz.qazmarka.h2k.config.H2kConfig.PayloadFormat.AVRO_BINARY;
+            case "avro_json":
+            case "avrojson":
+                return kz.qazmarka.h2k.config.H2kConfig.PayloadFormat.AVRO_JSON;
+            default:
+                return def;
+        }
+    }
+
+    /**
+     * Читает режим Avro (generic|confluent) без учёта регистра; незнакомые значения → {@code def}.
+     */
+    public static kz.qazmarka.h2k.config.H2kConfig.AvroMode readAvroMode(
+            org.apache.hadoop.conf.Configuration cfg,
+            String key,
+            kz.qazmarka.h2k.config.H2kConfig.AvroMode def
+    ) {
+        String raw = cfg.getTrimmed(key);
+        if (raw == null || raw.isEmpty()) return def;
+        switch (raw.trim().toLowerCase(Locale.ROOT)) {
+            case "confluent":
+                return kz.qazmarka.h2k.config.H2kConfig.AvroMode.CONFLUENT;
+            case "generic":
+                return kz.qazmarka.h2k.config.H2kConfig.AvroMode.GENERIC;
+            default:
+                return def;
+        }
+    }
+
+    /**
+     * Возвращает строку из {@link Configuration} или значение по умолчанию, если она пустая.
+     */
+    public static String readStringOrDefault(Configuration cfg, String key, String defVal) {
+        String v = cfg.getTrimmed(key);
+        return (v == null || v.isEmpty()) ? defVal : v;
+    }
+
+    /**
+     * Возвращает первый непустой CSV-список среди заданных ключей.
+     * Значение разбивается по запятым, элементы триммируются; пустые элементы исключаются.
+     */
+    public static List<String> readCsvListFirstNonEmpty(Configuration cfg, String... keys) {
+        if (keys == null || keys.length == 0) return Collections.emptyList();
+        for (String key : keys) {
+            List<String> values = readCsvValues(cfg, key);
+            if (!values.isEmpty()) {
+                return Collections.unmodifiableList(values);
+            }
+        }
+        return Collections.emptyList();
+    }
+
+    private static List<String> readCsvValues(Configuration cfg, String key) {
+        if (key == null) return Collections.emptyList();
+        return splitCsv(cfg.getTrimmed(key));
+    }
+
+    private static List<String> splitCsv(String raw) {
+        if (raw == null || raw.isEmpty()) return Collections.emptyList();
+        String[] parts = raw.split(",");
+        List<String> out = new ArrayList<>(parts.length);
+        for (String part : parts) {
+            String trimmed = part == null ? "" : part.trim();
+            if (!trimmed.isEmpty()) {
+                out.add(trimmed);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Обобщённое чтение пары ключ/значение по заданному префиксу конфигурации.
+     * Возвращает карту без префикса в ключах. Пустые ключи/значения игнорируются.
+     *
+     * Подходит для чтения семейств параметров, например:
+     *  - {@code h2k.topic.config.X=Y} → {@code {"X" → "Y"}}
+     *  - {@code h2k.avro.schema.registry.url=http://...} → {@code {"schema.registry.url" → "http://..."}}
+     *
+     * @param cfg    конфигурация Hadoop
+     * @param prefix строковый префикс ключей (например, {@code "h2k.avro."})
+     * @return новая изменяемая {@link java.util.HashMap} с нормализованными ключами без префикса
+     */
+    public static Map<String, String> readWithPrefix(Configuration cfg, String prefix) {
+        return readByPrefix(cfg, prefix);
     }
 
     /**
@@ -426,6 +548,11 @@ public final class Parsers {
     /** Регулярное выражение для замены недопустимых символов Kafka на подчёркивание. */
     private static final Pattern TOPIC_SANITIZE = Pattern.compile("[^a-zA-Z0-9._-]");
 
+    /** Возвращает {@code true}, если символ является разрешённым разделителем Kafka ('.', '_', '-'). */
+    private static boolean isKafkaDelimiter(char c) {
+        return c == '.' || c == '_' || c == '-';
+    }
+
     /**
      * Удаляет ведущие разделители {@code '.', '_', '-'} для корректной склейки плейсхолдеров.
      * Предполагается, что {@code s != null}.
@@ -438,7 +565,7 @@ public final class Parsers {
         final int len = s.length();
         while (i < len) {
             char c = s.charAt(i);
-            if (c == '.' || c == '_' || c == '-') {
+            if (isKafkaDelimiter(c)) {
                 i++;
             } else {
                 break;
@@ -448,7 +575,7 @@ public final class Parsers {
     }
 
     /**
-     * Схлопывает повторы разделителей {@code '.', '_', '-'} до одного символа подряд.
+     * Схлопывает повторы одного и того же разделителя из набора {@code '.', '_', '-'} до одного символа подряд.
      * Предполагается, что {@code s != null}.
      *
      * @param s исходная строка
@@ -459,7 +586,7 @@ public final class Parsers {
         char prev = 0;
         for (int j = 0; j < s.length(); j++) {
             char c = s.charAt(j);
-            boolean isDelim = (c == '.' || c == '_' || c == '-');
+            boolean isDelim = isKafkaDelimiter(c);
             if (!(isDelim && c == prev)) {
                 sb.append(c);
                 prev = c;

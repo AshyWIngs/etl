@@ -33,8 +33,8 @@ CAPACITY_HINT =
 - `_cf` — CF, откуда были изменения;
 - `_cells_total` — всего ячеек в WALEdit;
 - `_cells_cf` — ячеек по выбранному CF;
-- `event_version` — максимальная метка времени среди ячеек CF;
-- `delete` — `true`, если в партии был delete‑маркер по CF.
+- `_event_ts` — максимальная метка времени среди ячеек CF;
+- `_delete` — `true`, если в партии был delete‑маркер по CF.
 
 ### Если `h2k.payload.include.meta.wal = true` (WAL, **2** ключа)
 - `_wal_seq` — sequence id записи в WAL (long);
@@ -101,6 +101,7 @@ add_peer 'h2k_balanced',
 </property>
 ```
 Для таблиц из `DEFAULT` namespace используйте просто имя таблицы (без `DEFAULT.`).
+> Рекомендуемый способ — задать `"h2k.capacityHint"` прямо в `.avsc`. Конфигурационный ключ оставлен как фолбэк.
 
 ---
 
@@ -112,6 +113,7 @@ h2k.salt.map = TBL_JTI_TRACE_CIS_HISTORY=1
 ```
 - Значение — длина префикса соли в **байтах** (у Phoenix — всегда 1).
 - Это **не влияет** на `CAPACITY_HINT`, только на правильный парсинг rowkey и, как следствие, корректную инъекцию PK в JSON.
+> Основной источник — `"h2k.saltBytes"` в `.avsc`. Ключ `h2k.salt.map` нужен только на этапе миграции.
 
 ---
 

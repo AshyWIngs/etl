@@ -1,0 +1,27 @@
+{
+  "type": "record",
+  "name": "T_AVRO",
+  "namespace": "kz.qazmarka.test",
+  "h2k.saltBytes": 1,
+  "h2k.capacityHint": 4,
+  "fields": [
+    {
+      "name": "value",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "h2k.phoenixType": "VARCHAR"
+    },
+    {
+      "name": "_event_ts",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    }
+  ],
+  "h2k.pk": []
+}

@@ -5,11 +5,11 @@
 - RAW‑таблица (`ReplicatedMergeTree`) — нормализованные типы `DateTime64(3,'UTC')`, алиасы в `Asia/Almaty`.
 - Материализованное представление (MV) — конвертация миллисекунд → `DateTime64(3,'UTC')` и запись в RAW.
 
-> TTL: **только по `event_version`** (бизнес‑время). `event_version` в RAW — **NOT NULL**.
+> TTL: **только по `_event_ts`** (бизнес‑время). `_event_ts` в RAW — **NOT NULL**.
 
 ### 0) Предпосылки
-- В Kafka летит `JSONEachRow`, времена в **миллисекундах эпохи**: `opd`, `apd`, `emd`, `exd`, `tm`, `event_version` (Int64, мс).  
-- Поле `event_version` в потоке — **обязательное**.
+- В Kafka летит `JSONEachRow`, времена в **миллисекундах эпохи**: `opd`, `apd`, `emd`, `exd`, `tm`, `_event_ts` (Int64, мс).  
+- Поле `_event_ts` в потоке — **обязательное**.
 - Таймзона хранения — `UTC` (аналитические алиасы — `Asia/Almaty`).
 
 ---
@@ -22,8 +22,8 @@ CREATE TABLE stg.kafka_tbl_jti_trace_cis_history_src ON CLUSTER shardless
     t UInt8,
     opd Int64,
 
-    `delete` UInt8,
-    event_version Int64,
+    _delete UInt8,
+    _event_ts Int64,
 
     id   Nullable(String),
     did  Nullable(String),
@@ -73,7 +73,7 @@ SETTINGS
 **Диагностика источника:**
 ```sql
 SET stream_like_engine_allow_direct_select = 1; -- разрешить прямое чтение из Kafka‑таблицы на сессию
-SELECT opd, apd, emd, exd, tm, event_version
+SELECT opd, apd, emd, exd, tm, _event_ts
 FROM stg.kafka_tbl_jti_trace_cis_history_src
 LIMIT 5;
 ```
@@ -93,11 +93,11 @@ CREATE TABLE stg.tbl_jti_trace_cis_history_raw ON CLUSTER shardless
     opd_local DateTime64(3, 'Asia/Almaty') ALIAS toTimeZone(opd, 'Asia/Almaty'),
     opd_local_date Date MATERIALIZED toDate(toTimeZone(opd, 'Asia/Almaty')),
 
-    `delete` UInt8,
+    _delete UInt8,
 
-    event_version DateTime64(3, 'UTC'),
-    event_version_local DateTime64(3, 'Asia/Almaty')
-        ALIAS toTimeZone(event_version, 'Asia/Almaty'),
+    _event_ts DateTime64(3, 'UTC'),
+    _event_ts_local DateTime64(3, 'Asia/Almaty')
+        ALIAS toTimeZone(_event_ts, 'Asia/Almaty'),
 
     id   Nullable(String),
     did  Nullable(String),
@@ -148,7 +148,7 @@ CREATE TABLE stg.tbl_jti_trace_cis_history_raw ON CLUSTER shardless
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/stg.tbl_jti_trace_cis_history_raw', '{shardless_repl}')
 PARTITION BY toYYYYMMDD(opd)
 ORDER BY (c, opd, t)
-TTL event_version + INTERVAL 5 DAY DELETE
+TTL _event_ts + INTERVAL 5 DAY DELETE
 SETTINGS index_granularity = 8192;
 ```
 
@@ -164,8 +164,8 @@ SELECT
   t,
   toDateTime64(opd / 1000.0, 3, 'UTC')                                  AS opd,
 
-  `delete`,
-  toDateTime64(event_version / 1000.0, 3, 'UTC')                          AS event_version,
+  _delete,
+  toDateTime64(_event_ts / 1000.0, 3, 'UTC')                          AS _event_ts,
 
   id, did, rid, rinn, rn, sid, sinn, sn, gt, prid,
   st, ste, elr,
@@ -194,7 +194,7 @@ SELECT * FROM stg.kafka_tbl_jti_trace_cis_history_src LIMIT 5;
 **Вставки в RAW:**
 ```sql
 SELECT count() FROM stg.tbl_jti_trace_cis_history_raw;
-SELECT c, t, opd, apd, emd, tm, exd, event_version
+SELECT c, t, opd, apd, emd, tm, exd, _event_ts
 FROM stg.tbl_jti_trace_cis_history_raw
 ORDER BY ingested_at DESC
 LIMIT 10;

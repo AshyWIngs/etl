@@ -12,6 +12,7 @@
 - [CF (Column Families)](#cf-column-families)
 - [Декодирование и схема Phoenix](#декодирование-и-схема-phoenix)
 - [Метаполя и формат rowkey](#метаполя-и-формат-rowkey)
+- [Avro](#avro)
 - [Подсказки ёмкости](#подсказки-ёмкости)
 - [Соль rowkey (Phoenix)](#соль-rowkey-phoenix)
 - [Автосоздание/администрирование тем](#автосозданиеадминистрирование-тем)
@@ -44,7 +45,7 @@
 
 | Ключ | Назначение | Формат | Пример |
 |---|---|---|---|
-| **`h2k.cf.list`** | Список CF для экспорта | CSV **без пробелов**. Несуществующие CF игнорируются. | `d,0,DOCUMENTS` |
+| **`h2k.cf.list`** | Список CF для экспорта | CSV; пробелы обрезаются автоматически. Фильтр включается только при явном ключе. Фильтр работает по точному имени CF (регистр важен). Несуществующие CF игнорируются. | `d,0,DOCUMENTS` |
 
 > Поля **PK** из rowkey всегда инъектируются в payload автоматически; добавлять их в `cf.list` не требуется.
 
@@ -54,9 +55,11 @@
 
 | Ключ | Назначение | Значения / Требования | Пример |
 |---|---|---|---|
-| **`h2k.decode.mode`** | Режим декодирования значений | `simple` \| `json-phoenix` | `json-phoenix` |
-| **`h2k.schema.path`** | Путь к `schema.json` (Phoenix) | **Обязателен**, если `h2k.decode.mode=json-phoenix` | `/opt/hbase-default-current/conf/schema.json` |
+| **`h2k.decode.mode`** | Режим декодирования значений | `simple` \| `phoenix-avro` \| `json-phoenix` (legacy) | `phoenix-avro` |
+| **`h2k.schema.path`** | Путь к `schema.json` (Phoenix) | Необязательный фолбэк для `phoenix-avro`; обязателен для `json-phoenix` | `/opt/hbase-default-current/conf/schema.json` |
 | **`h2k.json.serialize.nulls`** | Сериализовать `null` в JSON | `true`/`false` (дефолт: `false`) | `false` |
+
+> `phoenix-avro` ожидает, что локальные `.avsc` содержат атрибуты `h2k.phoenixType` по колонкам и массив `h2k.pk`.
 
 ---
 
@@ -71,11 +74,31 @@
 
 ---
 
+## Avro
+
+| Ключ | Назначение | Значения / Дефолт | Примечание |
+|---|---|---|---|
+| **`h2k.payload.format`** | Формат payload | `json-each-row` \| `avro-binary` \| `avro-json` (дефолт: `json-each-row`) | Для Avro обязательно задать дополнительные ключи ниже |
+| **`h2k.avro.mode`** | Режим Avro | `generic` (дефолт) \| `confluent` | `generic` — локальные `.avsc`; `confluent` — Schema Registry |
+| **`h2k.avro.schema.dir`** | Каталог `.avsc` | Строка (дефолт: `conf/avro`) | Используется в режиме `generic` |
+| **`h2k.avro.sr.urls`** | URL Schema Registry (CSV) | `http://host1:8081[,http://hostN:8081]` | Для совместимости поддерживаются алиасы `h2k.avro.schema.registry` и `h2k.avro.schema.registry.url` |
+| **`h2k.avro.sr.auth.basic.username/password`** | Basic‑авторизация Schema Registry | Строки | Используются при регистрации схем |
+| **`h2k.avro.subject.*`** | Настройка subject | `h2k.avro.subject.strategy` (`qualifier`/`table`/`table-lower`/`table-upper`), `h2k.avro.subject.prefix`, `h2k.avro.subject.suffix` | По умолчанию используется `table` (namespace учитывается, если он не `default`) |
+| **`h2k.avro.props.client.cache.capacity`** | Размер кэша `CachedSchemaRegistryClient` | Положительное целое (дефолт: `1000`) | Управляет identity-map Schema Registry клиента |
+| **`h2k.avro.*`** | Доп. свойства Avro | Любые ключи, не перечисленные выше | Сохраняются в `H2kConfig#getAvroProps()` для пользовательских фабрик |
+
+> Aliases `h2k.avro.schema.registry` и `h2k.avro.schema.registry.url` обрабатываются как `h2k.avro.sr.urls`.
+> В режиме `h2k.avro.mode=confluent` поддерживается только `h2k.payload.format=avro-binary`.
+
+**Подробнее:** см. `docs/avro.md` (примеры конфигов и интеграция с Schema Registry).
+
+---
+
 ## Подсказки ёмкости
 
 | Ключ | Назначение | Формат | Пример |
 |---|---|---|---|
-| **`h2k.capacity.hints`** | Оценка «максимума не‑null полей» для таблиц | `TABLE=keys[,NS:TABLE=keys2,...]` (для DEFAULT‑NS имя без `DEFAULT`) | `TBL_JTI_TRACE_CIS_HISTORY=32` |
+| **`h2k.capacity.hints`** | Оценка «максимума не‑null полей» для таблиц (фолбэк; основной источник — `.avsc` `h2k.capacityHint`) | `TABLE=keys[,NS:TABLE=keys2,...]` (для DEFAULT‑NS имя без `DEFAULT`) | `TBL_JTI_TRACE_CIS_HISTORY=32` |
 | **`h2k.capacity.hint.<TABLE>`** | Точечная подсказка для одной таблицы | `<int>` | `h2k.capacity.hint.RECEIPT=18` |
 
 > Подсказки используются для предразмеривания структур в горячем пути (меньше аллокаций/GC). Если включены метаполя, добавляйте к «ключам» соответствующие константы (см. `docs/capacity.md`).
@@ -86,7 +109,7 @@
 
 | Ключ | Назначение | Формат | Пример |
 |---|---|---|---|
-| **`h2k.salt.map`** | Сопоставление таблиц и числа байт соли в начале rowkey | `TABLE=bytes[,NS:TABLE=bytes2][,default=0]` | `TBL_JTI_TRACE_CIS_HISTORY=1,default=0` |
+| **`h2k.salt.map`** | Сопоставление таблиц и числа байт соли в начале rowkey (фолбэк; основной источник — `.avsc` `h2k.saltBytes`) | `TABLE=bytes[,NS:TABLE=bytes2][,default=0]` | `TBL_JTI_TRACE_CIS_HISTORY=1,default=0` |
 
 ---
 
@@ -128,8 +151,8 @@
 'h2k.kafka.bootstrap.servers'   => '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
 'h2k.topic.pattern'             => '${table}',
 'h2k.cf.list'                   => 'd',
-'h2k.decode.mode'              => 'json-phoenix',
-'h2k.schema.path'              => '/opt/hbase-default-current/conf/schema.json',
+'h2k.decode.mode'              => 'phoenix-avro',
+'h2k.schema.path'              => '/opt/hbase-default-current/conf/schema.json', # опциональный фолбэк
 'h2k.json.serialize.nulls'     => 'false',
 'h2k.payload.include.meta'     => 'false',
 'h2k.payload.include.meta.wal' => 'false',

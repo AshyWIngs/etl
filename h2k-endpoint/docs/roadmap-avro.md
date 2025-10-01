@@ -1,269 +1,191 @@
 # Roadmap (Avro / Schema Registry)
 
-> ⚠️ **Статус:** это **дорожная карта**. Сейчас endpoint публикует **только JSON (JSONEachRow)**. Любые новые ключи/параметры из этого файла **не работают**, пока соответствующий код не появится в репозитории. Источник истины — **фактический исходный код**.
+> ⚠️ **Статус:** это дорожная карта **и эксплуатационные заметки**. По умолчанию endpoint публикует **JSON (JSONEachRow)**. Поддержка **Avro (generic)** уже заведена через SPI‑интерфейс сериализации; **Avro Confluent (Schema Registry 5.3.8)** — целевой режим (включается конфигом). Источник истины — код в репозитории и `H2kConfig`.
 
 ---
 
-## 1) Введение
+## 1) Цели и совместимость
 
-Цель — перевести полезную нагрузку Kafka с JSONEachRow на **Avro** с управляемыми схемами (локально или через **open-source Confluent Schema Registry 5.3.x**) для прироста **скорости, производительности, стабильности и качества**, сохраняя совместимость со стеком:
+**Цель:** перевести value‑payload Kafka с JSONEachRow на **Avro** с управляемыми схемами (локально или через open‑source **Confluent Schema Registry 5.3.x**) ради **скорости, производительности, стабильности и качества**, сохранив стек:
 
-- Java: **8** (target 1.8)
-- HBase: **1.4.13**
-- Kafka (клиенты): **2.3.1**
-- Phoenix: **4.14/4.15**
+- **Java:** 8 (target 1.8)
+- **HBase:** 1.4.13
+- **Phoenix:** 4.14/4.15 (под HBase‑1.4)
+- **Kafka‑клиенты:** 2.3.1
+- **Schema Registry (целевой):** 5.3.8 (под Kafka 2.3.1)
 
----
-
-## 2) Текущее состояние (JSON)
-
-Проект публикует JSONEachRow. Управление типами/нормализацией делает `ValueCodecPhoenix`, схемы колонок — через `SchemaRegistry`/`JsonSchemaRegistry` (+ `schema.json`). PK декодируется в `ValueCodecPhoenix.decodeRowKey(...)`.
-
-Связанные файлы:
-- `SchemaRegistry.java` — базовый контракт реестра схем.
-- `JsonSchemaRegistry.java` — текущая реализация (единый `schema.json`).
+ClickHouse: Kafka‑источник понимает `FORMAT AvroConfluent` (рекомендуется) и `FORMAT Avro` (при локальных схемах).
 
 ---
 
-## 3) Почему Avro (зачем)
+## 2) Что уже сделано (в коде)
 
-- **Бинарная компактность** → меньше трафика, выше TPS, ниже latency и нагрузка на GC/CPU по сравнению с JSON на объёмах 100M+/день.
-- **Строгая типизация** и **эволюция схем** (backward/forward).
-- **Confluent-совместимый wire-format**: `magic byte (0) + schemaId + Avro payload`.
-- Хорошая интеграция с ClickHouse (`AvroConfluent`) и экосистемой Kafka.
+- **SPI сериализации:** `PayloadSerializer` + фабрика (DIP/ISP).  
+- **PayloadBuilder** не знает про формат: делегирует сериализацию выбранному `PayloadSerializer` (SRP/DRY).  
+- **JsonEachRowSerializer:** перенос текущей JSON‑логики без функциональных изменений.  
+- **AvroSerializer (generic):** сбор `GenericRecord` по Avro‑схеме, бинарная кодировка без лишних аллокаций; сообщения об ошибках на русском.  
+- **H2kConfig:** фича‑флаг формата/режима Avro, параметры SR; валидация значений.  
+- **pom.xml:** профили под Avro/Confluent, enforcer/locks, страховки от несовместимых транзитивных библиотек.
 
----
-
-## 4) Совместимость стенда (мировые практики)
-
-- **Kafka брокеры/клиенты:** 2.3.1 → совместимы с Schema Registry **5.3.x** (open-source).
-- **Java:** 1.8 — ок и для клиента, и для SR 5.3.x.
-- **HBase/Phoenix:** на SR напрямую не влияют.
-- **ClickHouse 24.8+**: умеет `AvroConfluent` из Kafka.
-- **Транспорт**: единообразный (PLAINTEXT/SSL/SASL) для брокеров, SR и потребителей.
-- **Время**: синхронизация NTP/PTP на всех узлах (тайм-ауты/метрики).
+По умолчанию остаётся **JSON** (обратная совместимость). Avro включается **конфигом**, без перекомпиляции.
 
 ---
 
-## 5) Жёсткий план внедрения (этапы 0–6)
+## 3) План работ (обновлён)
 
-### ЭТАП 0. Фича-флаг формата, без поломок JSON
-**(план, не реализовано)**
-- Ключ `h2k.payload.format = json-eachrow|avro` (дефолт: `json-eachrow`).
-- Ключ `h2k.avro.mode = generic|confluent` (дефолт: `generic`).
-- Проверка значений в `H2kConfig` (IAE при ошибке).
+### ЭТАП 0 — Фича‑флаг формата *(выполнено)*
+- Ключ `h2k.payload.format = json-eachrow|avro` (дефолт: `json-eachrow`).  
+- Ключ `h2k.avro.mode = generic|confluent` (дефолт: `generic`).  
+- Проверка и кэш флагов в `H2kConfig` (Perf).
 
-### ЭТАП 1. Единая точка сериализации (Value-only)
-**(частично реализуемо без внешних зависимостей)**
-- В `PayloadBuilder` ввести интерфейс `PayloadSerializer`.
-- `JsonEachRowSerializer` — перенос текущей логики JSON (без изменений).
-- `AvroSerializer` — класс-заготовка (пока `UnsupportedOperationException`), чтобы собрать проект и включить фича-флаг без влияния.
+### ЭТАП 1 — Единая точка сериализации *(выполнено)*
+- `PayloadSerializer` + фабрика по `payloadFormat/serializerFactoryClass`.  
+- Делегирование из `PayloadBuilder` (SRP/ISP/DIP).
 
-### ЭТАП 2. Avro (generic) без внешнего SR
-**(реализация)**
-- `AvroSerializer` (GenericRecord + `Schema`):
-  - логический тип времени — **millis epoch (long)** (Phoenix date/time → long ms).
-  - бинарные — `bytes`, строки — `string`, числовые — по фиксированным размерам (mismatch → ISE).
-  - reuse `ByteArrayOutputStream`/`DatumWriter`/`Encoder` (меньше GC).
-- `AvroSchemaRegistry` (локально): возврат `Schema` по таблице/колонкам; в отсутствие схемы — ISE на русском.
-- Никаких сетевых завязок.
+### ЭТАП 2 — Avro (generic) без SR *(выполнено)*
+- `AvroSerializer`: `GenericData.Record` + `DatumWriter` + повторное использование `ByteArrayOutputStream/Encoder`.  
+- Маппинг Phoenix‑типов → Avro (см. §6).
 
-### ЭТАП 3. Производительность
-- Без лишних копий и аллокаций; предразмеренные коллекции по `h2k.capacity.hints`.
-- Никаких `Optional` на горячем пути.
-- Проверка профилей Kafka Producer (FAST/BALANCED/RELIABLE) — параметры не меняем, но подтверждаем TPS.
+### ЭТАП 3 — Локальный AvroSchemaRegistry *(в процессе)*
+- Чтение `conf/avro/*.avsc`, кеш по `TableName/topic`.  
+- Диагностика «несовпадений» колонок/nullable.
 
-### ЭТАП 4. Confluent-режим (опционально, best practice)
-**(план)**
-- Wire-format: `0x0 | int32 schemaId | avroBinary`.
-- Мини-клиент SR (HTTP) или зависимость SR-клиента (совместимую с Java 8).
-- Конфиги (при `confluent`):
-  - `h2k.avro.sr.url = http://host1:8081[,http://hostN:8081]`
-  - (при необходимости) `h2k.avro.sr.auth.*`
-- Subject-нейминг: `${topic}-value` (классика).
+### ЭТАП 4 — Avro Confluent (Schema Registry) *(целевой)*
+- Wire‑format: `0x0 | int32 schemaId | avroBinary`.  
+- Клиент SR (HTTP) **или** зависимости `io.confluent` 5.3.8 (Java 8).  
+- Политика совместимости: `BACKWARD` (или по требованиям).  
+- Subject‑нейминг: `${topic}-value`.
 
-### ЭТАП 5. Тесты (JUnit 5, детерминированные)
-- Позитив: корректная нормализация `ValueCodecPhoenix`, round-trip Avro (writer/reader).
-- Негатив: mismatch фиксированных типов → ISE; нет схемы → ISE; неверные конфиги → IAE.
-- Без сети/ФС; Confluent — мок SR.
+### ЭТАП 5 — Тесты/нагрузка *(итеративно)*
+- Unit/IT: позитив (round‑trip), негатив (mismatch типов/нет схемы/плохой конфиг).  
+- Нагрузочные на профилях продьюсера (FAST/BALANCED/RELIABLE) — параметры не меняем.
 
-### ЭТАП 6. Документация и ingest (CH)
-- Обновить `docs/clickhouse.md`: раздел «Kafka/Avro» с двумя вариантами:
-  - `FORMAT AvroConfluent` + `kafka_schema_registry_url` (при SR).
-  - `FORMAT Avro` + `format_schema` (без SR).
-- В README — как включить Avro через конфиг (после реализации).
+### ЭТАП 6 — Документация/интеграции *(итеративно)*
+- ClickHouse ingest (Kafka‑engine) для AvroConfluent/Avro; RAW+MV.
 
 ---
 
-## 6) Реализация варианта через Avro (open‑source Schema Registry)
-**(план внедрения; ключи пока не работают — см. статус в начале)**
+## 4) Конфигурация (ключи) и сценарии
 
-### Развёртывание Schema Registry 5.3.x (open-source)
-**Ссылки:**
-- Исходники: https://github.com/confluentinc/schema-registry
-- Релиз под Kafka 2.3.1: https://github.com/confluentinc/schema-registry/tree/v5.3.8
-- README по сборке/запуску: `README.md` в теге `v5.3.8`
+> Точные имена и дефолты — в `H2kConfig`. Ниже — логика и ожидаемые значения.
 
-**Вариант A — tar из Confluent Platform 5.3.x**
-- Развернуть `/opt/schema-registry/{bin,etc,lib}`; логи — `/var/log/schema-registry/`.
-- Конфиг `/opt/schema-registry/etc/schema-registry/schema-registry.properties`:
-  ```properties
-  listeners=http://0.0.0.0:8081
-  host.name=${HOSTNAME}
-  kafkastore.bootstrap.servers=PLAINTEXT://10.254.3.111:9092,PLAINTEXT://10.254.3.112:9092,PLAINTEXT://10.254.3.113:9092
-  kafkastore.topic=_schemas
-  kafkastore.topic.replication.factor=3
-  kafkastore.timeout.ms=60000
-  compatibility.level=BACKWARD
-  ```
-- Юнит systemd:
-  ```ini
-  [Unit]
-  Description=Schema Registry (open-source)
-  After=network-online.target
-  [Service]
-  Type=simple
-  ExecStart=/opt/schema-registry/bin/schema-registry-start /opt/schema-registry/etc/schema-registry/schema-registry.properties
-  ExecStop=/opt/schema-registry/bin/schema-registry-stop
-  Restart=always
-  RestartSec=5
-  Environment="KAFKA_HEAP_OPTS=-Xms512m -Xmx512m" "JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF-8"
-  LimitNOFILE=65536
-  [Install]
-  WantedBy=multi-user.target
-  ```
-- Проверка:
-  ```bash
-  curl -s http://10.254.3.111:8081/subjects   # ожидаем: []
-  ```
+### 4.1 Базовые ключи
+- `h2k.payload.format = json-eachrow | avro`  
+- `h2k.serializerFactoryClass = <FQN фабрики>`  
+- `h2k.avro.mode = generic | confluent`
 
-**Вариант B — сборка из исходников**
-```bash
-git clone https://github.com/confluentinc/schema-registry.git
-cd schema-registry
-git checkout v5.3.8
-mvn -q -DskipTests package
-# далее разложить как в варианте A
-```
+### 4.2 Confluent‑режим (`avro` + `confluent`)
+- `h2k.avro.sr.urls = http://host1:8081[,http://hostN:8081]`  
+- (опц.) `h2k.avro.sr.auth.*` (Basic/OAuth/MTLS)  
+- Subject‑нейминг: `${topic}-value` (дефолт)
 
-### Совместимость: короткий чек-лист
-- Java 8 на RS/SR/CH; Kafka 2.3.1; `_schemas` с RF≥3; SR доступен для RS/CH.
-- `compatibility.level=BACKWARD` или ваша политика.
-- В ClickHouse: Kafka-engine с `kafka_format='AvroConfluent'` и `kafka_schema_registry_url='http://host1:8081,...'`.
-- Продьюсер (после реализации Avro): включён Avro-serializer + `schema.registry.url=...`.
-- Сетевой транспорт единообразен, время синхронизировано.
+### 4.3 Как включить Avro (generic)
+1) Положить `.avsc` в `conf/avro/` (см. §7).  
+2) Установить:
+   ```
+   h2k.payload.format=avro
+   h2k.avro.mode=generic
+   ```
+3) Перезапустить peer. Проверить метрики/логи.
 
-### Пример Avro‑схемы (TBL_JTI_TRACE_CIS_HISTORY)
-`conf/avro/tbl_jti_trace_cis_history.avsc`:
-```json
-{
-  "type": "record",
-  "name": "TBL_JTI_TRACE_CIS_HISTORY_Row",
-  "namespace": "kz.qazmarka.h2k",
-  "fields": [
-    {"name": "c", "type": "string"},
-    {"name": "t", "type": "int"},
-    {"name": "opd", "type": "long"},
+### 4.4 Как включить Avro Confluent
+1) Поднять SR 5.3.8; зарегистрировать схемы (см. §8).  
+2) Установить:
+   ```
+   h2k.payload.format=avro
+   h2k.avro.mode=confluent
+   h2k.avro.sr.urls=http://host1:8081,http://host2:8081
+   ```
+3) Перезапустить peer. Проверить, что value начинается с `0x0|schemaId|…`.
 
-    {"name": "id",   "type": ["null","string"], "default": null},
-    {"name": "did",  "type": ["null","string"], "default": null},
-    {"name": "rid",  "type": ["null","string"], "default": null},
-    {"name": "rinn", "type": ["null","string"], "default": null},
-    {"name": "rn",   "type": ["null","string"], "default": null},
-    {"name": "sid",  "type": ["null","string"], "default": null},
-    {"name": "sinn", "type": ["null","string"], "default": null},
-    {"name": "sn",   "type": ["null","string"], "default": null},
-    {"name": "gt",   "type": ["null","string"], "default": null},
-    {"name": "prid", "type": ["null","string"], "default": null},
+---
 
-    {"name": "st",  "type": ["null","int"], "default": null},
-    {"name": "ste", "type": ["null","int"], "default": null},
-    {"name": "elr", "type": ["null","int"], "default": null},
+## 5) Производительность/стабильность (инварианты)
 
-    {"name": "emd", "type": ["null","long"], "default": null},
-    {"name": "apd", "type": ["null","long"], "default": null},
-    {"name": "exd", "type": ["null","long"], "default": null},
+- **Нулевая магия:** `PayloadBuilder` подаёт типизированные поля; сериализатор только кодирует.  
+- **Повторное использование буферов** в Avro‑кодеке; без лишних копий.  
+- **Прогретые флаги** в `H2kConfig` (rowkeyBase64 и др.).  
+- **Профили Kafka продьюсера** (FAST/BALANCED/RELIABLE) — без изменений.  
+- **Ошибки/логирование** — на русском, без «тихих» падений.
 
-    {"name": "p",  "type": ["null","string"], "default": null},
-    {"name": "pt", "type": ["null","int"], "default": null},
-    {"name": "o",  "type": ["null","string"], "default": null},
-    {"name": "pn", "type": ["null","string"], "default": null},
-    {"name": "b",  "type": ["null","string"], "default": null},
-    {"name": "tt", "type": ["null","long"], "default": null},
-    {"name": "tm", "type": ["null","long"], "default": null},
+---
 
-    {"name": "ch",  "type": ["null", { "type": "array", "items": "string" }], "default": null},
-    {"name": "j",   "type": ["null","string"], "default": null},
-    {"name": "pg",  "type": ["null","int"], "default": null},
-    {"name": "et",  "type": ["null","int"], "default": null},
-    {"name": "pvad","type": ["null","string"], "default": null},
-    {"name": "ag",  "type": ["null","string"], "default": null},
+## 6) Маппинг Phoenix → Avro (правила)
 
-    {"name": "event_version", "type": ["null","long"], "default": null},
-    {"name": "delete", "type": "boolean", "default": false}
-  ]
-}
-```
+- `TIMESTAMP/DATE/TIME` → `long` (epoch‑millis).  
+- `UNSIGNED_TINYINT/SMALLINT/INT` → `int`/`long` по диапазону (строго).  
+- `VARCHAR/CHAR` → `string` (UTF‑8).  
+- `BINARY/VARBINARY` → `bytes`.  
+- Массивы → `{"type":"array","items":<T>}`.  
+- Nullable → `["null",<T>]` + `"default": null`.  
+- Любой mismatch (фикс‑размеры/nullability) → **ISE**.
 
-**Регистрация в SR** (subject = `<topic>-value`):
-```bash
-curl -s -X POST http://10.254.3.111:8081/subjects/TBL_JTI_TRACE_CIS_HISTORY-value/versions \
-  -H "Content-Type: application/vnd.schemaregistry.v1+json" \
-  -d @conf/avro/tbl_jti_trace_cis_history.avsc
-```
+Пример живой схемы колонок/PK для `TBL_JTI_TRACE_CIS_HISTORY` смотрите в `schema.json`: первичный ключ `["c","t","opd"]`, а типы колонок соответствуют Phoenix‑описанию.
 
-### ClickHouse 24.8: чтение AvroConfluent
-> DDL приведён как ориентир для ingest; используйте ваш шардирующий/реплицирующий шаблон.
+---
+
+## 7) Локальный AvroSchemaRegistry и `.avsc`
+
+- Путь: `conf/avro/<table>.avsc`.  
+- Требования к полям:
+  - имена/порядок согласованы с `SchemaRegistry`/`schema.json`;  
+  - времена — **long epoch‑ms**;  
+  - бинарные — `bytes`; флаг _delete — `boolean/UInt8` на стороне CH.  
+- Кеш по `TableName`/`topic`; on‑miss → детальная ошибка на русском.
+
+---
+
+## 8) Schema Registry 5.3.8 (open‑source)
+
+Развёртывание: tar из Confluent Platform или сборка из исходников `v5.3.8` (Java 8). Базовые настройки: `listeners`, `kafkastore.bootstrap.servers`, `_schemas` (RF≥3), `compatibility.level=BACKWARD`.  
+
+Регистрация схем: subject = `${topic}-value`, версионирование по SR API.  
+
+Эксплуатация: `GET /subjects`, `…/versions`, `…/schemas/ids/<id>`; мониторинг доступности, latency, ошибок совместимости.
+
+---
+
+## 9) ClickHouse (ingest через Kafka‑engine)
+
+- Рекомендуемый формат — `AvroConfluent` + `kafka_schema_registry_url`.  
+- Pipeline: Kafka‑источник (сырой Avro) → RAW таблица (нормализация времени/беззнаковых) → MV → целевая.  
+- DDL‑пример и маппинг типов приведены ниже; адаптируйте `ORDER BY`/шардинг.
 
 ```sql
+-- Kafka‑источник
 CREATE TABLE stg.kafka_tbl_jti_trace_cis_history_src
 (
-  c String,
-  t Int32,
-  opd Int64,
-
+  c String, t Int32, opd Int64,
   id Nullable(String), did Nullable(String), rid Nullable(String), rinn Nullable(String), rn Nullable(String),
   sid Nullable(String), sinn Nullable(String), sn Nullable(String), gt Nullable(String), prid Nullable(String),
-
   st Nullable(Int32), ste Nullable(Int32), elr Nullable(Int32),
-
   emd Nullable(Int64), apd Nullable(Int64), exd Nullable(Int64),
-
   p Nullable(String), pt Nullable(Int32), o Nullable(String), pn Nullable(String), b Nullable(String),
   tt Nullable(Int64), tm Nullable(Int64),
-
   ch Array(String), j Nullable(String), pg Nullable(Int32), et Nullable(Int32), pvad Nullable(String), ag Nullable(String),
-
-  event_version Nullable(Int64),
-  `delete` UInt8
+  _event_ts Nullable(Int64), _delete UInt8
 )
 ENGINE = Kafka
 SETTINGS
-  kafka_broker_list = '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
+  kafka_broker_list = '<brokers>',
   kafka_topic_list  = 'TBL_JTI_TRACE_CIS_HISTORY',
   kafka_group_name  = 'ch_tbl_jti_trace_cis_history',
   kafka_format      = 'AvroConfluent',
-  kafka_schema_registry_url = 'http://10.254.3.111:8081,http://10.254.3.112:8081,http://10.254.3.113:8081',
+  kafka_schema_registry_url = 'http://host1:8081,http://host2:8081',
   kafka_num_consumers = 6,
   kafka_skip_broken_messages = 1;
 
+-- RAW
 CREATE TABLE stg.tbl_jti_trace_cis_history_raw
 (
-  c String,
-  t UInt8,
-  opd DateTime64(3, 'UTC'),
-  event_version Nullable(DateTime64(3, 'UTC')),
-  `delete` UInt8,
-
+  c String, t UInt8, opd DateTime64(3, 'UTC'),
+  _event_ts Nullable(DateTime64(3, 'UTC')), _delete UInt8,
   id Nullable(String), did Nullable(String), rid Nullable(String), rinn Nullable(String), rn Nullable(String),
   sid Nullable(String), sinn Nullable(String), sn Nullable(String), gt Nullable(String), prid Nullable(String),
-
   st Nullable(UInt8), ste Nullable(UInt8), elr Nullable(UInt8),
-
   emd Nullable(DateTime64(3, 'UTC')), apd Nullable(DateTime64(3, 'UTC')), exd Nullable(DateTime64(3, 'UTC')),
   p Nullable(String), pt Nullable(UInt8), o Nullable(String), pn Nullable(String), b Nullable(String),
   tt Nullable(Int64), tm Nullable(DateTime64(3, 'UTC')),
-
   ch Array(String), j Nullable(String), pg Nullable(UInt16), et Nullable(UInt8), pvad Nullable(String), ag Nullable(String)
 )
 ENGINE = MergeTree
@@ -275,8 +197,8 @@ SELECT
   c,
   CAST(t AS UInt8) AS t,
   toDateTime64(opd/1000.0, 3, 'UTC') AS opd,
-  ifNull(toDateTime64(event_version/1000.0, 3, 'UTC'), NULL) AS event_version,
-  `delete`,
+  ifNull(toDateTime64(_event_ts/1000.0, 3, 'UTC'), NULL) AS _event_ts,
+  _delete,
   id, did, rid, rinn, rn, sid, sinn, sn, gt, prid,
   CAST(st  AS Nullable(UInt8))  AS st,
   CAST(ste AS Nullable(UInt8))  AS ste,
@@ -292,34 +214,43 @@ FROM stg.kafka_tbl_jti_trace_cis_history_src;
 
 ---
 
-## 7) Изменения в h2k‑endpoint (план; не реализовано)
-- Добавить ключи (Этап 0) и стратегии (Этап 1).
-- Реализовать `AvroSerializer` (Этап 2) и локальный `AvroSchemaRegistry`.
-- (Опция) Confluent-режим (Этап 4) c HTTP‑клиентом к SR.
-- Тесты (Этап 5): позитив/негатив, без сети и ФС (моки).
+## 10) Включение по средам и откат
+
+1) **QA:** Avro (generic) на 1–2 топика, канареечная группа CH; сравнение лагов/TPS/ошибок.  
+2) **QA:** Avro Confluent, та же выборка; проверка схем/совместимости.  
+3) **UAT/PROD:** по батчам таблиц; контроль объёма/лага.  
+**Откат:** вернуть `h2k.payload.format=json-eachrow` и перезапустить peer; Kafka‑данные сохранены.
 
 ---
 
-## 8) Порядок включения (рекомендуемый)
-1. Поднять SR 5.3.x на QA → `/subjects` отвечает.
-2. Согласовать и зарегистрировать Avro‑схемы для топиков.
-3. Реализовать Этап 2 (generic) и собрать JAR; включить `h2k.payload.format=avro` **только на QA**.
-4. В ClickHouse завести Kafka‑источник (AvroConfluent) + RAW + MV; проверить типы/лаг.
-5. Нагрузочные тесты; затем включение Confluent‑режима (если требуется SR‑id wire‑format).
-6. Постепенно расширять набор таблиц.
+## 11) Диагностика/наблюдаемость
+
+- **Логи endpoint:** выбранный сериализатор/формат, имя схемы/subject, schemaId (confluent), размеры записей.  
+- **Метрики:** длина батча, размер payload, время сериализации/отправки, ретраи.  
+- **CH:** `SELECT * FROM ..._src LIMIT 5` (+ `SET stream_like_engine_allow_direct_select=1`).
 
 ---
 
-## 9) Диагностика/эксплуатация
-- **Kafka источник (CH):** `SELECT * FROM ..._src LIMIT 5` (+ `SET stream_like_engine_allow_direct_select=1`).
-- **RAW:** `SELECT count(), min(opd), max(opd) FROM ..._raw`.
-- **Перезапуск с «начала»:** смена `kafka_group_name` или сброс оффсетов у группы.
-- **SR:** `GET /subjects`, `GET /subjects/<subj>/versions`, `GET /schemas/ids/<id>`.
+## 12) Частые ошибки и решения
+
+- **Нет схемы (generic):** проверьте `conf/avro/*.avsc` и имя таблицы/топика.  
+- **Несовместимость типов:** сравните `.avsc` и описание колонок в `schema.json` (особенно epoch‑ms для времени/беззнаковые). fileciteturn3file2  
+- **SR id недоступен:** проверьте `h2k.avro.sr.urls`, сеть/аутентикацию и наличие subject’а.  
+- **Конфликт зависимостей:** сборка профильным `pom.xml` (enforcer/locks).
 
 ---
 
-## Связанные файлы в коде
-- `SchemaRegistry.java` — базовый контракт реестра схем.
-- `JsonSchemaRegistry.java` — текущая реализация (единый `schema.json`).
-- *(план)* `AvroSchemaRegistry.java` — локальные Avro‑схемы (без SR).
-- *(план)* `PayloadBuilder` → `PayloadSerializer`/`AvroSerializer`/`JsonEachRowSerializer`.
+## 13) Связанные файлы и роли
+
+- `PayloadBuilder` — сбор полей и делегирование сериализатору.  
+- `PayloadSerializer`, `JsonEachRowSerializer`, `AvroSerializer`.  
+- `SchemaRegistry.java`, `JsonSchemaRegistry.java` (JSON ветка), *(план)* `AvroSchemaRegistry.java` (локальные Avro‑схемы).  
+- `H2kConfig` — чтение ключей/инварианты.  
+- `KafkaReplicationEndpoint` — оркестрация (формат прозрачен).  
+- `BatchSender` — отправка батчами.
+
+---
+
+## 14) История и источники
+
+Этот документ — обновлённая версия первоначальной дорожной карты, где статус фич отражал только JSON‑режим. Для истории изменений и ранних предпосылок см. предыдущую редакцию roadmap.

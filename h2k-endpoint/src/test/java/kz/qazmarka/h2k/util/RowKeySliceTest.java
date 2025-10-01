@@ -11,7 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.Test;
 
-import kz.qazmarka.h2k.schema.SchemaRegistry;
+import kz.qazmarka.h2k.schema.registry.SchemaRegistry;
 
 /**
  * Юнит‑тесты для {@link RowKeySlice}.
@@ -178,7 +178,7 @@ class RowKeySliceTest {
 
     /**
      * Валидация границ конструктора:
-     *  • отрицательный offset, выход за пределы массива и переполнение offset+length приводят к {@link IllegalArgumentException}.
+     *  • отрицательный offset, выход за пределы массива и переполнение offset+length приводят к {@link IndexOutOfBoundsException}.
      */
     @Test
     void boundsCheck() {

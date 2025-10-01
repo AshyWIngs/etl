@@ -57,15 +57,14 @@ add_peer 'h2k_balanced',
       'h2k.kafka.bootstrap.servers'   => '10.254.3.111:9092,10.254.3.112:9092,10.254.3.113:9092',
       'h2k.topic.pattern'             => '${table}',
       'h2k.cf.list'                   => 'd',
-      'h2k.decode.mode'               => 'json-phoenix',
+      'h2k.decode.mode'               => 'phoenix-avro',
       'h2k.schema.path'               => '/opt/hbase-default-current/conf/schema.json',
       'h2k.json.serialize.nulls'      => 'false',
       'h2k.payload.include.meta'      => 'false',
       'h2k.payload.include.meta.wal'  => 'false',
       'h2k.payload.include.rowkey'    => 'false',
       'h2k.rowkey.encoding'           => 'BASE64',
-      'h2k.salt.map'                  => 'TBL_JTI_TRACE_CIS_HISTORY=1',
-      'h2k.capacity.hints'            => 'TBL_JTI_TRACE_CIS_HISTORY=32',
+      # Соль и capacity берутся из conf/avro/*.avsc (h2k.saltBytes / h2k.capacityHint)
       'h2k.ensure.topics'             => 'true',
       'h2k.topic.partitions'          => '12',
       'h2k.topic.replication'         => '3',
@@ -123,7 +122,7 @@ remove_peer 'h2k_balanced'
 
 - Репликация обрабатывает **только новые события**, появляющиеся **после создания peer** и его включения (`enable_peer`). Исторические данные из таблиц автоматически не подхватываются.
 - Топики создаются/проверяются автоматом (если включён `h2k.ensure.topics=true`), имя строится по `h2k.topic.pattern` (для default‑namespace префикс не добавляется).
-- Поля PK из `rowkey` **всегда** инъектируются в JSON (см. `ValueCodecPhoenix#decodeRowKey(...)`). Добавлять их в `cf.list` не требуется.
+- Поля PK из `rowkey` **всегда** инъектируются в JSON (`ValueCodecPhoenix` → `PhoenixPkParser`). Добавлять их в `cf.list` не требуется.
 - Формат сообщения — **JSONEachRow**; метаполя и `_rowkey` включаются флагами `h2k.payload.include.*` (см. `docs/config.md`).
 
 ---
@@ -142,4 +141,4 @@ remove_peer 'h2k_balanced'
 - [Профили peer (полная матрица)](peer-profiles.md)
 - [Phoenix и `schema.json`](phoenix.md)
 - [Подсказки ёмкости и метаданные](capacity.md)
-- [Диагностика и типовые ошибки](troubleshooting.md)
+- [Диагностика и типовые ошибки](runbook/troubleshooting.md)

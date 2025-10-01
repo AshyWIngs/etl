@@ -1,0 +1,44 @@
+{
+  "type": "record",
+  "name": "T_AVRO_UNION",
+  "namespace": "kz.qazmarka.test",
+  "fields": [
+    {
+      "name": "value_union",
+      "type": [
+        "null",
+        "string",
+        "long"
+      ],
+      "default": null,
+      "h2k.phoenixType": "VARCHAR"
+    },
+    {
+      "name": "aux_union",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "AuxRecord",
+          "fields": [
+            {
+              "name": "flag",
+              "type": "boolean"
+            }
+          ]
+        }
+      ],
+      "default": null,
+      "h2k.phoenixType": "VARCHAR"
+    },
+    {
+      "name": "_event_ts",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    }
+  ],
+  "h2k.pk": []
+}
