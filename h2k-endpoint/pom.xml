@@ -43,7 +43,7 @@
     <!-- lz4-java нужна только если на брокере включён compression.type=lz4; помечаем provided -->
     <lz4.version>1.6.0</lz4.version>
     <!-- Avro и Confluent Schema Registry (совместимо с Kafka 2.3.1 и Java 8) -->
-    <avro.version>1.9.2</avro.version>
+    <avro.version>1.11.4</avro.version>
     <confluent.sr.version>5.3.8</confluent.sr.version>
 
     <!-- Кодировка компиляции -->
